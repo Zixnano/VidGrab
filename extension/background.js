@@ -116,6 +116,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // async
   }
 
+  if (msg.type === "RELAY_BATCH") {
+    // items: [{url, filename}], from the popup's "Grab all media on this page"
+    const items = msg.items || [];
+    (async () => {
+      const alive = await checkBackend();
+      if (!alive) {
+        sendResponse({ ok: false, error: "Video Grabber app isn't running." });
+        return;
+      }
+      const cookie = await cookieHeaderFor(msg.pageUrl).catch(() => "");
+      try {
+        const res = await fetch(`${BACKEND_BASE}/batch`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            items,
+            referer: msg.pageUrl,
+            cookie,
+            user_agent: navigator.userAgent,
+          }),
+        });
+        const data = await res.json();
+        sendResponse({ ok: res.ok, job_ids: data.job_ids, error: data.error });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e) });
+      }
+    })();
+    return true; // async
+  }
+
   if (msg.type === "SAVE_RECORDING") {
     // content.js captured a blob it couldn't stream to disk itself (rare) —
     // normally content.js just triggers a normal <a download> click for blobs

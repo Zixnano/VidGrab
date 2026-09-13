@@ -71,10 +71,44 @@ pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp serve
   your own uploads, permissively-licensed material, or sites whose terms
   allow it. It doesn't check that for you.
 
+## v2 features (download-manager parity with IDM)
+
+- **Queue with pause/resume/stop/delete**, per-item or in bulk from the GUI.
+- **Resumable downloads** for direct files (mp4, zip, exe, pdf, etc.) — a
+  `.part` file is kept and continued with an HTTP `Range` request if you
+  pause/stop and resume later. HLS/DASH (`ytdlp` jobs) restart the job on
+  resume rather than continuing mid-stream — a real limitation of how those
+  formats work, not a bug.
+- **Categories** (Video/Music/Compressed/Documents/Programs/Other) — files
+  are auto-sorted into subfolders and filterable in the sidebar, plus
+  Finished/Unfinished views.
+- **Speed limiter** (global, KB/s) and **max concurrent downloads**, in Options.
+- **Batch add** (paste a list of URLs) and **clipboard monitoring** (prompts
+  you when a downloadable-looking link is copied — off by default, enable
+  it in Options).
+- **Scheduler** — arm a time for the queue to start automatically.
+- **Export/Import** the queue as JSON.
+- **"Grab all media/files on this page"** button in the extension popup —
+  scans the page's `<a>` links and `<video>`/`<audio>` sources for anything
+  downloadable and sends the whole batch to the app at once (this is the
+  closest equivalent to IDM's "site grabber").
+- Job history persists across restarts (`~/Downloads/VideoGrabber/jobs.json`).
+
+## Deliberately left out
+
+- **IDM's own icons/branding/tray polish** — built this with its own look
+  rather than copying IDM's UI.
+- **"Tell a Friend"** — that's a referral/marketing feature, not something
+  useful for your own use.
+- **Multi-language UI** — everything's English-only for now.
+- **"Keys to force/prevent download" browser context-menu hooks** — doable,
+  just not built yet; say the word if you want it.
+
 ## Sensible next steps if you keep building this
 
-- Swap the Tkinter window for `pystray` if you want a tray-icon-only app.
-- Add a download-history/queue view to the GUI (the `/jobs` endpoint already
-  returns everything needed).
-- Add an options page to the extension for changing the backend port/output
-  folder without editing code.
+- Swap the Tkinter window for `pystray` if you want a tray-icon-only app
+  instead of a visible window.
+- Right-click context menu in Chrome ("Download this link with Video
+  Grabber") as another entry point besides the hover pill and popup.
+- Smarter batch scanning (currently only sees links/sources already in the
+  DOM — could also merge in the network-sniffed list from `background.js`).
