@@ -1,0 +1,36 @@
+name: Build VideoGrabber.exe
+
+on:
+  workflow_dispatch:      # manual "Run workflow" button on GitHub
+  push:
+    paths:
+      - "backend/**"
+      - ".github/workflows/build-exe.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build exe
+        run: |
+          pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp server.py
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoGrabber-windows
+          path: backend/dist/VideoGrabber.exe

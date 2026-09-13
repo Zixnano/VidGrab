@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  body { width: 340px; font: 13px -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 10px; color: #222; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  #status { font-size: 12px; margin-bottom: 8px; padding: 6px 8px; border-radius: 6px; }
+  .ok { background: #e8f5e9; color: #2e7d32; }
+  .bad { background: #fdecea; color: #c62828; }
+  .item { border: 1px solid #eee; border-radius: 6px; padding: 6px 8px; margin-bottom: 6px; }
+  .item .url { font-size: 11px; color: #555; word-break: break-all; display:block; margin-bottom:4px; }
+  .item button { font-size: 12px; padding: 4px 8px; cursor: pointer; }
+  .empty { color: #888; font-size: 12px; padding: 12px 0; text-align: center; }
+</style>
+</head>
+<body>
+  <h1>Video Grabber</h1>
+  <div id="status">Checking desktop app…</div>
+  <div id="list"><div class="empty">Scanning this tab…</div></div>
+  <script src="popup.js"></script>
+</body>
+</html>

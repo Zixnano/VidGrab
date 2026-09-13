@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Universal Video Grabber",
+  "version": "1.0.0",
+  "description": "Detects video streams (mp4/HLS/DASH) on any page and sends them to the local Video Grabber app for full-speed download via yt-dlp. Includes a blob/MediaRecorder fallback for in-page-only streams.",
+  "permissions": [
+    "webRequest",
+    "webNavigation",
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "cookies"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Video Grabber"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
