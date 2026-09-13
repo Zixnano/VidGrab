@@ -22,6 +22,7 @@
     "default_popup": "popup.html",
     "default_title": "Video Grabber"
   },
+  "options_ui": { "page": "options.html", "open_in_tab": false },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],

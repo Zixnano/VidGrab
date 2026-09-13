@@ -12,6 +12,7 @@ video-grabber/
 │   ├── background.js   network sniffing + relays downloads to the app
 │   ├── content.js      the on-page hover button (direct-download or record)
 │   ├── popup.html/js   manual list of everything sniffed on the current tab
+│   └── options.html/js pairing-token storage
 └── backend/           Desktop companion app (Python)
     ├── server.py        local HTTP server + yt-dlp + Tkinter window
     ├── requirements.txt
@@ -24,20 +25,24 @@ video-grabber/
    A small window opens, listening on `http://127.0.0.1:5757`. Leave it running.
 2. **Extension**: open `chrome://extensions`, enable Developer Mode, "Load
    unpacked", select the `extension/` folder.
-3. Browse normally. When a page has a playable `<video>`, a small pill
+3. Pair them: in the app, **Tools → Copy pairing token for extension**, then
+   paste it into the extension's Options page (right-click toolbar icon → Options).
+4. Browse normally. When a page has a playable `<video>`, a small pill
    appears over it:
    - **"Download this video"** (green) — the video has a real network URL.
      Clicking sends it to the backend, which runs yt-dlp with the page's
      cookies/referer/user-agent attached, merges audio+video, and saves to
      `~/Downloads/VideoGrabber`.
+   - **"Send page URL to Grabber"** (purple, MSE-only sites like Twitch) —
+     the player exposes no capture-able stream, so the page URL itself is
+     handed to yt-dlp, which has a dedicated extractor for the site.
    - **"Record this video"** (red) — the video is playing from a `blob:` URL
      (MSE-based players), which isn't a downloadable file. Clicking starts
      `MediaRecorder` capture; click again to stop and save what was
      captured so far as a `.webm`.
-4. The toolbar popup also lists everything the network sniffer has seen on
-   the current tab, in case the hover button doesn't appear (e.g. video
-   inside a same-origin iframe the content script didn't get positioned
-   over correctly) — "Send to Grabber" does the same handoff.
+5. The toolbar popup also lists everything the network sniffer has seen on
+   the current tab, in case the hover button doesn't appear — "Send to
+   Grabber" does the same handoff.
 
 ## To get an actual `VideoGrabber.exe`
 
@@ -45,70 +50,83 @@ PyInstaller builds are platform-specific, so it has to be built on Windows.
 Full steps are in `backend/build_exe.md`. Short version:
 
 ```
+cd backend
 pip install -r requirements.txt
 pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp server.py
 ```
 
-## What this will and won't do (being straight with you, same as before)
+(Or push to GitHub — the workflow in `.github/workflows/build-exe.yml`
+builds the exe on Windows and uploads it as an artifact, ffmpeg bundled.)
+
+## Feature set (v3.1)
+
+Downloads:
+- **Queue** with pause/resume/stop/delete, per-item or in bulk.
+- **Resumable downloads** for direct files via HTTP `Range` requests (.part files).
+- **Segmented (8-connection) downloads** for large direct files when the
+  server supports range requests (files ≥ 1 MB). Pausing a segmented job
+  restarts it cleanly on resume rather than corrupting the merge.
+- **yt-dlp engine** for HLS/DASH/page URLs (YouTube etc.), with cookies,
+  referer and UA from the browser, subtitles embedded, ffmpeg merging.
+- **Speed limiter** (global) and **max concurrent downloads**.
+- **Categories** (Video/Music/Compressed/Documents/Programs/Other) with
+  auto-sort into subfolders, per-category folder overrides, sidebar filters,
+  Finished/Unfinished views, and per-site rules that assign categories by domain.
+- **Batch add**, **clipboard monitor**, **scheduler** (arm a start time),
+  **export/import queue** as JSON, job history persisted across restarts.
+
+GUI:
+- Dark download-manager window with live progress, speed, status.
+- **Right-click context menu**: open/open-with/open-folder, rename/move,
+  redownload, resume/stop, refresh URL, remove, category change, double-click
+  behavior, play, convert (mp4/mkv/mp3/wav via ffmpeg), properties.
+- **Drag finished downloads out** of the list into Explorer/other apps.
+- **Download-finished toast** with Open file / Open folder, auto-dismiss.
+- **Minimize-to-bar**: closing the window drops to a small always-on-top
+  status strip (green dot = active downloads) instead of quitting.
+- **Tabbed Options**: General, File Types, Save-to (per-category folders),
+  Downloads, Connection (timeout/retries), Post-Download.
+- **Post-download actions**: Windows Defender scan, auto-extract zips,
+  open containing folder, play sound, shut down PC when queue empties.
+- **Portable mode**: drop a `portable.txt` next to the exe and settings/jobs
+  live alongside it instead of in the user profile.
+- **LAN web UI** at `http://<pc-ip>:5757/remote` (enable "Allow LAN access"
+  in Options) — view and control the queue from a phone/other device on your
+  network. Action links carry a random per-launch key so strangers on the
+  LAN can't touch your queue without it.
+- **Pairing token** shared with the extension (Tools → Copy pairing token).
+
+## What this will and won't do (being straight with you)
 
 - **DRM'd content (Netflix, Disney+, most paid streaming platforms)**: won't
   work, on purpose. Those streams are encrypted with Widevine/PlayReady;
   there's no legal or reliable technical way for a general tool to decrypt
-  them, and I'm not going to build in DRM circumvention.
+  them, and this project doesn't attempt DRM circumvention.
 - **Direct `.mp4`/`.m3u8`/`.mpd` links**: this is the strong path. The
   sniffer + yt-dlp combo handles the large majority of "normal" video sites
-  (this is also exactly why yt-dlp supports 1,800+ sites — that's the engine
-  doing the heavy lifting here).
+  (yt-dlp supports 1,800+ sites — that's the engine doing the heavy lifting).
 - **`blob:`/MSE players without DRM**: handled via the record button, but
   it's a real-time capture, not a download — it only captures from the
-  moment you click forward, at the video's playback speed, and re-encodes
-  to webm rather than grabbing the original file bit-for-bit.
+  moment you click forward, at playback speed, re-encoded to webm.
 - **Sites that scramble/obfuscate the URL in custom JS**: the generic
-  sniffer won't catch these. You'd need a site-specific patch (yt-dlp
-  itself has hundreds of these hand-written; this tool doesn't attempt to
-  replicate that per-site work).
+  sniffer won't catch these; yt-dlp's per-site extractors cover many of them
+  when you hand the page URL to the app directly.
 - **Only use this on content you actually have the right to download** —
   your own uploads, permissively-licensed material, or sites whose terms
   allow it. It doesn't check that for you.
 
-## v2 features (download-manager parity with IDM)
-
-- **Queue with pause/resume/stop/delete**, per-item or in bulk from the GUI.
-- **Resumable downloads** for direct files (mp4, zip, exe, pdf, etc.) — a
-  `.part` file is kept and continued with an HTTP `Range` request if you
-  pause/stop and resume later. HLS/DASH (`ytdlp` jobs) restart the job on
-  resume rather than continuing mid-stream — a real limitation of how those
-  formats work, not a bug.
-- **Categories** (Video/Music/Compressed/Documents/Programs/Other) — files
-  are auto-sorted into subfolders and filterable in the sidebar, plus
-  Finished/Unfinished views.
-- **Speed limiter** (global, KB/s) and **max concurrent downloads**, in Options.
-- **Batch add** (paste a list of URLs) and **clipboard monitoring** (prompts
-  you when a downloadable-looking link is copied — off by default, enable
-  it in Options).
-- **Scheduler** — arm a time for the queue to start automatically.
-- **Export/Import** the queue as JSON.
-- **"Grab all media/files on this page"** button in the extension popup —
-  scans the page's `<a>` links and `<video>`/`<audio>` sources for anything
-  downloadable and sends the whole batch to the app at once (this is the
-  closest equivalent to IDM's "site grabber").
-- Job history persists across restarts (`~/Downloads/VideoGrabber/jobs.json`).
-
 ## Deliberately left out
 
-- **IDM's own icons/branding/tray polish** — built this with its own look
-  rather than copying IDM's UI.
-- **"Tell a Friend"** — that's a referral/marketing feature, not something
-  useful for your own use.
-- **Multi-language UI** — everything's English-only for now.
-- **"Keys to force/prevent download" browser context-menu hooks** — doable,
-  just not built yet; say the word if you want it.
+- **IDM's own icons/branding** — built with its own look rather than copying IDM's UI.
+- **"Tell a Friend"** — a referral/marketing feature, not something useful for personal use.
+- **Multi-language UI** — English-only for now.
+- **Browser context-menu hooks** ("Download this link with Video Grabber"
+  on right-click in Chrome) — doable, just not built yet; the hover pill,
+  popup list and page scanner cover the same ground.
 
 ## Sensible next steps if you keep building this
 
-- Swap the Tkinter window for `pystray` if you want a tray-icon-only app
-  instead of a visible window.
-- Right-click context menu in Chrome ("Download this link with Video
-  Grabber") as another entry point besides the hover pill and popup.
-- Smarter batch scanning (currently only sees links/sources already in the
-  DOM — could also merge in the network-sniffed list from `background.js`).
+- Swap the minimize-to-bar strip for a proper `pystray` tray icon.
+- Browser context-menu entry point (see above).
+- Smarter batch scanning (merge the network-sniffed list from `background.js`
+  into the popup's DOM scan).

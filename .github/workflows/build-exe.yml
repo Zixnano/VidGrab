@@ -25,9 +25,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Download and bundle ffmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extracted
+          $ffmpegExe = Get-ChildItem -Path ffmpeg_extracted -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $ffmpegExe.FullName -Destination .\ffmpeg.exe
+
       - name: Build exe
         run: |
-          pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp server.py
+          pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp --collect-all tkinterdnd2 --add-binary "ffmpeg.exe;." server.py
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4

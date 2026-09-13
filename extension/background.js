@@ -75,6 +75,21 @@ async function checkBackend() {
   }
 }
 
+async function getApiToken() {
+  const { apiToken } = await chrome.storage.local.get("apiToken");
+  return apiToken || "";
+}
+
+async function authedFetch(path, options = {}) {
+  const token = await getApiToken();
+  const headers = { ...(options.headers || {}), "X-API-Token": token };
+  const res = await fetch(`${BACKEND_BASE}${path}`, { ...options, headers });
+  if (res.status === 401) {
+    return { res, unpaired: true };
+  }
+  return { res, unpaired: false };
+}
+
 async function sendToBackend({ url, pageUrl, filename }) {
   const alive = await checkBackend();
   if (!alive) {
@@ -83,7 +98,7 @@ async function sendToBackend({ url, pageUrl, filename }) {
   const cookie = await cookieHeaderFor(url).catch(() => "");
   const pageCookie = await cookieHeaderFor(pageUrl).catch(() => "");
   try {
-    const res = await fetch(`${BACKEND_BASE}/download`, {
+    const { res, unpaired } = await authedFetch("/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -94,7 +109,10 @@ async function sendToBackend({ url, pageUrl, filename }) {
         filename: filename || null,
       }),
     });
-    const data = await res.json();
+    if (unpaired) {
+      return { ok: false, error: "Not paired yet — open the extension's Options page and paste in the pairing token from the desktop app." };
+    }
+    const data = await res.json().catch(() => ({}));
     return { ok: res.ok, job_id: data.job_id, error: data.error };
   } catch (e) {
     return { ok: false, error: String(e) };
@@ -127,7 +145,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       const cookie = await cookieHeaderFor(msg.pageUrl).catch(() => "");
       try {
-        const res = await fetch(`${BACKEND_BASE}/batch`, {
+        const { res, unpaired } = await authedFetch("/batch", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -137,7 +155,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             user_agent: navigator.userAgent,
           }),
         });
-        const data = await res.json();
+        if (unpaired) {
+          sendResponse({ ok: false, error: "Not paired yet — open the extension's Options page and paste in the pairing token from the desktop app." });
+          return;
+        }
+        const data = await res.json().catch(() => ({}));
         sendResponse({ ok: res.ok, job_ids: data.job_ids, error: data.error });
       } catch (e) {
         sendResponse({ ok: false, error: String(e) });

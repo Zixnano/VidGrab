@@ -14,6 +14,10 @@
   const HANDLED = new WeakSet();
   const DISMISSED = new WeakSet();
   const RECORDERS = new WeakMap();
+  // Sites whose players use MSE in a way captureStream can't record — for these,
+  // the only viable move is to hand the PAGE URL to yt-dlp (site extractor).
+  const MSE_ONLY_HOSTS = [/twitch\.tv$/i];
+  const isMseOnlySite = () => MSE_ONLY_HOSTS.some((rx) => rx.test(location.hostname));
 
   function isVisible(el) {
     const r = el.getBoundingClientRect();
@@ -64,7 +68,10 @@
       const r = video.getBoundingClientRect();
       wrap.style.top = Math.max(8, r.top + 8) + "px";
       wrap.style.left = Math.max(8, r.left + 8) + "px";
-      wrap.style.display = isVisible(video) && r.bottom > 0 && r.top < innerHeight ? "flex" : "none";
+      wrap.style.display = isVisible(video)
+        && r.bottom > 0 && r.top < innerHeight
+        && r.right > 0 && r.left < innerWidth
+        ? "flex" : "none";
     }
     position();
     const reposition = () => requestAnimationFrame(position);
@@ -106,6 +113,31 @@
     );
   }
 
+  async function handleSendPageUrl(video, overlay) {
+    setLabel(overlay, "Sending…");
+    const guessName = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+    chrome.runtime.sendMessage(
+      {
+        type: "RELAY_DOWNLOAD",
+        url: location.href,
+        pageUrl: location.href,
+        filename: guessName,
+      },
+      (resp) => {
+        if (chrome.runtime.lastError) {
+          setLabel(overlay, "Extension error", "#e53935");
+          return;
+        }
+        if (resp && resp.ok) {
+          setLabel(overlay, "Sent to app ✓", "#4caf50");
+          setTimeout(() => setLabel(overlay, "Send page URL to Grabber", "#b388ff"), 2500);
+        } else {
+          setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", "#e53935");
+        }
+      }
+    );
+  }
+
   function saveBlob(blob, filenameBase) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -132,6 +164,10 @@
     }
     if (!stream) {
       setLabel(overlay, "Can't capture (DRM?)", "#e53935");
+      return;
+    }
+    if (stream.getVideoTracks().length === 0) {
+      setLabel(overlay, "Can't record on this site", "#e53935");
       return;
     }
     const chunks = [];
@@ -166,6 +202,10 @@
 
     const refresh = () => {
       if (RECORDERS.has(video)) return; // don't clobber label mid-recording
+      if (isMseOnlySite()) {
+        setLabel(overlay, "Send page URL to Grabber", "#b388ff");
+        return;
+      }
       if (!video.currentSrc) {
         setLabel(overlay, "Waiting for video…", "#999");
         return;
@@ -183,7 +223,9 @@
     overlay.btn.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
-      if (isBlob()) {
+      if (isMseOnlySite()) {
+        handleSendPageUrl(video, overlay);
+      } else if (isBlob()) {
         handleRecordToggle(video, overlay);
       } else if (video.currentSrc) {
         handleDirectDownload(video, overlay);

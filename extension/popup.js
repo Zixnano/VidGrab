@@ -72,10 +72,11 @@ async function grabAll(tab) {
   resultEl.textContent = "Scanning page…";
   let results;
   try {
-    [{ result: results }] = await chrome.scripting.executeScript({
+    const frames = await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       func: scanPageForDownloads,
     });
+    results = frames.flatMap((f) => f.result || []);
   } catch (e) {
     resultEl.textContent = "Couldn't scan this page.";
     return;

@@ -10,11 +10,15 @@
    pip install -r requirements.txt
    ```
 
-2. Freeze it:
+2. Freeze it (drop a static `ffmpeg.exe` next to `server.py` first — see
+   "Common build issues" below for where to get one):
 
    ```
-   pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp server.py
+   pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp --collect-all tkinterdnd2 --add-binary "ffmpeg.exe;." server.py
    ```
+
+   - `--collect-all tkinterdnd2` bundles the tkdnd Tcl libraries that the
+     drag-and-drop features need — PyInstaller's static analysis misses them.
 
    - `--onefile` gives you a single `VideoGrabber.exe`.
    - `--noconsole` hides the terminal window (the Tkinter window is the UI).
@@ -38,10 +42,13 @@
 ## Common build issues
 
 - **"ffmpeg not found" errors when merging separate video/audio streams**
-  (common on HLS/DASH sites): yt-dlp needs `ffmpeg.exe` on PATH, or drop a
-  copy of `ffmpeg.exe` next to `VideoGrabber.exe` and add
-  `"ffmpeg_location": os.path.dirname(sys.executable)` to `ydl_opts` in
-  `server.py`. Get a static build from https://www.gyan.dev/ffmpeg/builds/.
+  (common on HLS/DASH sites): the GitHub Actions workflow now downloads a
+  static ffmpeg build and bundles it into the exe automatically
+  (`--add-binary "ffmpeg.exe;."`), and `server.py` points yt-dlp at it via
+  `sys._MEIPASS` when frozen — no manual step needed for CI builds. If
+  you're building locally by hand instead of via Actions, drop a copy of
+  `ffmpeg.exe` next to `server.py` before running PyInstaller, or put it on
+  PATH. Get a static build from https://www.gyan.dev/ffmpeg/builds/.
 - **Antivirus deletes the exe on build**: PyInstaller onefile binaries
   self-extract at runtime, which some AV heuristics dislike. Add an
   exclusion for your build folder, or switch to `--onedir` (a folder
