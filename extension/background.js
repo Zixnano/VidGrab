@@ -119,6 +119,48 @@ async function sendToBackend({ url, pageUrl, filename }) {
   }
 }
 
+chrome.downloads.onCreated.addListener(async (item) => {
+  const { interceptDownloads } = await chrome.storage.local.get("interceptDownloads");
+  if (!interceptDownloads) return;
+
+  if (!item.url) return;
+  if (item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
+  if (item.byExtensionId === chrome.runtime.id) return;
+
+  try {
+    chrome.downloads.cancel(item.id);
+  } catch (e) {
+    return;
+  }
+
+  let filename = null;
+  try {
+    const [full] = await chrome.downloads.search({ id: item.id });
+    if (full && full.filename) {
+      filename = full.filename.split(/[\\/]/).pop();
+    }
+  } catch (e) {}
+
+  const cookie = await cookieHeaderFor(item.url).catch(() => "");
+  try {
+    await authedFetch("/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: item.url,
+        referer: item.referrer || "",
+        cookie: cookie,
+        user_agent: navigator.userAgent,
+        filename: filename,
+      }),
+    });
+  } catch (e) {
+    try {
+      chrome.downloads.download({ url: item.url, filename: filename || undefined });
+    } catch (_) {}
+  }
+});
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "GET_VIDEOS") {
     const m = videoMap.get(msg.tabId);

@@ -22,7 +22,10 @@ video-grabber/
 ## Setup (development / using it yourself right now)
 
 1. **Backend**: `cd backend && pip install -r requirements.txt && python server.py`
-   A small window opens, listening on `http://127.0.0.1:5757`. Leave it running.
+   A dark PySide6 download-manager window opens, listening on
+   `http://127.0.0.1:5757`. Leave it running. If PySide6 fails to import
+   (e.g. it wasn't installed), the app automatically falls back to the
+   older Tkinter window and logs why.
 2. **Extension**: open `chrome://extensions`, enable Developer Mode, "Load
    unpacked", select the `extension/` folder.
 3. Pair them: in the app, **Tools → Copy pairing token for extension**, then
@@ -57,6 +60,37 @@ pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp serve
 
 (Or push to GitHub — the workflow in `.github/workflows/build-exe.yml`
 builds the exe on Windows and uploads it as an artifact, ffmpeg bundled.)
+
+## What's new in v3.2
+
+- **New PySide6 GUI** (`backend/gui_qt.py`) replaces Tkinter as the primary
+  window — dark IDM-style layout, sidebar category filters, sortable table
+  with a live progress-bar column, search box, and an activity-log strip.
+  Tkinter is kept as an automatic fallback if PySide6 isn't installed.
+- **Force-on-top on new downloads**: the window un-minimizes and briefly
+  flashes to the front whenever a job is queued from any source (extension,
+  clipboard, GUI, or an auto-imported screen recording). Toggle via the
+  `force_on_top` setting.
+- **Screen-recording auto-import** (Windows only): a background folder
+  watcher (`watchdog`) watches `~/Videos/Captures` (and similar folders) and
+  automatically copies finished recordings into the Video category once the
+  file size stops changing.
+- **Chrome download interception** (opt-in, off by default): a checkbox in
+  the extension's Options page — when enabled, clicking any downloadable
+  link in Chrome cancels the browser's own download and hands the URL to
+  Video Grabber instead, with cookies/referer/UA attached.
+- **Drag finished rows out of the Qt window** into Explorer or another app
+  (e.g. drop a finished `.mp4` onto VLC).
+- **Auto-convert to MP4**: any video job that lands as `.mkv`/`.webm`/etc.
+  gets remuxed (or transcoded if remuxing fails) to `.mp4` automatically.
+  Toggle via the `auto_mp4` setting.
+- **"Download File Info" dialog**: URL, category, save-as path with a
+  "remember this path for &lt;category&gt;" checkbox, description, and a
+  live file-size probe before you commit to starting the download.
+- **"Grab all media on this page" now shows a checklist** in the popup —
+  every sniffed file gets a checkbox (checked by default), with a
+  select-all/none toggle, so you can leave out the ones you don't want
+  before sending the batch to the app.
 
 ## Feature set (v3.1)
 

@@ -35,6 +35,7 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
+from watchdog.events import FileSystemEventHandler
 try:
     # Drag ACTIONS are COPY/MOVE/LINK/REFUSE_DROP (no DND_ prefix — that prefix
     # is only for data types like DND_FILES).

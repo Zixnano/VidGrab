@@ -14,14 +14,16 @@
    "Common build issues" below for where to get one):
 
    ```
-   pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp --collect-all tkinterdnd2 --add-binary "ffmpeg.exe;." server.py
+   pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 --add-binary "ffmpeg.exe;." server.py
    ```
 
    - `--collect-all tkinterdnd2` bundles the tkdnd Tcl libraries that the
      drag-and-drop features need — PyInstaller's static analysis misses them.
-
+   - `--collect-all PySide6` bundles the Qt plugins/platform DLLs the new
+     GUI needs — without it the frozen exe falls back to the Tkinter GUI
+     with a "PySide6 GUI unavailable" log line.
    - `--onefile` gives you a single `VideoGrabber.exe`.
-   - `--noconsole` hides the terminal window (the Tkinter window is the UI).
+   - `--noconsole` hides the terminal window (the GUI is the only window).
    - `--collect-all yt_dlp` is important — yt-dlp dynamically loads many
      per-site extractor modules that PyInstaller's static analysis can miss.
 

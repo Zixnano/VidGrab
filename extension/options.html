@@ -11,6 +11,10 @@
   #status { font-size: 12px; margin-top: 8px; }
   .ok { color: #2e7d32; }
   .bad { color: #c62828; }
+  hr { margin: 16px 0; border: none; border-top: 1px solid #eee; }
+  .checkbox-row { display: flex; align-items: flex-start; gap: 8px; }
+  .checkbox-row input { width: auto; margin: 2px 0 0; }
+  .checkbox-row label { line-height: 1.4; }
 </style>
 </head>
 <body>
@@ -19,6 +23,12 @@
   <input id="token" type="text" placeholder="Paste pairing token here" />
   <button id="save">Save</button>
   <div id="status"></div>
+  <hr />
+  <div class="checkbox-row">
+    <input type="checkbox" id="interceptDownloads" />
+    <label for="interceptDownloads">Intercept browser downloads and send them to Video Grabber</label>
+  </div>
+  <p style="font-size:11px;color:#888;">Off by default. When on, clicking any downloadable link in Chrome cancels the browser's own download and hands the file to Video Grabber instead.</p>
   <script src="options.js"></script>
 </body>
 </html>

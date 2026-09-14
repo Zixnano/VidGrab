@@ -12,6 +12,15 @@
   .item .url { font-size: 11px; color: #555; word-break: break-all; display:block; margin-bottom:4px; }
   .item button { font-size: 12px; padding: 4px 8px; cursor: pointer; }
   .empty { color: #888; font-size: 12px; padding: 12px 0; text-align: center; }
+  .grab-item { display: flex; align-items: flex-start; gap: 6px; border: 1px solid #eee;
+    border-radius: 6px; padding: 5px 7px; margin-bottom: 4px; }
+  .grab-item input[type=checkbox] { margin-top: 3px; flex-shrink: 0; }
+  .grab-item .name { font-size: 12px; word-break: break-all; }
+  .grab-toolbar { display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 6px; }
+  .grab-toolbar button { font-size: 11px; padding: 3px 8px; cursor: pointer; }
+  #grabSendBtn { width: 100%; padding: 6px; margin-top: 6px; cursor: pointer; }
+  #grabSendBtn:disabled { opacity: 0.5; cursor: default; }
 </style>
 </head>
 <body>
@@ -19,6 +28,12 @@
   <div id="status">Checking desktop app…</div>
   <button id="grabAllBtn" style="width:100%;padding:6px;margin-bottom:8px;cursor:pointer;">🔍 Grab all media/files on this page</button>
   <div id="grabResult" style="font-size:11px;color:#555;margin-bottom:8px;"></div>
+  <div id="grabToolbar" class="grab-toolbar" style="display:none;">
+    <span id="grabCount" style="font-size:11px;color:#555;"></span>
+    <button id="grabToggleAll">Select none</button>
+  </div>
+  <div id="grabChecklist"></div>
+  <button id="grabSendBtn" style="display:none;">Send selected to Grabber</button>
   <div id="list"><div class="empty">Scanning this tab…</div></div>
   <script src="popup.js"></script>
 </body>
