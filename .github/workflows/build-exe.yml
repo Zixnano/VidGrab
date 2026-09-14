@@ -35,10 +35,16 @@ jobs:
 
       - name: Build exe
         run: |
-          pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 --add-binary "ffmpeg.exe;." server.py
+          # --onedir instead of --onefile: onefile re-extracts the entire bundle
+          # (PySide6 DLLs, ffmpeg, yt-dlp, Tcl libs) to a temp folder on EVERY
+          # launch, costing 30s-minutes. onedir starts instantly.
+          pyinstaller --onedir --noconsole --name VideoGrabber --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 --add-binary "ffmpeg.exe;." server.py
 
-      - name: Upload exe artifact
+      # onedir output is a FOLDER: dist/VideoGrabber/VideoGrabber.exe plus all
+      # its DLLs/assets alongside it. The whole folder must be distributed and
+      # moved together.
+      - name: Upload app artifact
         uses: actions/upload-artifact@v4
         with:
           name: VideoGrabber-windows
-          path: backend/dist/VideoGrabber.exe
+          path: backend/dist/VideoGrabber/

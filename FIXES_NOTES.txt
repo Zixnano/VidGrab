@@ -1,0 +1,31 @@
+WHAT'S FIXED IN THIS BUILD
+==========================
+All seven problems from the original list are now implemented:
+
+  Problem 1:  Context menu + toolbar actions fixed. Handlers read
+              _current_ctx (set from the right-click position, immune to the
+              1s model reset); refresh() re-applies the selection after each
+              reset; empty selections now show "Select a row first."
+  Problem 2:  Quality dropdown in Add Download (probed on a background
+              thread via /probe-formats, passed through as format_id).
+  Problem 3:  Screen recordings upload to the app via the service worker
+              (/upload); <a download> remains the fallback.
+  Problem 4:  Auto-MP4 handles extensionless files, probes for a video
+              stream, verifies output before deleting source, logs
+              diagnostics; run_ytdlp fixes output template + resolves the
+              real on-disk filename.
+  Problem 5:  Lazy tkinter imports + --onedir build (workflow + docs).
+  Problem 6:  Settings dialog (General / Downloads / Post-Download /
+              Pairing) via toolbar button and File menu.
+  Problem 7:  Extensionless filename fixes (new_job, HEAD Content-Type
+              guess, content.js sends real extension), one-shot migration.
+
+TEST FOCUS (the confirmed bugs):
+  1. Right-click Open/Open folder/Resume/Stop/Redownload/Remove;
+     toolbar Stop/Pause/Resume/Delete; selection should STAY highlighted.
+  2. Paste a YouTube URL in Add URL -> Quality list populates.
+  3. Record a blob video -> appears in the app as a done job.
+  4. Extensionless/WebM downloads -> become .mp4; log shows auto-mp4 lines.
+  6. Gear button / File -> Settings -> change a value, restart app, check
+     it stuck.
+  7. Re-download the page that produced "..._lol_fr" -> gets .mp4.

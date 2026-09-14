@@ -210,6 +210,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // async
   }
 
+  if (msg.type === "UPLOAD_RECORDING") {
+    // Screen-recording handoff from content.js's recorder.onstop. The content
+    // script can't read chrome.storage.local and FormData can't cross
+    // chrome.runtime.sendMessage, so it sends the raw ArrayBuffer (structured
+    // clone) plus the desired filename; we attach the pairing token here and
+    // build the multipart request. On any failure content.js falls back to
+    // a plain <a download>, so a rejected sendResponse never loses the take.
+    (async () => {
+      const alive = await checkBackend();
+      if (!alive) {
+        sendResponse({ ok: false, error: "Video Grabber app isn't running." });
+        return;
+      }
+      try {
+        const file = new File([msg.buffer], msg.filename || "recording.webm",
+                              { type: "video/webm" });
+        const form = new FormData();
+        form.append("file", file);
+        const { res, unpaired } = await authedFetch("/upload", {
+          method: "POST",
+          body: form, // no Content-Type header — fetch sets the boundary
+        });
+        if (unpaired) {
+          sendResponse({ ok: false, error: "Not paired yet — open the extension's Options page and paste in the pairing token from the desktop app." });
+          return;
+        }
+        const data = await res.json().catch(() => ({}));
+        sendResponse({ ok: res.ok, job_id: data.job_id, error: data.error });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e) });
+      }
+    })();
+    return true; // async
+  }
+
   if (msg.type === "SAVE_RECORDING") {
     // content.js captured a blob it couldn't stream to disk itself (rare) —
     // normally content.js just triggers a normal <a download> click for blobs

@@ -90,14 +90,23 @@
 
   async function handleDirectDownload(video, overlay) {
     setLabel(overlay, "Sending…");
-    const guessName = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+    const base = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+    // document.title never carries a file extension, which made the app save
+    // files with no extension. Borrow the real one from the stream URL's
+    // path; if the URL has none either, omit filename entirely and let the
+    // backend guess it from the URL / Content-Type (server-side fix).
+    let ext = "";
+    try {
+      ext = (new URL(video.currentSrc).pathname.match(/(\.[A-Za-z0-9]{1,5})$/) || [""])[0];
+    } catch (e) {}
+    const payload = {
+      type: "RELAY_DOWNLOAD",
+      url: video.currentSrc,
+      pageUrl: location.href,
+    };
+    if (ext) payload.filename = base + ext;
     chrome.runtime.sendMessage(
-      {
-        type: "RELAY_DOWNLOAD",
-        url: video.currentSrc,
-        pageUrl: location.href,
-        filename: guessName,
-      },
+      payload,
       (resp) => {
         if (chrome.runtime.lastError) {
           setLabel(overlay, "Extension error", "#e53935");
@@ -184,9 +193,27 @@
     recorder.onstop = () => {
       const blob = new Blob(chunks, { type: "video/webm" });
       const guessName = (document.title || "recording").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
-      saveBlob(blob, guessName);
-      setLabel(overlay, "Saved ✓ — Record again", "#4caf50");
-      RECORDERS.delete(video);
+      // Hand the recording to the desktop app instead of <a download> (which
+      // drops it in the browser's Downloads folder the app never watches).
+      // FormData can't cross chrome.runtime.sendMessage, so we pass the raw
+      // ArrayBuffer (structured-cloneable) and the service worker builds the
+      // multipart request. Tradeoff vs base64: no +33% bloat, but the whole
+      // buffer is held in memory — if the app is down or the upload fails,
+      // the <a download> fallback below still saves the recording.
+      blob.arrayBuffer().then((buffer) => {
+        chrome.runtime.sendMessage(
+          { type: "UPLOAD_RECORDING", buffer, filename: guessName + ".webm" },
+          (resp) => {
+            if (chrome.runtime.lastError || !resp || !resp.ok) {
+              saveBlob(blob, guessName);
+              setLabel(overlay, "Saved ✓ (browser) — Record again", "#4caf50");
+            } else {
+              setLabel(overlay, "Sent to app ✓ — Record again", "#4caf50");
+            }
+            RECORDERS.delete(video);
+          }
+        );
+      });
     };
     recorder.start(1000);
     RECORDERS.set(video, { recorder });

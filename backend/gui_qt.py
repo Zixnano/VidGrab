@@ -9,11 +9,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import requests
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, Qt, QTimer, Signal, QMimeData, QUrl,
+    QItemSelectionModel,
 )
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import (
@@ -22,7 +24,7 @@ from PySide6.QtWidgets import (
     QMenu, QMessageBox, QDialog, QDialogButtonBox, QFormLayout, QComboBox,
     QStatusBar, QSizePolicy, QAbstractItemView, QStyledItemDelegate,
     QInputDialog, QFileDialog, QCheckBox, QSystemTrayIcon, QStyle,
-    QSpinBox, QListWidget, QListWidgetItem,
+    QSpinBox, QListWidget, QListWidgetItem, QTabWidget,
 )
 
 BACKEND_BASE = "http://127.0.0.1:5757"
@@ -112,7 +114,8 @@ class ApiClient:
         data = self._req("GET", "/jobs") or {}
         return list(data.values())
 
-    def add(self, url, filename=None, category=None, description=None):
+    def add(self, url, filename=None, category=None, description=None,
+            format_id=None):
         body = {"url": url}
         if filename:
             body["filename"] = filename
@@ -120,6 +123,8 @@ class ApiClient:
             body["category"] = category
         if description:
             body["description"] = description
+        if format_id:
+            body["format_id"] = format_id
         return self._req("POST", "/download", json=body)
 
     def pause(self, jid):
@@ -142,6 +147,9 @@ class ApiClient:
 
     def probe_head(self, url):
         return self._req("POST", "/probe-head", json={"url": url})
+
+    def probe_formats(self, url):
+        return self._req("POST", "/probe-formats", json={"url": url})
 
     def logs(self):
         data = self._req("GET", "/logs") or {}
@@ -295,9 +303,14 @@ class ProgressDelegate(QStyledItemDelegate):
 
 
 class AddDownloadDialog(QDialog):
+    # Carries (probe_seq, response_dict) from the background probe thread —
+    # Qt widgets are only touched in the slot, never in the thread.
+    _formats_ready = Signal(object)
+
     def __init__(self, parent=None, api=None, prefill_url=""):
         super().__init__(parent)
         self.api = api
+        self._probe_seq = 0
         self.setWindowTitle("Download File Info")
         self.setMinimumWidth(560)
         form = QFormLayout(self)
@@ -305,6 +318,10 @@ class AddDownloadDialog(QDialog):
         self.url.setPlaceholderText("https://example.com/file.mp4")
         self.url.editingFinished.connect(self._probe)
         form.addRow("URL", self.url)
+        self.quality = QComboBox()
+        self.quality.addItem("Best available")
+        form.addRow("Quality", self.quality)
+        self._formats_ready.connect(self._on_formats)
         self.category = QComboBox()
         self.category.addItems(CATEGORIES)
         form.addRow("Category", self.category)
@@ -352,6 +369,45 @@ class AddDownloadDialog(QDialog):
             self.size_label.setText(fmt_bytes(size) if size else "unknown")
         except Exception:
             self.size_label.setText("unknown")
+        self._probe_formats(url)
+
+    def _probe_formats(self, url):
+        """Ask the backend which formats exist, off the UI thread. A seq
+        counter drops stale responses when the URL changes quickly."""
+        self._probe_seq += 1
+        seq = self._probe_seq
+        self.quality.clear()
+        self.quality.addItem("Loading formats…")
+        self.quality.setEnabled(False)
+
+        def worker():
+            try:
+                data = self.api.probe_formats(url)
+            except Exception as e:
+                data = {"error": str(e)}
+            self._formats_ready.emit((seq, data))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_formats(self, payload):
+        seq, data = payload
+        if seq != self._probe_seq:
+            return  # stale — a newer probe superseded this one
+        self.quality.clear()
+        self.quality.addItem("Best available")
+        for f in data.get("formats") or []:
+            self.quality.addItem(self._format_label(f), f.get("format_id"))
+        self.quality.setEnabled(True)
+
+    @staticmethod
+    def _format_label(f):
+        res = f.get("resolution") or ""
+        ext = f.get("ext") or ""
+        vc = f.get("vcodec") or "none"
+        ac = f.get("acodec") or "none"
+        size = fmt_bytes(f.get("filesize")) if f.get("filesize") else "?"
+        kind = "audio only" if vc == "none" else f"{vc}/{ac}"
+        return " · ".join(p for p in (res, ext, kind, size) if p)
 
     def values(self):
         return {
@@ -360,7 +416,120 @@ class AddDownloadDialog(QDialog):
             "save_path": self.save_path.text().strip(),
             "remember": self.remember.isChecked(),
             "description": self.description.text().strip(),
+            "format_id": self.quality.currentData(),
         }
+
+
+class SettingsDialog(QDialog):
+    """Tabbed settings editor — POSTs each value to /settings on Save."""
+
+    def __init__(self, parent=None, api=None):
+        super().__init__(parent)
+        self.api = api
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(520)
+        s = load_settings()
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
+
+        # ---- General ----
+        g = QWidget()
+        gl = QFormLayout(g)
+        self.force_on_top = QCheckBox("Force window to front on new downloads")
+        self.force_on_top.setChecked(bool(s.get("force_on_top", True)))
+        self.close_to_tray = QCheckBox("Close to system tray")
+        self.close_to_tray.setChecked(bool(s.get("close_to_tray", True)))
+        self.watch_recording_folder = QCheckBox(
+            "Auto-import screen recordings from the OS captures folder")
+        self.watch_recording_folder.setChecked(
+            bool(s.get("watch_recording_folder", True)))
+        self.clipboard_monitor = QCheckBox(
+            "Monitor clipboard for downloadable links")
+        self.clipboard_monitor.setChecked(bool(s.get("clipboard_monitor", False)))
+        for w in (self.force_on_top, self.close_to_tray,
+                  self.watch_recording_folder, self.clipboard_monitor):
+            gl.addRow(w)
+        tabs.addTab(g, "General")
+
+        # ---- Downloads ----
+        d = QWidget()
+        dl = QFormLayout(d)
+        self.max_concurrent = QSpinBox()
+        self.max_concurrent.setRange(1, 16)
+        self.max_concurrent.setValue(int(s.get("max_concurrent", 3)))
+        dl.addRow("Max simultaneous downloads", self.max_concurrent)
+        self.speed_limit_kbps = QSpinBox()
+        self.speed_limit_kbps.setRange(0, 10_000_000)
+        self.speed_limit_kbps.setSingleStep(100)
+        self.speed_limit_kbps.setSuffix(" KB/s")
+        self.speed_limit_kbps.setSpecialValueText("unlimited")
+        self.speed_limit_kbps.setValue(int(s.get("speed_limit_kbps", 0)))
+        dl.addRow("Speed limit", self.speed_limit_kbps)
+        self.auto_mp4 = QCheckBox("Auto-convert downloaded videos to MP4")
+        self.auto_mp4.setChecked(bool(s.get("auto_mp4", True)))
+        dl.addRow(self.auto_mp4)
+        tabs.addTab(d, "Downloads")
+
+        # ---- Post-Download ----
+        p = QWidget()
+        pl = QFormLayout(p)
+        self.defender_scan = QCheckBox("Scan downloads with Windows Defender")
+        self.defender_scan.setChecked(bool(s.get("defender_scan", False)))
+        self.auto_shutdown = QCheckBox("Shut down PC when the queue empties")
+        self.auto_shutdown.setChecked(bool(s.get("auto_shutdown", False)))
+        self.auto_extract = QCheckBox("Auto-extract archives after download")
+        self.auto_extract.setChecked(bool(s.get("auto_extract", False)))
+        self.open_folder_on_complete = QCheckBox(
+            "Open containing folder on completion")
+        self.open_folder_on_complete.setChecked(
+            bool(s.get("open_folder_on_complete", False)))
+        self.play_sound_on_complete = QCheckBox("Play sound on completion")
+        self.play_sound_on_complete.setChecked(
+            bool(s.get("play_sound_on_complete", False)))
+        for w in (self.defender_scan, self.auto_shutdown, self.auto_extract,
+                  self.open_folder_on_complete, self.play_sound_on_complete):
+            pl.addRow(w)
+        tabs.addTab(p, "Post-Download")
+
+        # ---- Pairing ----
+        pr = QWidget()
+        prl = QFormLayout(pr)
+        self.token_edit = QLineEdit(s.get("api_token", ""))
+        self.token_edit.setReadOnly(True)
+        prl.addRow("Pairing token", self.token_edit)
+        copy_btn = QPushButton("Copy")
+        copy_btn.clicked.connect(self._copy_token)
+        prl.addRow(copy_btn)
+        tabs.addTab(pr, "Pairing")
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _copy_token(self):
+        QApplication.clipboard().setText(self.token_edit.text())
+
+    def _save(self):
+        if self.api:
+            for key, widget in [
+                ("force_on_top", self.force_on_top),
+                ("close_to_tray", self.close_to_tray),
+                ("watch_recording_folder", self.watch_recording_folder),
+                ("clipboard_monitor", self.clipboard_monitor),
+                ("auto_mp4", self.auto_mp4),
+                ("defender_scan", self.defender_scan),
+                ("auto_shutdown", self.auto_shutdown),
+                ("auto_extract", self.auto_extract),
+                ("open_folder_on_complete", self.open_folder_on_complete),
+                ("play_sound_on_complete", self.play_sound_on_complete),
+            ]:
+                self.api.save_setting(key, widget.isChecked())
+            self.api.save_setting("max_concurrent", int(self.max_concurrent.value()))
+            self.api.save_setting("speed_limit_kbps",
+                                  int(self.speed_limit_kbps.value()))
+        self.accept()
 
 
 class BandwidthProfilesDialog(QDialog):
@@ -662,6 +831,7 @@ class MainWindow(QMainWindow):
             ("Pause", "Ⅱ", lambda: self._selected("pause")),
             ("Stop", "■", lambda: self._selected("stop")),
             ("Delete", "⌫", self.remove_selected),
+            ("Settings", "⚙", self.open_settings),
         ]:
             b = QPushButton(f"{icon}  {label}")
             b.setObjectName("ToolbarButton")
@@ -725,6 +895,8 @@ class MainWindow(QMainWindow):
         f = menu.addMenu("File")
         a = QAction("Add URL…", self); a.triggered.connect(self.add_download); f.addAction(a)
         a = QAction("Batch add…", self); a.triggered.connect(self.add_batch); f.addAction(a)
+        f.addSeparator()
+        a = QAction("Settings…", self); a.triggered.connect(self.open_settings); f.addAction(a)
         f.addSeparator()
         a = QAction("Exit", self); a.triggered.connect(self._real_quit); f.addAction(a)
         t = menu.addMenu("Tools")
@@ -806,7 +978,16 @@ class MainWindow(QMainWindow):
                 if getattr(self, "_done_seeded", False):
                     self._recently_done[jid] = 1.0
         self._done_seeded = True
+        # Snapshot the selection before the model reset wipes it, then restore.
+        selected_ids = {j["id"] for j in self._selected_rows()}
         self.apply_filter(self.search.text())
+        if selected_ids:
+            sm = self.table.selectionModel()
+            if sm is not None:
+                for r, j in enumerate(self.model.items):
+                    if j["id"] in selected_ids:
+                        sm.select(self.model.index(r, 0),
+                                  QItemSelectionModel.Select | QItemSelectionModel.Rows)
 
     def _tick_fade(self):
         if not self._recently_done:
@@ -850,6 +1031,9 @@ class MainWindow(QMainWindow):
     def open_bandwidth_profiles(self):
         BandwidthProfilesDialog(self, self.api).exec()
 
+    def open_settings(self):
+        SettingsDialog(self, self.api).exec()
+
     def apply_filter(self, text):
         text = (text or "").lower().strip()
         src = self.all_items
@@ -879,6 +1063,9 @@ class MainWindow(QMainWindow):
         return [self.model.items[r] for r in rows if r < len(self.model.items)]
 
     def _selected(self, action):
+        if not self._selected_rows():
+            QMessageBox.information(self, "No job selected", "Select a row first.")
+            return
         for j in self._selected_rows():
             try:
                 getattr(self.api, action)(j["id"])
@@ -889,6 +1076,7 @@ class MainWindow(QMainWindow):
     def remove_selected(self):
         items = self._selected_rows()
         if not items:
+            QMessageBox.information(self, "No job selected", "Select a row first.")
             return
         if QMessageBox.question(self, "Remove", f"Remove {len(items)} job(s)?") != QMessageBox.Yes:
             return
@@ -914,7 +1102,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         try:
-            self.api.add(v["url"], category=v["category"], description=v["description"])
+            self.api.add(v["url"], category=v["category"],
+                         description=v["description"], format_id=v.get("format_id"))
         except Exception as e:
             QMessageBox.critical(self, "Add failed", str(e))
         self.refresh()
@@ -941,9 +1130,14 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Token reloaded", f"Token is now: {self.api.token[:8]}…")
 
     def context_menu(self, pos):
-        items = self._selected_rows()
-        if not items:
+        # Resolve the row from the click position itself — the selection
+        # model may have been wiped by the 1s refresh by the time the user
+        # picks a menu item, so handlers key off self._current_ctx instead.
+        idx = self.table.indexAt(pos)
+        if not idx.isValid() or idx.row() >= len(self.model.items):
             return
+        self._current_ctx = self.model.items[idx.row()]["id"]
+        j = self.model.items[idx.row()]
         m = QMenu(self)
         a_open = m.addAction("Open")
         a_open_folder = m.addAction("Open folder")
@@ -960,7 +1154,6 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         a_remove = m.addAction("Remove")
         a_props = m.addAction("Properties")
-        j = items[0]
         a_open.setEnabled(j["status"] == "done")
         a_open_folder.setEnabled(j["status"] == "done")
         a_resume.setEnabled(j["status"] in ("paused", "stopped"))
@@ -968,41 +1161,92 @@ class MainWindow(QMainWindow):
         a_redl.setEnabled(j["status"] in ("done", "error", "stopped"))
         chosen = m.exec(self.table.viewport().mapToGlobal(pos))
         if chosen == a_open:
-            self._open_selected(folder=False)
+            self._ctx_open()
         elif chosen == a_open_folder:
-            self._open_selected(folder=True)
+            self._ctx_open_folder()
         elif chosen == a_resume:
-            self._selected("resume")
+            self._ctx_resume()
         elif chosen == a_stop:
-            self._selected("stop")
+            self._ctx_stop()
         elif chosen == a_redl:
-            for j in items:
-                try:
-                    self.api.resume(j["id"])
-                except Exception:
-                    pass
+            self._ctx_redownload()
         elif chosen in cat_actions:
-            for j in items:
-                try:
-                    self.api.set_category(j["id"], cat_actions[chosen])
-                except Exception as e:
-                    QMessageBox.warning(self, "Error", str(e))
+            try:
+                self.api.set_category(self._current_ctx, cat_actions[chosen])
+            except Exception as e:
+                QMessageBox.warning(self, "Error", str(e))
             self.refresh()
         elif chosen in conv_actions:
-            for j in items:
-                try:
-                    self.api.convert(j["id"], conv_actions[chosen])
-                except Exception as e:
-                    QMessageBox.warning(self, "Convert", str(e))
+            try:
+                self.api.convert(self._current_ctx, conv_actions[chosen])
+            except Exception as e:
+                QMessageBox.warning(self, "Convert", str(e))
         elif chosen == a_remove:
-            self.remove_selected()
+            self._ctx_remove()
         elif chosen == a_props:
             self._show_props(j)
 
-    def _open_selected(self, folder=False):
-        """Open the selected job's file (or its containing folder) with
-        proper error reporting so failures are visible instead of silent."""
-        for job in self._selected_rows():
+    def _ctx_open(self):
+        jid = getattr(self, "_current_ctx", None)
+        if jid:
+            self._open_selected(job_id=jid)
+
+    def _ctx_open_folder(self):
+        jid = getattr(self, "_current_ctx", None)
+        if jid:
+            self._open_selected(folder=True, job_id=jid)
+
+    def _ctx_resume(self):
+        jid = getattr(self, "_current_ctx", None)
+        if not jid:
+            return
+        try:
+            self.api.resume(jid)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+        self.refresh()
+
+    def _ctx_stop(self):
+        jid = getattr(self, "_current_ctx", None)
+        if not jid:
+            return
+        try:
+            self.api.stop(jid)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+        self.refresh()
+
+    def _ctx_redownload(self):
+        jid = getattr(self, "_current_ctx", None)
+        if not jid:
+            return
+        try:
+            self.api.resume(jid)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+        self.refresh()
+
+    def _ctx_remove(self):
+        jid = getattr(self, "_current_ctx", None)
+        if not jid:
+            return
+        if QMessageBox.question(self, "Remove", "Remove this job?") != QMessageBox.Yes:
+            return
+        try:
+            self.api.delete(jid)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
+        self.refresh()
+
+    def _open_selected(self, folder=False, job_id=None):
+        """Open a job's file (or its containing folder) with proper error
+        reporting so failures are visible instead of silent. When job_id is
+        given, only that job is opened; otherwise every selected row is."""
+        if job_id is not None:
+            items = [j for j in self.model.items if j["id"] == job_id]
+        else:
+            items = self._selected_rows()
+        for job in items:
             path = _path_for(job)
             target = path.parent if folder else path
             if not target.exists():
@@ -1033,7 +1277,7 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self.model.items):
             job = self.model.items[row]
             if job.get("status") == "done":
-                self._open_selected(folder=False)
+                self._open_selected(folder=False, job_id=job["id"])
 
     def _show_props(self, j):
         text = "\n".join([

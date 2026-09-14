@@ -26,8 +26,6 @@ import sys
 import time
 import queue
 import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog, messagebox
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
@@ -36,19 +34,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
 from watchdog.events import FileSystemEventHandler
-try:
-    # Drag ACTIONS are COPY/MOVE/LINK/REFUSE_DROP (no DND_ prefix — that prefix
-    # is only for data types like DND_FILES).
-    from tkinterdnd2 import TkinterDnD, DND_FILES, COPY
-except ImportError:  # older/alternate tkinterdnd2 builds name it DND_COPY
-    try:
-        from tkinterdnd2 import TkinterDnD, DND_FILES, DND_COPY as COPY
-    except ImportError:
-        from tkinterdnd2.TkinterDnD import TkinterDnD, DND_FILES, DND_COPY as COPY
-try:
-    from tkinterdnd2 import REFUSE_DROP
-except ImportError:
-    REFUSE_DROP = "refuse_drop"
+# tkinter / tkinterdnd2 are imported lazily inside main() so the Tcl
+# interpreter only loads when the Tkinter fallback is actually used.
 
 APP_PORT = 5757
 HOME = Path.home() / "Downloads" / "VideoGrabber"
@@ -123,7 +110,7 @@ CORS(app, resources={r"/*": {"origins": r"chrome-extension://.*"}}, supports_cre
 TOKEN_PROTECTED_PATHS = {
     "/download", "/batch", "/pause", "/resume", "/stop", "/delete",
     "/probe", "/rules", "/jobs", "/stats", "/convert", "/logs",
-    "/category", "/probe-head", "/settings",
+    "/category", "/probe-head", "/settings", "/probe-formats", "/upload",
 }
 
 # Random per-launch key, embedded in the LAN web UI's action links so that
@@ -195,6 +182,26 @@ def save_jobs_snapshot():
         log(f"couldn't save job history: {e}")
 
 
+def _migrate_extensionless(job):
+    """One-shot fix for restored jobs whose file landed with no extension."""
+    try:
+        p = stat_for(job)
+        if p.suffix or not p.exists():
+            return
+        ext = os.path.splitext(urlparse(job.get("url", "")).path)[1]
+        if not ext:
+            return
+        target = p.with_suffix(ext)
+        if target.exists():
+            return
+        os.replace(p, target)
+        job["filename"] = target.name
+        log(f"migrated extensionless file: {p.name} → {target.name}")
+        save_jobs_snapshot()
+    except Exception as e:
+        log(f"extensionless migration failed: {e}")
+
+
 def load_jobs_snapshot():
     if JOBS_PATH.exists():
         try:
@@ -205,6 +212,7 @@ def load_jobs_snapshot():
                 if j["status"] in ("downloading", "queued"):
                     j["status"] = "stopped"
                 JOBS[jid] = j
+                _migrate_extensionless(j)
             global JOB_COUNTER
             JOB_COUNTER = max([int(k) for k in JOBS.keys()] + [0])
         except Exception as e:
@@ -235,6 +243,45 @@ def safe_filename(name):
     return name
 
 
+_CT_EXT_MAP = [
+    ("video/mp4", ".mp4"), ("video/webm", ".webm"), ("video/x-matroska", ".mkv"),
+    ("video/quicktime", ".mov"), ("video/x-msvideo", ".avi"), ("video/mp2t", ".ts"),
+    ("audio/mpeg", ".mp3"), ("audio/mp4", ".m4a"), ("audio/x-m4a", ".m4a"),
+    ("audio/wav", ".wav"), ("audio/x-wav", ".wav"), ("audio/flac", ".flac"),
+    ("audio/aac", ".aac"), ("application/zip", ".zip"),
+    ("application/x-zip-compressed", ".zip"), ("application/x-7z-compressed", ".7z"),
+    ("application/x-rar-compressed", ".rar"), ("application/pdf", ".pdf"),
+    ("image/jpeg", ".jpg"), ("image/png", ".png"), ("image/gif", ".gif"),
+]
+_HEAD_EXT_CACHE = {}
+
+
+def guess_ext_from_head(url):
+    """HEAD the URL and map Content-Type to an extension. Cached per-URL so
+    repeated guesses (restored jobs, retries) don't re-hit the server."""
+    if url in _HEAD_EXT_CACHE:
+        return _HEAD_EXT_CACHE[url]
+    ext = ""
+    try:
+        r = requests.head(url, allow_redirects=True,
+                          timeout=STATE["connection_timeout"])
+        ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        for mime, e in _CT_EXT_MAP:
+            if ct == mime:
+                ext = e
+                break
+        if not ext:
+            cd = r.headers.get("Content-Disposition")
+            if cd:
+                m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
+                if m:
+                    ext = os.path.splitext(unquote(m.group(1)))[1]
+    except Exception:
+        pass
+    _HEAD_EXT_CACHE[url] = ext
+    return ext
+
+
 def guess_filename(url, content_disposition=None):
     if content_disposition:
         m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', content_disposition)
@@ -258,10 +305,21 @@ def detect_type(url):
     return "ytdlp"
 
 
-def new_job(url, filename=None, category=None, referer=None, cookie=None, user_agent=None, job_type=None):
+def new_job(url, filename=None, category=None, referer=None, cookie=None,
+            user_agent=None, job_type=None, format_id=None):
     jid = next_job_id()
     jtype = job_type or detect_type(url)
     fname = safe_filename(filename) if filename else guess_filename(url)
+    # Caller-supplied names (e.g. document.title from the extension) often
+    # have no extension — borrow one from the URL, then Content-Type, then
+    # fall back by job type.
+    if not os.path.splitext(fname)[1]:
+        ext = os.path.splitext(guess_filename(url))[1]
+        if not ext:
+            ext = guess_ext_from_head(url)
+        if not ext:
+            ext = ".mp4" if jtype == "ytdlp" else ".bin"
+        fname = fname + ext
     job_cat = category or category_for(fname)
 
     # Apply per-site rules
@@ -277,6 +335,7 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None, user_a
         "id": jid, "url": url, "filename": fname,
         "category": job_cat,
         "type": jtype, "status": "queued",
+        "format_id": format_id,
         "size_total": 0, "size_done": 0, "speed": "", "error": None,
         "referer": referer, "cookie": cookie, "user_agent": user_agent,
         "created_ts": time.time(),
@@ -492,13 +551,26 @@ def maybe_convert_to_mp4(job, dest):
     transcode (fallback) with ffmpeg. Returns the final path."""
     if not STATE.get("auto_mp4"):
         return dest
+    ext = dest.suffix.lower()
     video_exts = {".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".flv"}
-    if dest.suffix.lower() not in video_exts:
+    # Extensionless files are treated as unknown-video and probed, not skipped.
+    if ext == ".mp4" or (ext and ext not in video_exts):
         return dest
     ffmpeg = "ffmpeg"
     if getattr(sys, "frozen", False):
         ffmpeg = str(Path(sys._MEIPASS) / "ffmpeg.exe")
+    log(f"auto-mp4: ffmpeg={ffmpeg} exists={os.path.exists(ffmpeg)} "
+        f"input={dest.name} (ext={ext or '(none)'})")
     target = dest.with_suffix(".mp4")
+    log(f"auto-mp4: output → {target}")
+    # Confirm a video stream actually exists before running a full conversion.
+    try:
+        r = subprocess.run([ffmpeg, "-i", str(dest)], capture_output=True, timeout=60)
+        if b"Video" not in r.stderr:
+            log(f"auto-mp4: {dest.name} has no video stream, skipping")
+            return dest
+    except Exception as e:
+        log(f"auto-mp4: stream probe failed for {dest.name}: {e}")
     for args in (
         ["-c", "copy", "-movflags", "+faststart"],
         ["-c:v", "libx264", "-crf", "20", "-c:a", "aac"],
@@ -508,7 +580,9 @@ def maybe_convert_to_mp4(job, dest):
                 [ffmpeg, "-y", "-i", str(dest)] + args + [str(target)],
                 capture_output=True, timeout=600,
             )
-            if r.returncode == 0 and target.exists():
+            # Only trust the conversion if the output exists and is non-zero —
+            # a rc=0 run that wrote nothing must not cost us the source file.
+            if r.returncode == 0 and target.exists() and target.stat().st_size > 0:
                 try:
                     dest.unlink()
                 except OSError:
@@ -517,9 +591,12 @@ def maybe_convert_to_mp4(job, dest):
                 if Path(job["filename"]).suffix.lower() != ".mp4":
                     job["filename"] = target.name
                 return target
+            err_tail = (r.stderr or b"")[-500:].decode(errors="replace")
+            log(f"auto-mp4: ffmpeg rc={r.returncode} for {dest.name} — stderr tail: {err_tail}")
         except Exception as e:
             log(f"ffmpeg pass failed for {dest.name}: {e}")
     return dest
+
 
 
 try:
@@ -832,7 +909,9 @@ def run_ytdlp(job_id):
         headers["User-Agent"] = job["user_agent"]
 
     dest = stat_for(job)
-    outtmpl = str(dest.with_suffix(".%(ext)s"))
+    # stem + ".%(ext)s" — with_suffix() would treat a dotted tail that's part
+    # of the title (e.g. "Post_...lol_fr") as an extension and mangle it.
+    outtmpl = str(dest.parent / (dest.stem + ".%(ext)s"))
 
     def hook(d):
         while job["pause_evt"].is_set():
@@ -866,6 +945,8 @@ def run_ytdlp(job_id):
         "subtitleslangs": ["en"],
         "embedsubs": True,
     }
+    if job.get("format_id"):
+        ydl_opts["format"] = job["format_id"]
     lim = effective_speed_limit_kbps()
     if lim > 0:
         ydl_opts["ratelimit"] = lim * 1024
@@ -876,8 +957,21 @@ def run_ytdlp(job_id):
     try:
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([job["url"]])
+        # yt-dlp picks the real extension; find the file it actually wrote and
+        # record it so finished-job paths resolve correctly (and auto-mp4 runs).
+        try:
+            matches = [m for m in dest.parent.glob(dest.stem + ".*")
+                       if m.is_file() and not m.name.endswith(".part")]
+            if matches:
+                real = max(matches, key=lambda p: p.stat().st_size)
+                job["filename"] = real.name
+                real = maybe_convert_to_mp4(job, real)
+                job["filename"] = real.name
+                job["size_total"] = job["size_done"] = real.stat().st_size
+        except Exception as e:
+            log(f"job {job_id}: post-download filename fixup failed: {e}")
         job["status"] = "done"
-        log(f"job {job_id}: complete ✓")
+        log(f"job {job_id}: complete ✓ ({job['filename']})")
         try:
             d = stat_for(job)
             if d.exists():
@@ -943,6 +1037,7 @@ def download():
         url, filename=data.get("filename"), category=data.get("category"),
         referer=data.get("referer"), cookie=data.get("cookie"),
         user_agent=data.get("user_agent"), job_type=data.get("type"),
+        format_id=data.get("format_id"),
     )
     return jsonify({"job_id": jid})
 
@@ -1035,6 +1130,82 @@ def probe():
         return jsonify({"items": out})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/probe-formats", methods=["POST"])
+def probe_formats():
+    data = request.get_json(force=True, silent=True) or {}
+    url = data.get("url")
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        out = []
+        seen = set()
+        for f in info.get("formats") or []:
+            fid = str(f.get("format_id") or "")
+            if not fid or fid in seen:
+                continue
+            seen.add(fid)
+            vcodec = f.get("vcodec") or "none"
+            acodec = f.get("acodec") or "none"
+            if vcodec == "none" and acodec == "none":
+                continue
+            height = f.get("height") or 0
+            width = f.get("width") or 0
+            resolution = (f.get("resolution") or
+                          (f"{width}x{height}" if width and height else ""))
+            out.append({
+                "format_id": fid,
+                "ext": f.get("ext") or "",
+                "resolution": resolution,
+                "fps": f.get("fps") or 0,
+                "vcodec": vcodec,
+                "acodec": acodec,
+                "filesize": f.get("filesize") or f.get("filesize_approx") or 0,
+                "note": f.get("format_note") or "",
+            })
+        # Best-first: video height, then filesize; audio-only sinks last.
+        def _h(x):
+            tail = x["resolution"].split("x")[-1]
+            return (int(tail) if tail.isdigit() else 0, x["filesize"] or 0)
+        out.sort(key=_h, reverse=True)
+        return jsonify({"formats": out[:30]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    """Direct handoff for extension screen recordings (multipart, one file)."""
+    if request.content_length and request.content_length > MAX_UPLOAD_BYTES:
+        return jsonify({"error": "file too large (max 500 MB)"}), 413
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "missing 'file' field"}), 400
+    filename = safe_filename(f.filename or "recording.webm")
+    if not os.path.splitext(filename)[1]:
+        filename += ".webm"
+    dest_dir = Path(STATE["output_dir"]) / "Video"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename
+    f.save(str(dest))
+    jid = new_job(url=f"upload:///{dest.name}", filename=dest.name,
+                  category="Video", job_type="generic")
+    job = JOBS[jid]
+    job["status"] = "done"
+    if dest.exists():
+        job["size_total"] = job["size_done"] = dest.stat().st_size
+    dest = maybe_convert_to_mp4(job, dest)  # .webm → .mp4 when auto_mp4 is on
+    save_jobs_snapshot()
+    _fire_new_job_hooks(job)
+    log(f"uploaded recording: {dest.name}")
+    return jsonify({"ok": True, "job_id": jid})
 
 
 @app.route("/stats", methods=["GET"])
@@ -1914,8 +2085,27 @@ def main():
     try:
         from gui_qt import launch_gui
         launch_gui(new_job_hook=register_new_job_hook, home_dir=HOME)
-    except ImportError as e:
-        log(f"PySide6 GUI unavailable ({e}); falling back to Tkinter")
+    except ImportError:
+        log("PySide6 GUI unavailable; falling back to Tkinter")
+        # Imported lazily so the Tcl interpreter only loads when Tkinter is
+        # actually used — this is what keeps --onedir launches fast. `global`
+        # is required: names imported inside main() would otherwise be locals
+        # and invisible to the GUI class's methods.
+        global tk, ttk, filedialog, simpledialog, messagebox
+        global TkinterDnD, DND_FILES, COPY, REFUSE_DROP
+        import tkinter as tk
+        from tkinter import ttk, filedialog, simpledialog, messagebox
+        try:
+            from tkinterdnd2 import TkinterDnD, DND_FILES, COPY
+        except ImportError:  # older/alternate tkinterdnd2 builds name it DND_COPY
+            try:
+                from tkinterdnd2 import TkinterDnD, DND_FILES, DND_COPY as COPY
+            except ImportError:
+                from tkinterdnd2.TkinterDnD import TkinterDnD, DND_FILES, DND_COPY as COPY
+        try:
+            from tkinterdnd2 import REFUSE_DROP
+        except ImportError:
+            REFUSE_DROP = "refuse_drop"
         root = TkinterDnD.Tk()
         gui = GUI(root)
         start_clipboard_watcher(root)
