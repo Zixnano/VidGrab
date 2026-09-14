@@ -35,7 +35,19 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
-from tkinterdnd2 import TkinterDnD, DND_FILES, DND_COPY
+try:
+    # Drag ACTIONS are COPY/MOVE/LINK/REFUSE_DROP (no DND_ prefix — that prefix
+    # is only for data types like DND_FILES).
+    from tkinterdnd2 import TkinterDnD, DND_FILES, COPY
+except ImportError:  # older/alternate tkinterdnd2 builds name it DND_COPY
+    try:
+        from tkinterdnd2 import TkinterDnD, DND_FILES, DND_COPY as COPY
+    except ImportError:
+        from tkinterdnd2.TkinterDnD import TkinterDnD, DND_FILES, DND_COPY as COPY
+try:
+    from tkinterdnd2 import REFUSE_DROP
+except ImportError:
+    REFUSE_DROP = "refuse_drop"
 
 APP_PORT = 5757
 HOME = Path.home() / "Downloads" / "VideoGrabber"
@@ -1174,8 +1186,8 @@ class GUI:
                 if p.exists():
                     paths.append(str(p))
         if not paths:
-            return ("refuse_drag", DND_FILES)
-        return (DND_COPY, (DND_FILES, tuple(paths)))
+            return (REFUSE_DROP, DND_FILES, "")
+        return (COPY, DND_FILES, tuple(paths))
 
     def _on_drop_files(self, event):
         raw = event.data
