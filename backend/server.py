@@ -86,7 +86,30 @@ STATE = {
     "download_stats": [],
     "portable": False,
     "double_click": "open",
+    "force_on_top": True,
+    "watch_recording_folder": True,
+    "recording_watch_dirs": [],
+    "auto_mp4": True,
+    "close_to_tray": True,
+    "bandwidth_profiles": [],
+    "bandwidth_profiles_enabled": False,
 }
+
+_ON_NEW_JOB_HOOKS = []
+
+
+def register_new_job_hook(fn):
+    """GUI registers a callable here; called from any thread when a job is queued."""
+    _ON_NEW_JOB_HOOKS.append(fn)
+
+
+def _fire_new_job_hooks(job):
+    for fn in _ON_NEW_JOB_HOOKS:
+        try:
+            fn(job)
+        except Exception as e:
+            log(f"new-job hook failed: {e}")
+
 
 JOBS = {}
 JOB_COUNTER = 0
@@ -96,7 +119,11 @@ LOG_QUEUE = queue.Queue()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": r"chrome-extension://.*"}}, supports_credentials=False)
 
-TOKEN_PROTECTED_PATHS = {"/download", "/batch", "/pause", "/resume", "/stop", "/delete", "/probe", "/rules", "/jobs", "/stats", "/convert"}
+TOKEN_PROTECTED_PATHS = {
+    "/download", "/batch", "/pause", "/resume", "/stop", "/delete",
+    "/probe", "/rules", "/jobs", "/stats", "/convert", "/logs",
+    "/category", "/probe-head", "/settings",
+}
 
 # Random per-launch key, embedded in the LAN web UI's action links so that
 # unauthenticated page can still drive the token-protected action endpoints
@@ -262,7 +289,48 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None, user_a
         return jid
     log(f"job {jid} queued: {fname}")
     save_jobs_snapshot()
+    _fire_new_job_hooks(JOBS[jid])
     return jid
+
+
+def _active_bandwidth_profile():
+    """Return the first enabled profile whose time window covers now, or None.
+
+    Profiles are dicts: {"name", "start": "HH:MM", "end": "HH:MM",
+    "speed_limit_kbps": int}. Overnight windows (start > end) wrap midnight.
+    """
+    if not STATE.get("bandwidth_profiles_enabled"):
+        return None
+    now = time.localtime()
+    mins = now.tm_hour * 60 + now.tm_min
+    for p in STATE.get("bandwidth_profiles") or []:
+        try:
+            sh, sm = map(int, str(p.get("start", "")).split(":"))
+            eh, em = map(int, str(p.get("end", "")).split(":"))
+            start = sh * 60 + sm
+            end = eh * 60 + em
+        except Exception:
+            continue
+        if start == end:
+            continue
+        if start < end:
+            in_range = start <= mins < end
+        else:
+            in_range = mins >= start or mins < end
+        if in_range:
+            return p
+    return None
+
+
+def effective_speed_limit_kbps():
+    """Active bandwidth-profile limit if enabled and matching; else global."""
+    p = _active_bandwidth_profile()
+    if p is not None:
+        try:
+            return int(p.get("speed_limit_kbps", 0))
+        except (TypeError, ValueError):
+            return 0
+    return int(STATE.get("speed_limit_kbps", 0) or 0)
 
 
 class SpeedLimiter:
@@ -272,7 +340,7 @@ class SpeedLimiter:
         self.tokens = 0.0
 
     def consume(self, n):
-        limit = STATE["speed_limit_kbps"] * 1024
+        limit = effective_speed_limit_kbps() * 1024
         if limit <= 0:
             return
         with self.lock:
@@ -287,6 +355,38 @@ class SpeedLimiter:
 
 
 LIMITER = SpeedLimiter()
+
+
+def start_bandwidth_profile_watcher():
+    """Log when the active bandwidth profile changes (limit applied live)."""
+    last = {"key": None}
+
+    def loop():
+        while True:
+            try:
+                p = _active_bandwidth_profile()
+                if p is None:
+                    key = ("off", effective_speed_limit_kbps())
+                else:
+                    key = (p.get("name") or p.get("start"),
+                           int(p.get("speed_limit_kbps", 0) or 0))
+                if key != last["key"]:
+                    last["key"] = key
+                    if not STATE.get("bandwidth_profiles_enabled"):
+                        pass
+                    elif p is None:
+                        log(f"Bandwidth profile: none active "
+                            f"(global {effective_speed_limit_kbps()} KB/s)")
+                    else:
+                        lim = int(p.get("speed_limit_kbps", 0) or 0)
+                        label = p.get("name") or f"{p.get('start')}-{p.get('end')}"
+                        lim_s = "unlimited" if lim <= 0 else f"{lim} KB/s"
+                        log(f"Bandwidth profile active: {label} → {lim_s}")
+            except Exception as e:
+                log(f"bandwidth watcher: {e}")
+            time.sleep(30)
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def _dest_for(job):
@@ -384,6 +484,122 @@ def record_stat(nbytes):
     stats.append({"ts": time.time(), "bytes": nbytes})
     if len(stats) > 3600:
         del stats[: len(stats) - 3600]
+
+
+def maybe_convert_to_mp4(job, dest):
+    """If auto_mp4 is on and the file isn't already mp4, remux (fast) or
+    transcode (fallback) with ffmpeg. Returns the final path."""
+    if not STATE.get("auto_mp4"):
+        return dest
+    video_exts = {".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".flv"}
+    if dest.suffix.lower() not in video_exts:
+        return dest
+    ffmpeg = "ffmpeg"
+    if getattr(sys, "frozen", False):
+        ffmpeg = str(Path(sys._MEIPASS) / "ffmpeg.exe")
+    target = dest.with_suffix(".mp4")
+    for args in (
+        ["-c", "copy", "-movflags", "+faststart"],
+        ["-c:v", "libx264", "-crf", "20", "-c:a", "aac"],
+    ):
+        try:
+            r = subprocess.run(
+                [ffmpeg, "-y", "-i", str(dest)] + args + [str(target)],
+                capture_output=True, timeout=600,
+            )
+            if r.returncode == 0 and target.exists():
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                log(f"converted {dest.name} → {target.name}")
+                if Path(job["filename"]).suffix.lower() != ".mp4":
+                    job["filename"] = target.name
+                return target
+        except Exception as e:
+            log(f"ffmpeg pass failed for {dest.name}: {e}")
+    return dest
+
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    _WATCHDOG_OK = True
+except ImportError:
+    _WATCHDOG_OK = False
+
+
+class _RecordingHandler(FileSystemEventHandler):
+    VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        p = Path(event.src_path)
+        if p.suffix.lower() not in self.VIDEO_EXTS:
+            return
+        threading.Thread(target=self._import_after_delay,
+                         args=(p,), daemon=True).start()
+
+    def _import_after_delay(self, p):
+        last = -1
+        stable = 0
+        for _ in range(60):
+            time.sleep(1)
+            if not p.exists():
+                return
+            try:
+                size = p.stat().st_size
+            except OSError:
+                return
+            if size == last and size > 0:
+                stable += 1
+                if stable >= 2:
+                    break
+            else:
+                stable = 0
+            last = size
+        try:
+            dest_dir = Path(STATE["output_dir"]) / "Video"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / safe_filename(p.name)
+            if dest.exists():
+                return
+            shutil.copy2(p, dest)
+            log(f"auto-imported screen recording: {p.name}")
+            _fire_new_job_hooks({"filename": p.name, "category": "Video",
+                                 "status": "done", "auto_imported": True})
+        except Exception as e:
+            log(f"couldn't import recording {p.name}: {e}")
+
+
+def start_recording_watcher():
+    if not _WATCHDOG_OK:
+        log("watchdog not installed — screen-recording auto-import disabled")
+        return
+    if sys.platform != "win32":
+        return
+    if not STATE.get("watch_recording_folder", True):
+        return
+    custom = STATE.get("recording_watch_dirs")
+    if custom:
+        candidates = [Path(x) for x in custom]
+    else:
+        candidates = [
+            Path.home() / "Videos" / "Captures",
+            Path.home() / "Videos",
+            Path.home() / "Videos" / "Screen Recordings",
+        ]
+    seen = set()
+    observer = Observer()
+    for folder in candidates:
+        if folder.exists() and str(folder) not in seen:
+            observer.schedule(_RecordingHandler(), str(folder), recursive=False)
+            seen.add(str(folder))
+            log(f"watching for screen recordings: {folder}")
+    if seen:
+        observer.daemon = True
+        observer.start()
 
 
 # ---------------------------------------------------------------- generic downloader ------
@@ -504,6 +720,7 @@ def run_generic_segmented(job_id):
             with open(p, "rb") as inp:
                 shutil.copyfileobj(inp, out)
             p.unlink()
+    dest = maybe_convert_to_mp4(job, dest)
     job["status"] = "done"
     job["speed"] = ""
     record_stat(job["size_done"])
@@ -581,6 +798,7 @@ def _run_generic_single(job_id):
                         job["speed"] = f"{rate/1024:.0f} KB/s"
                         last_report, last_bytes = now, job["size_done"]
             os.replace(part, dest)
+            dest = maybe_convert_to_mp4(job, dest)
             job["status"] = "done"
             job["speed"] = ""
             record_stat(job["size_done"])
@@ -647,8 +865,9 @@ def run_ytdlp(job_id):
         "subtitleslangs": ["en"],
         "embedsubs": True,
     }
-    if STATE["speed_limit_kbps"] > 0:
-        ydl_opts["ratelimit"] = STATE["speed_limit_kbps"] * 1024
+    lim = effective_speed_limit_kbps()
+    if lim > 0:
+        ydl_opts["ratelimit"] = lim * 1024
     if getattr(sys, "frozen", False):
         ydl_opts["ffmpeg_location"] = sys._MEIPASS
 
@@ -850,6 +1069,63 @@ def convert(job_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/logs", methods=["GET"])
+def logs_endpoint():
+    lines = []
+    while not LOG_QUEUE.empty():
+        try:
+            lines.append(LOG_QUEUE.get_nowait())
+        except queue.Empty:
+            break
+    return jsonify({"logs": lines[-200:]})
+
+
+@app.route("/category/<job_id>", methods=["POST"])
+def set_category(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    data = request.get_json(force=True, silent=True) or {}
+    job["category"] = data.get("category", "Other")
+    save_jobs_snapshot()
+    return jsonify({"ok": True})
+
+
+@app.route("/probe-head", methods=["POST"])
+def probe_head():
+    data = request.get_json(force=True, silent=True) or {}
+    url = data.get("url")
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+    try:
+        r = requests.head(url, allow_redirects=True,
+                          timeout=STATE["connection_timeout"])
+        return jsonify({
+            "size": int(r.headers.get("Content-Length", 0)),
+            "content_type": r.headers.get("Content-Type", ""),
+            "filename_guess": guess_filename(url, r.headers.get("Content-Disposition")),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/settings", methods=["POST"])
+def update_settings():
+    data = request.get_json(force=True, silent=True) or {}
+    for k, v in data.items():
+        if k == "api_token" or k not in STATE:
+            continue
+        # Dict-valued settings (e.g. per_category_dirs) are merged key-by-key
+        # rather than replaced outright, so setting one category's override
+        # (as the "Remember this path" checkbox does) doesn't wipe the rest.
+        if isinstance(STATE[k], dict) and isinstance(v, dict):
+            STATE[k].update(v)
+        else:
+            STATE[k] = v
+    save_settings()
+    return jsonify({"ok": True})
+
+
 @app.route("/remote", methods=["GET"])
 def remote_ui():
     rows = "".join(
@@ -973,6 +1249,19 @@ class GUI:
         self.tree.bind("<<DragInitCmd>>", self._on_drag_init)
         self.tree.drop_target_register(DND_FILES)
         self.tree.dnd_bind("<<Drop>>", self._on_drop_files)
+
+        register_new_job_hook(lambda job: self.root.after(0, self._bring_to_front))
+
+    def _bring_to_front(self):
+        if not STATE.get("force_on_top", True):
+            return
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(400, lambda: self.root.attributes("-topmost", False))
+        except tk.TclError:
+            pass
 
     def _build_context_menu(self):
         self.menu = tk.Menu(self.root, tearoff=0)
@@ -1527,7 +1816,10 @@ class GUI:
                         "min_speed_kbps": 0, "defender_scan": False,
                         "auto_shutdown": False, "auto_extract": False,
                         "open_folder_on_complete": False, "play_sound_on_complete": False,
-                        "per_category_dirs": {}, "file_types_overrides": {}}
+                        "per_category_dirs": {}, "file_types_overrides": {},
+                        "close_to_tray": True,
+                        "bandwidth_profiles": [],
+                        "bandwidth_profiles_enabled": False}
             STATE.update(defaults)
             save_settings()
 
@@ -1614,12 +1906,19 @@ def main():
 
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=dispatcher_loop, daemon=True).start()
+    start_recording_watcher()
+    start_bandwidth_profile_watcher()
     log(f"Server started on port {APP_PORT}. Saving to {STATE['output_dir']}")
 
-    root = TkinterDnD.Tk()
-    gui = GUI(root)
-    start_clipboard_watcher(root)
-    root.mainloop()
+    try:
+        from gui_qt import launch_gui
+        launch_gui(new_job_hook=register_new_job_hook, home_dir=HOME)
+    except ImportError as e:
+        log(f"PySide6 GUI unavailable ({e}); falling back to Tkinter")
+        root = TkinterDnD.Tk()
+        gui = GUI(root)
+        start_clipboard_watcher(root)
+        root.mainloop()
     save_jobs_snapshot()
 
 
