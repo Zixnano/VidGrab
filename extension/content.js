@@ -60,8 +60,18 @@
       wrap.remove();
     });
 
+    const menu = document.createElement("div");
+    menu.style.cssText = `
+      position: absolute; top: 100%; left: 0; margin-top: 6px; min-width: 250px;
+      background: rgba(18,22,28,0.97); color: #fff;
+      border: 1px solid rgba(255,255,255,0.12); border-radius: 10px;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+      display: none; flex-direction: column; padding: 6px;
+      font: 12px/1.4 -apple-system, Segoe UI, Roboto, sans-serif;
+    `;
     wrap.appendChild(btn);
     wrap.appendChild(closeBtn);
+    wrap.appendChild(menu);
     document.documentElement.appendChild(wrap);
 
     function position() {
@@ -80,7 +90,7 @@
     const ro = new ResizeObserver(reposition);
     ro.observe(video);
 
-    return { wrap, btn, label, icon, position };
+    return { wrap, btn, label, icon, menu, position };
   }
 
   function setLabel(overlay, text, color) {
@@ -88,38 +98,75 @@
     if (color) overlay.icon.style.color = color;
   }
 
-  async function handleDirectDownload(video, overlay) {
-    setLabel(overlay, "Sending…");
-    const base = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
-    // document.title never carries a file extension, which made the app save
-    // files with no extension. Borrow the real one from the stream URL's
-    // path; if the URL has none either, omit filename entirely and let the
-    // backend guess it from the URL / Content-Type (server-side fix).
-    let ext = "";
-    try {
-      ext = (new URL(video.currentSrc).pathname.match(/(\.[A-Za-z0-9]{1,5})$/) || [""])[0];
-    } catch (e) {}
-    const payload = {
-      type: "RELAY_DOWNLOAD",
-      url: video.currentSrc,
-      pageUrl: location.href,
-    };
-    if (ext) payload.filename = base + ext;
-    chrome.runtime.sendMessage(
-      payload,
-      (resp) => {
-        if (chrome.runtime.lastError) {
-          setLabel(overlay, "Extension error", "#e53935");
-          return;
+  // ---------- format-picker helpers ----------
+
+  function fmtBytes(n) {
+    if (!n) return "";
+    const units = ["B", "KB", "MB", "GB"];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(n >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+  }
+
+  function streamInfo(video) {
+    const w = video.videoWidth, h = video.videoHeight;
+    const dims = w && h ? `${w}×${h}` : "unknown size";
+    let dur = "";
+    if (video.duration && isFinite(video.duration)) {
+      const m = Math.floor(video.duration / 60);
+      const s = Math.floor(video.duration % 60);
+      dur = ` · ${m}:${String(s).padStart(2, "0")}`;
+    }
+    return dims + dur;
+  }
+
+  function formatLabel(f) {
+    const res = f.resolution || "";
+    const ext = f.ext || "";
+    const size = f.filesize ? fmtBytes(f.filesize) : "";
+    const kind = !f.vcodec || f.vcodec === "none" ? "audio only" : "";
+    return [res, ext, kind, size].filter(Boolean).join(" · ");
+  }
+
+  // Probe results cached per URL so reopening the menu doesn't re-hit the app.
+  const FORMAT_CACHE = new Map();
+  function probeFormatsCached(url) {
+    if (!url) return Promise.resolve(null);
+    if (!FORMAT_CACHE.has(url)) {
+      FORMAT_CACHE.set(url, new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: "PROBE_FORMATS", url }, (resp) => {
+            resolve(chrome.runtime.lastError ? null : resp);
+          });
+        } catch (e) {
+          resolve(null);
         }
-        if (resp && resp.ok) {
-          setLabel(overlay, "Sent to app ✓", "#4caf50");
-          setTimeout(() => setLabel(overlay, "Download this video", "#4caf50"), 2500);
-        } else {
-          setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", "#e53935");
-        }
-      }
-    );
+      }));
+    }
+    return FORMAT_CACHE.get(url);
+  }
+
+  function addMenuItem(menu, text, opts = {}, onClick) {
+    const el = document.createElement("div");
+    el.textContent = text;
+    el.style.cssText = "padding:6px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;";
+    if (opts.dim) el.style.color = "#9aa7b4";
+    if (opts.header) {
+      el.style.cssText += "cursor:default;font-weight:600;color:#e6edf3;";
+    }
+    if (!opts.header) {
+      el.addEventListener("mouseenter", () => { el.style.background = "rgba(76,175,80,0.18)"; });
+      el.addEventListener("mouseleave", () => { el.style.background = "transparent"; });
+      el.addEventListener("click", (e) => { e.stopPropagation(); if (onClick) onClick(); });
+    }
+    menu.appendChild(el);
+    return el;
+  }
+
+  function addDivider(menu) {
+    const el = document.createElement("div");
+    el.style.cssText = "margin:4px 6px;border-top:1px solid rgba(255,255,255,0.12);";
+    menu.appendChild(el);
   }
 
   async function handleSendPageUrl(video, overlay) {
@@ -226,6 +273,105 @@
 
     const overlay = makeOverlay(video);
     const isBlob = () => (video.currentSrc || "").startsWith("blob:");
+    let menuOpen = false;
+    let menuSeq = 0;
+
+    function closeMenu() {
+      if (!menuOpen) return;
+      menuOpen = false;
+      overlay.menu.style.display = "none";
+      document.removeEventListener("click", onDocClick, true);
+    }
+
+    function onDocClick(e) {
+      if (!overlay.wrap.contains(e.target)) closeMenu();
+    }
+
+    function sendChoice({ format_id = null, target_format = null } = {}) {
+      closeMenu();
+      setLabel(overlay, "Sending…");
+      const base = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+      // document.title has no extension — borrow it from the stream URL;
+      // if there is none, omit filename so the backend guesses it.
+      let ext = "";
+      try {
+        ext = (new URL(video.currentSrc).pathname.match(/(\.[A-Za-z0-9]{1,5})$/) || [""])[0];
+      } catch (e) {}
+      const payload = {
+        type: "RELAY_DOWNLOAD",
+        url: video.currentSrc,
+        pageUrl: location.href,
+        filename: ext ? base + ext : undefined,
+        format_id: format_id,
+        target_format: target_format,
+      };
+      chrome.runtime.sendMessage(payload, (resp) => {
+        if (chrome.runtime.lastError) {
+          setLabel(overlay, "Extension error", "#e53935");
+          return;
+        }
+        if (resp && resp.ok) {
+          setLabel(overlay, "Sent to app ✓", "#4caf50");
+          setTimeout(() => setLabel(overlay, "Download ▾", "#4caf50"), 2500);
+        } else {
+          setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", "#e53935");
+        }
+      });
+    }
+
+    function toggleMenu() {
+      if (menuOpen) { closeMenu(); return; }
+      menuOpen = true;
+      const seq = ++menuSeq;
+      const menu = overlay.menu;
+      menu.innerHTML = "";
+
+      addMenuItem(menu, streamInfo(video), { header: true });
+      addMenuItem(menu, "Best quality", {}, () => {
+        // Direct media files (.webm/.mkv/... served straight to <video>):
+        // take the file as-is — forcing mp4 would mean a full re-encode.
+        // Page URLs (yt-dlp path): default to mp4, which is a fast remux.
+        const directFile = /\.(mp4|webm|mkv|mov|m4v|avi)(\?|#|$)/i.test(video.currentSrc || "");
+        sendChoice(directFile ? {} : { target_format: "mp4" });
+      });
+      addDivider(menu);
+      const fmtBox = document.createElement("div");
+      menu.appendChild(fmtBox);
+      const loadingEl = addMenuItem(fmtBox, "Loading formats…",
+        { dim: true, header: true });
+      addDivider(menu);
+      addMenuItem(menu, "Extract audio → MP3", {},
+        () => sendChoice({ target_format: "mp3" }));
+      addMenuItem(menu, "Extract audio → FLAC", {},
+        () => sendChoice({ target_format: "flac" }));
+      addMenuItem(menu, "Extract audio → Opus", {},
+        () => sendChoice({ target_format: "opus" }));
+      addDivider(menu);
+      addMenuItem(menu, "Send page URL to Grabber (no menu)", { dim: true },
+        () => { closeMenu(); handleSendPageUrl(video, overlay); });
+
+      menu.style.display = "flex";
+      document.addEventListener("click", onDocClick, true);
+
+      // Populate formats async; if the probe fails the menu still works —
+      // Best quality + audio extraction are always usable.
+      probeFormatsCached(video.currentSrc).then((data) => {
+        if (seq !== menuSeq || !menuOpen) return; // stale probe or menu closed
+        loadingEl.remove();
+        const formats = (data && data.formats) || [];
+        if (!formats.length) {
+          addMenuItem(fmtBox,
+            "No format list — Best quality will be used",
+            { dim: true, header: true });
+          return;
+        }
+        for (const f of formats.slice(0, 12)) {
+          const tf = f.ext === "webm" ? "webm" : null;
+          addMenuItem(fmtBox, formatLabel(f), {},
+            () => sendChoice({ format_id: f.format_id, target_format: tf }));
+        }
+      });
+    }
 
     const refresh = () => {
       if (RECORDERS.has(video)) return; // don't clobber label mid-recording
@@ -240,7 +386,7 @@
       if (isBlob()) {
         setLabel(overlay, "Record this video", "#e53935");
       } else {
-        setLabel(overlay, "Download this video", "#4caf50");
+        setLabel(overlay, "Download ▾", "#4caf50");
       }
     };
     refresh();
@@ -250,13 +396,11 @@
     overlay.btn.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
-      if (isMseOnlySite()) {
-        handleSendPageUrl(video, overlay);
-      } else if (isBlob()) {
-        handleRecordToggle(video, overlay);
-      } else if (video.currentSrc) {
-        handleDirectDownload(video, overlay);
-      }
+      if (RECORDERS.has(video)) { handleRecordToggle(video, overlay); return; }
+      if (isMseOnlySite()) { handleSendPageUrl(video, overlay); return; }
+      if (isBlob()) { handleRecordToggle(video, overlay); return; }
+      if (!video.currentSrc) return;
+      toggleMenu();
     });
   }
 

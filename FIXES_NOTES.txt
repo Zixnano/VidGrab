@@ -1,31 +1,66 @@
-WHAT'S FIXED IN THIS BUILD
-==========================
-All seven problems from the original list are now implemented:
+VIDEO GRABBER — FULL CHANGE LOG (all 7 original problems + 7 roadmap sessions)
+================================================================================
 
-  Problem 1:  Context menu + toolbar actions fixed. Handlers read
-              _current_ctx (set from the right-click position, immune to the
-              1s model reset); refresh() re-applies the selection after each
-              reset; empty selections now show "Select a row first."
-  Problem 2:  Quality dropdown in Add Download (probed on a background
-              thread via /probe-formats, passed through as format_id).
-  Problem 3:  Screen recordings upload to the app via the service worker
-              (/upload); <a download> remains the fallback.
-  Problem 4:  Auto-MP4 handles extensionless files, probes for a video
-              stream, verifies output before deleting source, logs
-              diagnostics; run_ytdlp fixes output template + resolves the
-              real on-disk filename.
-  Problem 5:  Lazy tkinter imports + --onedir build (workflow + docs).
-  Problem 6:  Settings dialog (General / Downloads / Post-Download /
-              Pairing) via toolbar button and File menu.
-  Problem 7:  Extensionless filename fixes (new_job, HEAD Content-Type
-              guess, content.js sends real extension), one-shot migration.
+ORIGINAL PROBLEMS
+  1. Context menu/toolbar dead + selection vanished
+     -> handlers read _current_ctx set from indexAt(pos); refresh() re-applies
+        selection after each model reset; "Select a row first." on empty.
+  2. Quality picker -> /probe-formats endpoint, format_id pass-through,
+     Quality combo in AddDownloadDialog (background-thread probe + Signal).
+  3. Recordings -> /upload endpoint; ArrayBuffer via service worker;
+     <a download> kept as fallback.
+  4. Auto-MP4: extensionless probed not skipped, stream check, output
+     verified before deleting source, diagnostics logged; run_ytdlp outtmpl
+     uses stem+" .%(ext)s", real filename resolved post-download.
+  5. Launch speed: lazy tkinter imports; --onedir build.
+  6. Settings dialog (4 tabs) via toolbar + File menu.
+  7. Extensionless filenames: content.js sends real ext or omits; new_job
+     falls back URL -> HEAD Content-Type -> default; one-shot migration in
+     load_jobs_snapshot.
 
-TEST FOCUS (the confirmed bugs):
-  1. Right-click Open/Open folder/Resume/Stop/Redownload/Remove;
-     toolbar Stop/Pause/Resume/Delete; selection should STAY highlighted.
-  2. Paste a YouTube URL in Add URL -> Quality list populates.
-  3. Record a blob video -> appears in the app as a done job.
-  4. Extensionless/WebM downloads -> become .mp4; log shows auto-mp4 lines.
-  6. Gear button / File -> Settings -> change a value, restart app, check
-     it stuck.
-  7. Re-download the page that produced "..._lol_fr" -> gets .mp4.
+ROADMAP SESSIONS
+  1. Sortable column headers (sort after filter+search, arrow indicators),
+     search matches filename+category+status+URL, _selected_rows falls back
+     to selectedIndexes (batch delete).
+  2. Auto-pairing: POST /pair (localhost-only, once per session),
+     pairIfNeeded() in background.js, Options "Test connection" button.
+  3. Icon set: 7 SVGs in icons/ (concept: green arrow into tray on
+     near-black rounded square) + ICONS.md with ICO conversion steps and
+     the --icon=VideoGrabber.ico flag.
+  4. Format picker on hover pill: "Download" menu with Best quality,
+     probed formats, audio extraction (MP3/FLAC/Opus); server-side
+     target_format support incl. FFmpegExtractAudio + maybe_convert_target.
+  5. Popup overhaul: media-list manager (tabs, sizes, per-row actions,
+     toolbar with Merge/Download/Copy/Toggle/Filter/Clear/Search);
+     background.js captures Content-Length, addItem preserves real data,
+     CLEAR_VIDEOS + GET_ALL_VIDEOS messages.
+  6. Conversion progress: no console windows (CREATE_NO_WINDOW), /convert
+     non-blocking with progress thread; GUI shows "conv N%" + WARN state.
+  7. Cleanup: README onedir command, settings-load logging, error key
+     excluded from snapshots, HEAD-ext cache cap.
+
+TEST PRIORITIES (confirmed bugs from the original list)
+  - Right-click every menu item; selection persists; toolbar buttons work.
+  - YouTube URL -> Quality dropdown populates; pick 720p -> that format lands.
+  - Record a blob video -> done job appears in app.
+  - Extensionless/WebM downloads -> .mp4 with auto-mp4 log lines.
+  - "..._lol_fr" page re-download -> gets .mp4.
+  - Convert a done job -> amber progress bar, no console window.
+  - Extension: format menu on pill; popup tabs/filter/search; auto-pair.
+
+REVIEW ROUND (DeepSeek findings) — ALL ADDRESSED:
+  1. glob bracket bug: dest.stem wrapped in glob.escape() in run_ytdlp fixup.
+  2. Icons wired end-to-end: manifest.json icons + action.default_icon,
+     PNG exports committed (extension/icons/, icons/), backend/
+     VideoGrabber.ico committed, --icon= flag in build-exe.yml + build_exe.md.
+  3. Global queue pause/resume: toolbar Queue toggle button (Pause/Start
+     Queue label from saved queue_running state).
+  4. README tab list matches the Qt Settings dialog, which now also has
+     Connection / Save To / File Types tabs (not just docs-fixed).
+  5. Properties re-fetches the job by id at click time (no stale snapshot).
+  6. "Best quality" no longer forces mp4 re-encode for direct .webm/.mkv
+     files; only yt-dlp page URLs default to mp4.
+
+FINAL: cleanup_partial_files() glob also escaped (bracketed titles left
+orphaned .part siblings behind). Verified: only two .glob() call sites
+remain in server.py, both escaped.

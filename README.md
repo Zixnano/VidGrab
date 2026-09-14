@@ -26,6 +26,7 @@ video-grabber/
    `http://127.0.0.1:5757`. Leave it running. If PySide6 fails to import
    (e.g. it wasn't installed), the app automatically falls back to the
    older Tkinter window and logs why.
+   Files are saved under `%USERPROFILE%\Downloads\VideoGrabber\`.
 2. **Extension**: open `chrome://extensions`, enable Developer Mode, "Load
    unpacked", select the `extension/` folder.
 3. Pair them: in the app, **Tools → Copy pairing token for extension**, then
@@ -55,7 +56,7 @@ Full steps are in `backend/build_exe.md`. Short version:
 ```
 cd backend
 pip install -r requirements.txt
-pyinstaller --onefile --noconsole --name VideoGrabber --collect-all yt_dlp server.py
+pyinstaller --onedir --noconsole --name VideoGrabber --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 --add-binary "ffmpeg.exe;." server.py
 ```
 
 (Or push to GitHub — the workflow in `.github/workflows/build-exe.yml`
@@ -118,8 +119,10 @@ GUI:
 - **Download-finished toast** with Open file / Open folder, auto-dismiss.
 - **Minimize-to-bar**: closing the window drops to a small always-on-top
   status strip (green dot = active downloads) instead of quitting.
-- **Tabbed Options**: General, File Types, Save-to (per-category folders),
-  Downloads, Connection (timeout/retries), Post-Download.
+- **Tabbed Options**: the Settings dialog (toolbar **⚙ Settings** or
+  File → **Settings…**) has General, Downloads, Connection (timeout/retries/
+  min-speed), Save To (default + per-category folders), File Types (disable
+  capture per extension), Post-Download, and Pairing tabs.
 - **Post-download actions**: Windows Defender scan, auto-extract zips,
   open containing folder, play sound, shut down PC when queue empties.
 - **Portable mode**: drop a `portable.txt` next to the exe and settings/jobs
@@ -158,9 +161,4 @@ GUI:
   on right-click in Chrome) — doable, just not built yet; the hover pill,
   popup list and page scanner cover the same ground.
 
-## Sensible next steps if you keep building this
 
-- Swap the minimize-to-bar strip for a proper `pystray` tray icon.
-- Browser context-menu entry point (see above).
-- Smarter batch scanning (merge the network-sniffed list from `background.js`
-  into the popup's DOM scan).

@@ -19,9 +19,14 @@
 </head>
 <body>
   <h1>Pair with Video Grabber</h1>
-  <p>In the desktop app: <b>Tools → Copy pairing token for extension</b>, then paste it below.</p>
+  <p>Pairing is usually automatic. If the extension can't reach the app,
+     paste the token manually (in the desktop app: <b>Tools → Copy pairing
+     token for extension</b>).</p>
   <input id="token" type="text" placeholder="Paste pairing token here" />
-  <button id="save">Save</button>
+  <div style="display:flex; gap:8px; margin:4px 0;">
+    <button id="save">Save</button>
+    <button id="test">Test connection</button>
+  </div>
   <div id="status"></div>
   <hr />
   <div class="checkbox-row">

@@ -16,6 +16,7 @@ mode, per-site rules, post-download conversion, Link Grabber, LAN web UI.
 Freeze with PyInstaller — see build_exe.md.
 """
 
+import glob
 import json
 import os
 import re
@@ -38,6 +39,9 @@ from watchdog.events import FileSystemEventHandler
 # interpreter only loads when the Tkinter fallback is actually used.
 
 APP_PORT = 5757
+
+# Keep ffmpeg / Defender from flashing console windows when frozen on Windows.
+_CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 HOME = Path.home() / "Downloads" / "VideoGrabber"
 CONFIG_PATH = HOME / "settings.json"
 JOBS_PATH = HOME / "jobs.json"
@@ -118,6 +122,11 @@ TOKEN_PROTECTED_PATHS = {
 # without exposing them to anyone else on the network.
 REMOTE_KEY = secrets.token_hex(8)
 
+# Auto-pairing: one successful /pair per app session. The endpoint is
+# deliberately NOT in TOKEN_PROTECTED_PATHS — it's guarded by the
+# localhost-only check and this once-per-session flag instead.
+_PAIR_GRANTED = False
+
 
 @app.before_request
 def _require_api_token():
@@ -154,8 +163,8 @@ def load_settings():
     if CONFIG_PATH.exists():
         try:
             STATE.update(json.loads(CONFIG_PATH.read_text()))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"couldn't read settings.json ({e}); using defaults")
     if not STATE.get("api_token"):
         STATE["api_token"] = secrets.token_hex(16)
         save_settings()
@@ -174,7 +183,7 @@ def save_jobs_snapshot():
         snap = {}
         for jid, j in JOBS.items():
             snap[jid] = {k: v for k, v in j.items()
-                         if k not in ("pause_evt", "stop_evt", "cookie", "referer", "user_agent")}
+                         if k not in ("pause_evt", "stop_evt", "cookie", "referer", "user_agent", "error")}
         tmp = JOBS_PATH.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(snap, indent=2))
         os.replace(tmp, JOBS_PATH)
@@ -279,6 +288,8 @@ def guess_ext_from_head(url):
     except Exception:
         pass
     _HEAD_EXT_CACHE[url] = ext
+    if len(_HEAD_EXT_CACHE) > 5000:
+        _HEAD_EXT_CACHE.clear()
     return ext
 
 
@@ -306,7 +317,7 @@ def detect_type(url):
 
 
 def new_job(url, filename=None, category=None, referer=None, cookie=None,
-            user_agent=None, job_type=None, format_id=None):
+            user_agent=None, job_type=None, format_id=None, target_format=None):
     jid = next_job_id()
     jtype = job_type or detect_type(url)
     fname = safe_filename(filename) if filename else guess_filename(url)
@@ -335,7 +346,7 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
         "id": jid, "url": url, "filename": fname,
         "category": job_cat,
         "type": jtype, "status": "queued",
-        "format_id": format_id,
+        "format_id": format_id, "target_format": target_format,
         "size_total": 0, "size_done": 0, "speed": "", "error": None,
         "referer": referer, "cookie": cookie, "user_agent": user_agent,
         "created_ts": time.time(),
@@ -474,7 +485,7 @@ def cleanup_partial_files(job):
         except OSError:
             pass
     if dest.parent.exists():
-        for sibling in dest.parent.glob(dest.name + ".part*"):
+        for sibling in dest.parent.glob(glob.escape(dest.name) + ".part*"):
             try:
                 sibling.unlink()
             except OSError:
@@ -489,7 +500,8 @@ def scan_file(path):
         return
     try:
         r = subprocess.run([defender, "-Scan", "-ScanType", "3", "-File", str(path)],
-                           capture_output=True, timeout=120)
+                           capture_output=True, timeout=120,
+                           creationflags=_CREATE_NO_WINDOW)
         if r.returncode != 0:
             log(f"Defender flagged {path.name} (rc={r.returncode})")
     except Exception as e:
@@ -546,6 +558,50 @@ def record_stat(nbytes):
         del stats[: len(stats) - 3600]
 
 
+AUDIO_ONLY_TARGETS = {"mp3", "flac", "opus"}
+
+
+def maybe_convert_target(job, dest):
+    """Convert a finished direct download to the job's requested target
+    format; when no target was requested, fall back to the legacy
+    auto-mp4 behavior. Audio-only targets strip the video track."""
+    target = (job.get("target_format") or "").lower().lstrip(".")
+    if not target:
+        return maybe_convert_to_mp4(job, dest)
+    if dest.suffix.lower().lstrip(".") == target:
+        return dest
+    try:
+        target_path = dest.with_suffix("." + target)
+    except ValueError:
+        log(f"target-format convert: invalid target '{target}', skipping")
+        return dest
+    ffmpeg = "ffmpeg"
+    if getattr(sys, "frozen", False):
+        ffmpeg = str(Path(sys._MEIPASS) / "ffmpeg.exe")
+    cmd = [ffmpeg, "-y", "-i", str(dest)]
+    if target in AUDIO_ONLY_TARGETS:
+        cmd += ["-vn"]
+        if target == "mp3":
+            cmd += ["-b:a", "192k"]
+    cmd += [str(target_path)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=600,
+                           creationflags=_CREATE_NO_WINDOW)
+        if r.returncode == 0 and target_path.exists() and target_path.stat().st_size > 0:
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+            job["filename"] = target_path.name
+            log(f"converted {dest.name} → {target_path.name}")
+            return target_path
+        err_tail = (r.stderr or b"")[-300:].decode(errors="replace")
+        log(f"target-format convert failed for {dest.name} (rc={r.returncode}): {err_tail}")
+    except Exception as e:
+        log(f"target-format convert failed for {dest.name}: {e}")
+    return dest
+
+
 def maybe_convert_to_mp4(job, dest):
     """If auto_mp4 is on and the file isn't already mp4, remux (fast) or
     transcode (fallback) with ffmpeg. Returns the final path."""
@@ -565,7 +621,8 @@ def maybe_convert_to_mp4(job, dest):
     log(f"auto-mp4: output → {target}")
     # Confirm a video stream actually exists before running a full conversion.
     try:
-        r = subprocess.run([ffmpeg, "-i", str(dest)], capture_output=True, timeout=60)
+        r = subprocess.run([ffmpeg, "-i", str(dest)], capture_output=True, timeout=60,
+                           creationflags=_CREATE_NO_WINDOW)
         if b"Video" not in r.stderr:
             log(f"auto-mp4: {dest.name} has no video stream, skipping")
             return dest
@@ -579,6 +636,7 @@ def maybe_convert_to_mp4(job, dest):
             r = subprocess.run(
                 [ffmpeg, "-y", "-i", str(dest)] + args + [str(target)],
                 capture_output=True, timeout=600,
+                creationflags=_CREATE_NO_WINDOW,
             )
             # Only trust the conversion if the output exists and is non-zero —
             # a rc=0 run that wrote nothing must not cost us the source file.
@@ -798,7 +856,7 @@ def run_generic_segmented(job_id):
             with open(p, "rb") as inp:
                 shutil.copyfileobj(inp, out)
             p.unlink()
-    dest = maybe_convert_to_mp4(job, dest)
+    dest = maybe_convert_target(job, dest)
     job["status"] = "done"
     job["speed"] = ""
     record_stat(job["size_done"])
@@ -876,7 +934,7 @@ def _run_generic_single(job_id):
                         job["speed"] = f"{rate/1024:.0f} KB/s"
                         last_report, last_bytes = now, job["size_done"]
             os.replace(part, dest)
-            dest = maybe_convert_to_mp4(job, dest)
+            dest = maybe_convert_target(job, dest)
             job["status"] = "done"
             job["speed"] = ""
             record_stat(job["size_done"])
@@ -947,6 +1005,24 @@ def run_ytdlp(job_id):
     }
     if job.get("format_id"):
         ydl_opts["format"] = job["format_id"]
+    tf = (job.get("target_format") or "").lower()
+    if tf in ("mp3", "flac", "opus"):
+        # Audio-only extraction: best audio stream, no video/subtitle work.
+        ydl_opts["format"] = "bestaudio/best"
+        pp = {"key": "FFmpegExtractAudio", "preferredcodec": tf}
+        if tf == "mp3":
+            pp["preferredquality"] = "192"
+        ydl_opts["postprocessors"] = [pp]
+        ydl_opts.pop("writesubtitles", None)
+        ydl_opts.pop("writeautomaticsub", None)
+        ydl_opts.pop("subtitleslangs", None)
+        ydl_opts.pop("embedsubs", None)
+    elif tf == "webm":
+        # Keep VP9/Opus streams in a WebM container instead of remuxing to mp4.
+        ydl_opts["merge_output_format"] = "webm"
+        if not job.get("format_id"):
+            ydl_opts["format"] = ("bestvideo[vcodec^=vp9]+bestaudio[acodec=opus]/"
+                                  "bestvideo[ext=webm]+bestaudio[ext=webm]/best")
     lim = effective_speed_limit_kbps()
     if lim > 0:
         ydl_opts["ratelimit"] = lim * 1024
@@ -960,7 +1036,10 @@ def run_ytdlp(job_id):
         # yt-dlp picks the real extension; find the file it actually wrote and
         # record it so finished-job paths resolve correctly (and auto-mp4 runs).
         try:
-            matches = [m for m in dest.parent.glob(dest.stem + ".*")
+            # glob.escape(): "[" / "]" are legal in Windows filenames but
+            # wildcards to glob() — titles like "Song [Official Video]"
+            # would never match their own file.
+            matches = [m for m in dest.parent.glob(glob.escape(dest.stem) + ".*")
                        if m.is_file() and not m.name.endswith(".part")]
             if matches:
                 real = max(matches, key=lambda p: p.stat().st_size)
@@ -1027,6 +1106,22 @@ def health():
     return jsonify({"ok": True})
 
 
+@app.route("/pair", methods=["POST"])
+def pair():
+    """Handshake for the extension: hand out the API token, but only to a
+    localhost peer, and only once per app session."""
+    global _PAIR_GRANTED
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        log(f"pair attempt rejected: remote_addr={request.remote_addr}")
+        return jsonify({"error": "pairing only allowed from localhost"}), 403
+    if _PAIR_GRANTED:
+        log("pair attempt rejected: already granted this session")
+        return jsonify({"error": "pairing already granted this session"}), 403
+    _PAIR_GRANTED = True
+    log("extension paired automatically")
+    return jsonify({"token": STATE.get("api_token", "")})
+
+
 @app.route("/download", methods=["POST"])
 def download():
     data = request.get_json(force=True, silent=True) or {}
@@ -1037,7 +1132,7 @@ def download():
         url, filename=data.get("filename"), category=data.get("category"),
         referer=data.get("referer"), cookie=data.get("cookie"),
         user_agent=data.get("user_agent"), job_type=data.get("type"),
-        format_id=data.get("format_id"),
+        format_id=data.get("format_id"), target_format=data.get("target_format"),
     )
     return jsonify({"job_id": jid})
 
@@ -1218,6 +1313,8 @@ def convert(job_id):
     job = JOBS.get(job_id)
     if not job or job["status"] != "done":
         return jsonify({"error": "job not done"}), 400
+    if job.get("converting"):
+        return jsonify({"error": "conversion already in progress"}), 400
     data = request.get_json(force=True, silent=True) or {}
     fmt = (data.get("format") or "").lower()
     if fmt not in ("mp4", "mkv", "mp3", "wav"):
@@ -1233,12 +1330,46 @@ def convert(job_id):
     if fmt in ("mp3", "wav"):
         cmd += ["-vn"]
     cmd += [str(dst)]
-    try:
-        subprocess.Popen(cmd)
-        log(f"converting {src.name} → {dst.name}")
-        return jsonify({"ok": True, "output": str(dst)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+
+    job["converting"] = fmt
+    job["conversion_progress"] = 0
+    log(f"converting {src.name} → {dst.name}")
+
+    def progress_thread():
+        total_sec = None
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=_CREATE_NO_WINDOW, text=True, errors="replace",
+            )
+            dur_re = re.compile(r"Duration: (\d+):(\d+):(\d+)")
+            time_re = re.compile(r"time=(\d+):(\d+):(\d+)")
+            for line in proc.stdout:
+                if total_sec is None:
+                    m = dur_re.search(line)
+                    if m:
+                        total_sec = (int(m.group(1)) * 3600
+                                     + int(m.group(2)) * 60 + int(m.group(3)))
+                m = time_re.search(line)
+                if m and total_sec:
+                    done_sec = (int(m.group(1)) * 3600
+                                + int(m.group(2)) * 60 + int(m.group(3)))
+                    job["conversion_progress"] = min(99, int(done_sec / total_sec * 100))
+            proc.wait()
+            if proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+                job["conversion_progress"] = 100
+                job["converted_to"] = fmt
+                log(f"converted {src.name} → {dst.name}")
+            else:
+                log(f"conversion failed for {src.name} (rc={proc.returncode})")
+        except Exception as e:
+            log(f"conversion failed for {src.name}: {e}")
+        finally:
+            job["converting"] = None
+            save_jobs_snapshot()
+
+    threading.Thread(target=progress_thread, daemon=True).start()
+    return jsonify({"ok": True})
 
 
 @app.route("/logs", methods=["GET"])

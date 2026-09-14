@@ -7,6 +7,7 @@ from settings.json. Imported and launched by server.py's main().
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -202,20 +203,26 @@ class DownloadModel(QAbstractTableModel):
                 )
         if role == Qt.DisplayRole:
             pct = "—"
-            if j.get("size_total"):
+            if j.get("converting"):
+                pct = f"conv {j.get('conversion_progress', 0)}%"
+            elif j.get("size_total"):
                 pct = f"{(j.get('size_done', 0) / j['size_total'] * 100):.0f}%"
             elif j["status"] == "done":
                 pct = "100%"
+            status = (f"converting → {j['converting']}" if j.get("converting")
+                      else j["status"])
             return [
                 j["filename"],
                 fmt_bytes(j.get("size_total")),
                 pct,
                 j.get("speed") or "",
-                j["status"],
+                status,
                 j["category"],
             ][col]
         if role == Qt.ForegroundRole:
             if col == 4:
+                if j.get("converting"):
+                    return QColor(WARN)
                 s = j["status"]
                 if s == "done":
                     return QColor(ACCENT)
@@ -234,7 +241,11 @@ class DownloadModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if role == Qt.DisplayRole and orientation == Qt.Horizontal:
-            return self.HEADERS[section]
+            label = self.HEADERS[section]
+            pw = self.parent_window
+            if pw is not None and getattr(pw, "_sort_column", None) == section:
+                label += " ▲" if pw._sort_ascending else " ▼"
+            return label
         return None
 
     def flags(self, index):
@@ -281,10 +292,10 @@ class ProgressDelegate(QStyledItemDelegate):
             super().paint(painter, option, index)
             return
         value = index.data(Qt.DisplayRole) or "0%"
-        try:
-            pct = float(str(value).replace("%", ""))
-        except ValueError:
-            pct = 0
+        # "conv 37%" (conversion progress) and plain "37%" both parse here.
+        m = re.search(r"(\d+)", str(value))
+        pct = float(m.group(1)) if m else 0
+        converting = str(value).startswith("conv")
         painter.save()
         rect = option.rect.adjusted(6, 14, -6, -14)
         painter.setPen(Qt.NoPen)
@@ -292,7 +303,7 @@ class ProgressDelegate(QStyledItemDelegate):
         painter.drawRoundedRect(rect, 5, 5)
         fill = int(rect.width() * max(0, min(100, pct)) / 100)
         if fill > 0:
-            painter.setBrush(QColor(ACCENT))
+            painter.setBrush(QColor(WARN if converting else ACCENT))
             painter.drawRoundedRect(
                 rect.adjusted(0, 0, -(rect.width() - fill), 0), 5, 5
             )
@@ -492,6 +503,54 @@ class SettingsDialog(QDialog):
             pl.addRow(w)
         tabs.addTab(p, "Post-Download")
 
+        # ---- Connection ----
+        c = QWidget()
+        cl = QFormLayout(c)
+        self.connection_timeout = QSpinBox()
+        self.connection_timeout.setRange(5, 120)
+        self.connection_timeout.setSuffix(" s")
+        self.connection_timeout.setValue(int(s.get("connection_timeout", 20)))
+        cl.addRow("Connection timeout", self.connection_timeout)
+        self.max_retries = QSpinBox()
+        self.max_retries.setRange(0, 20)
+        self.max_retries.setValue(int(s.get("max_retries", 3)))
+        cl.addRow("Max retries", self.max_retries)
+        self.min_speed_kbps = QSpinBox()
+        self.min_speed_kbps.setRange(0, 10_000_000)
+        self.min_speed_kbps.setSingleStep(50)
+        self.min_speed_kbps.setSuffix(" KB/s")
+        self.min_speed_kbps.setSpecialValueText("off")
+        self.min_speed_kbps.setValue(int(s.get("min_speed_kbps", 0)))
+        cl.addRow("Abort if slower than", self.min_speed_kbps)
+        tabs.addTab(c, "Connection")
+
+        # ---- Save To ----
+        st = QWidget()
+        stl = QFormLayout(st)
+        self.output_dir = QLineEdit(s.get("output_dir", ""))
+        stl.addRow("Default folder", self.output_dir)
+        self.percat_edits = {}
+        for cat in ["Video", "Music", "Compressed", "Documents", "Programs", "Other"]:
+            e = QLineEdit(s.get("per_category_dirs", {}).get(cat, ""))
+            e.setPlaceholderText("(use default folder)")
+            self.percat_edits[cat] = e
+            stl.addRow(f"{cat} folder", e)
+        tabs.addTab(st, "Save To")
+
+        # ---- File Types ----
+        ft = QWidget()
+        ftl = QFormLayout(ft)
+        ftl.addRow("Check to DISABLE auto-capture for that type:")
+        self.ft_checks = {}
+        disabled = s.get("file_types_overrides", {})
+        for ext in ["mp4", "mkv", "webm", "mov", "mp3", "wav", "flac", "m4a",
+                    "zip", "rar", "7z", "pdf", "doc", "docx", "txt", "exe", "msi"]:
+            cb = QCheckBox(f".{ext}")
+            cb.setChecked(disabled.get(ext) is False)
+            self.ft_checks[ext] = cb
+            ftl.addRow(cb)
+        tabs.addTab(ft, "File Types")
+
         # ---- Pairing ----
         pr = QWidget()
         prl = QFormLayout(pr)
@@ -529,6 +588,20 @@ class SettingsDialog(QDialog):
             self.api.save_setting("max_concurrent", int(self.max_concurrent.value()))
             self.api.save_setting("speed_limit_kbps",
                                   int(self.speed_limit_kbps.value()))
+            self.api.save_setting("connection_timeout",
+                                  int(self.connection_timeout.value()))
+            self.api.save_setting("max_retries", int(self.max_retries.value()))
+            self.api.save_setting("min_speed_kbps",
+                                  int(self.min_speed_kbps.value()))
+            self.api.save_setting("output_dir", self.output_dir.text().strip())
+            self.api.save_setting("per_category_dirs",
+                                  {cat: e.text().strip()
+                                   for cat, e in self.percat_edits.items()})
+            # Send every known extension explicitly so unchecked boxes
+            # reliably re-enable a type (server merges dicts key-by-key).
+            self.api.save_setting("file_types_overrides",
+                                  {ext: not cb.isChecked()
+                                   for ext, cb in self.ft_checks.items()})
         self.accept()
 
 
@@ -698,10 +771,13 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self._done_seen = set()
         self._recently_done = {}
+        self._sort_column = None
+        self._sort_ascending = True
         self.setWindowTitle("Video Grabber")
         self.resize(1200, 760)
         self.setMinimumSize(880, 560)
         self._build_ui()
+        self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
         self._apply_styles()
         self._build_tray()
         self._new_job_signal.connect(self._on_new_job, Qt.QueuedConnection)
@@ -831,12 +907,16 @@ class MainWindow(QMainWindow):
             ("Pause", "Ⅱ", lambda: self._selected("pause")),
             ("Stop", "■", lambda: self._selected("stop")),
             ("Delete", "⌫", self.remove_selected),
+            ("Queue", "⏯", self.toggle_queue),
             ("Settings", "⚙", self.open_settings),
         ]:
             b = QPushButton(f"{icon}  {label}")
             b.setObjectName("ToolbarButton")
             b.clicked.connect(action)
             tl.addWidget(b)
+            if label == "Queue":
+                self.queue_btn = b
+        self._update_queue_btn()
         tl.addStretch()
         self.search = QLineEdit()
         self.search.setObjectName("Search")
@@ -1034,6 +1114,34 @@ class MainWindow(QMainWindow):
     def open_settings(self):
         SettingsDialog(self, self.api).exec()
 
+    def toggle_queue(self):
+        """Flip the dispatcher's queue_running flag via /settings."""
+        running = not bool(load_settings().get("queue_running", True))
+        if self.api:
+            try:
+                self.api.save_setting("queue_running", running)
+            except Exception as e:
+                QMessageBox.warning(self, "Error", str(e))
+        self._update_queue_btn()
+
+    def _update_queue_btn(self):
+        if not hasattr(self, "queue_btn"):
+            return
+        running = bool(load_settings().get("queue_running", True))
+        self.queue_btn.setText("⏸  Pause Queue" if running else "⏵  Start Queue")
+        self.queue_btn.setToolTip(
+            "Pause the whole download queue" if running
+            else "Resume the whole download queue")
+
+    def _on_header_clicked(self, col):
+        if col == self._sort_column:
+            self._sort_ascending = not self._sort_ascending
+        else:
+            self._sort_column = col
+            self._sort_ascending = True
+        self.model.headerDataChanged.emit(Qt.Horizontal, 0, len(self.model.HEADERS) - 1)
+        self.apply_filter(self.search.text())
+
     def apply_filter(self, text):
         text = (text or "").lower().strip()
         src = self.all_items
@@ -1045,8 +1153,37 @@ class MainWindow(QMainWindow):
         elif f != "All":
             src = [x for x in src if x["category"] == f]
         if text:
-            src = [x for x in src if text in x["filename"].lower()]
-        src = sorted(src, key=lambda x: -x.get("created_ts", 0))
+            def matches(x):
+                hay = " ".join([
+                    x.get("filename", ""),
+                    x.get("category", ""),
+                    x.get("status", ""),
+                    x.get("url", ""),
+                ]).lower()
+                return text in hay
+            src = [x for x in src if matches(x)]
+        # Sort runs after filter+search so it only reorders visible rows.
+        if self._sort_column is not None:
+            def sort_key(x):
+                c = self._sort_column
+                if c == 0:
+                    return x.get("filename", "").lower()
+                if c == 1:
+                    return x.get("size_total", 0) or 0
+                if c == 2:
+                    total = x.get("size_total", 0) or 0
+                    return (x.get("size_done", 0) / total) if total else 0
+                if c == 3:
+                    m = re.match(r"([\d.]+)", x.get("speed", "") or "")
+                    return float(m.group(1)) if m else 0
+                if c == 4:
+                    return x.get("status", "")
+                if c == 5:
+                    return x.get("category", "").lower()
+                return 0
+            src = sorted(src, key=sort_key, reverse=not self._sort_ascending)
+        else:
+            src = sorted(src, key=lambda x: -x.get("created_ts", 0))
         self.model.set_items(src)
 
     def select_category(self, name):
@@ -1059,7 +1196,12 @@ class MainWindow(QMainWindow):
         self.apply_filter(self.search.text())
 
     def _selected_rows(self):
-        rows = sorted({i.row() for i in self.table.selectionModel().selectedRows()})
+        sm = self.table.selectionModel()
+        rows = sorted({i.row() for i in sm.selectedRows()})
+        if not rows:
+            # Ctrl+click can select individual cells without whole rows —
+            # fall back to any selected index so batch delete still works.
+            rows = sorted({i.row() for i in sm.selectedIndexes()})
         return [self.model.items[r] for r in rows if r < len(self.model.items)]
 
     def _selected(self, action):
@@ -1184,7 +1326,11 @@ class MainWindow(QMainWindow):
         elif chosen == a_remove:
             self._ctx_remove()
         elif chosen == a_props:
-            self._show_props(j)
+            # Re-fetch at click time — the row object captured when the menu
+            # opened can be stale if a refresh fired while the menu was up.
+            fresh = next((x for x in self.model.items
+                          if x["id"] == self._current_ctx), j)
+            self._show_props(fresh)
 
     def _ctx_open(self):
         jid = getattr(self, "_current_ctx", None)

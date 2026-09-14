@@ -7,6 +7,11 @@ or just push; it uploads the built app as an artifact).
 
 ## Manual build
 
+`VideoGrabber.ico` is committed in this folder — the build below uses it
+for the exe icon automatically. (The SVG masters live in ../icons/; PNG
+exports and the .ico are pre-generated, so no conversion step is needed
+unless you want to change the artwork.)
+
 ```bat
 cd backend
 pip install -r requirements.txt
@@ -16,7 +21,7 @@ curl -L -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentia
 tar -xf ffmpeg.zip
 REM copy the extracted ffmpeg.exe into backend\
 
-pyinstaller --onedir --noconsole --name VideoGrabber ^
+pyinstaller --onedir --noconsole --name VideoGrabber --icon=VideoGrabber.ico ^
     --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 ^
     --add-binary "ffmpeg.exe;." server.py
 ```
