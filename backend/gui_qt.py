@@ -7,6 +7,7 @@ from settings.json. Imported and launched by server.py's main().
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -25,10 +26,6 @@ from PySide6.QtWidgets import (
 )
 
 BACKEND_BASE = "http://127.0.0.1:5757"
-# Defaults for a non-portable install. launch_gui(home_dir=...) overrides
-# these at startup so the Qt GUI reads/writes the SAME settings.json the
-# Flask backend is using — important when portable mode relocates HOME to
-# a folder next to the exe instead of ~/Downloads/VideoGrabber.
 HOME = Path.home() / "Downloads" / "VideoGrabber"
 CONFIG_PATH = HOME / "settings.json"
 
@@ -47,17 +44,12 @@ _ICON_CACHE = {}
 
 
 def _status_icon(status):
-    """14×14 colored dot reflecting job status (cached)."""
     key = status or "queued"
     if key in _ICON_CACHE:
         return _ICON_CACHE[key]
     colors = {
-        "downloading": "#4caf50",
-        "done": "#4caf50",
-        "paused": "#ffca28",
-        "stopped": "#ef5350",
-        "error": "#ef5350",
-        "queued": "#9e9e9e",
+        "downloading": "#4caf50", "done": "#4caf50", "paused": "#ffca28",
+        "stopped": "#ef5350", "error": "#ef5350", "queued": "#9e9e9e",
         "skipped": "#607d8b",
     }
     color = QColor(colors.get(key, "#9e9e9e"))
@@ -264,9 +256,6 @@ class DownloadModel(QAbstractTableModel):
 
 
 def _path_for(job):
-    """Mirror server.py's _dest_for(): a per-category folder override
-    replaces the base dir entirely (no category subfolder appended);
-    otherwise the file lives under <output_dir>/<Category>/<filename>."""
     settings = load_settings()
     category = job.get("category", "Other")
     override = settings.get("per_category_dirs", {}).get(category)
@@ -375,8 +364,6 @@ class AddDownloadDialog(QDialog):
 
 
 class BandwidthProfilesDialog(QDialog):
-    """Edit time-of-day speed-limit profiles stored in settings.json."""
-
     def __init__(self, parent=None, api=None):
         super().__init__(parent)
         self.api = api
@@ -464,8 +451,7 @@ class BandwidthProfilesDialog(QDialog):
             return
         p = {
             "name": self.name.text().strip() or "Profile",
-            "start": start,
-            "end": end,
+            "start": start, "end": end,
             "speed_limit_kbps": int(self.limit.value()),
         }
         cur = self.list.currentItem()
@@ -528,7 +514,6 @@ class Sidebar(QFrame):
         btn.clicked.connect(lambda _=False, n=name: self.category_selected.emit(n))
         layout.addWidget(btn)
         self.buttons[name] = btn
-
 
 class MainWindow(QMainWindow):
     _new_job_signal = Signal(object)
@@ -650,7 +635,6 @@ class MainWindow(QMainWindow):
                     3000,
                 )
             return
-        # close_to_tray off or no system tray — quit for real
         self._quitting = True
         if self._tray:
             self._tray.hide()
@@ -717,6 +701,7 @@ class MainWindow(QMainWindow):
         self.table.setShowGrid(False)
         self.table.setDragEnabled(True)
         self.table.setDragDropMode(QAbstractItemView.DragOnly)
+        self.table.doubleClicked.connect(self._on_double_click)
         cl.addWidget(self.table, 1)
         log_label = QLabel("ACTIVITY LOG")
         log_label.setObjectName("SectionLabel")
@@ -818,7 +803,6 @@ class MainWindow(QMainWindow):
             jid = j.get("id")
             if j.get("status") == "done" and jid not in self._done_seen:
                 self._done_seen.add(jid)
-                # Skip flash on first populate so historical done rows don't all flash.
                 if getattr(self, "_done_seeded", False):
                     self._recently_done[jid] = 1.0
         self._done_seeded = True
@@ -1015,12 +999,41 @@ class MainWindow(QMainWindow):
         elif chosen == a_props:
             self._show_props(j)
 
-    def _open_selected(self, folder):
-        for j in self._selected_rows():
-            path = _path_for(j)
+    def _open_selected(self, folder=False):
+        """Open the selected job's file (or its containing folder) with
+        proper error reporting so failures are visible instead of silent."""
+        for job in self._selected_rows():
+            path = _path_for(job)
             target = path.parent if folder else path
-            if target.exists() and sys.platform == "win32":
-                os.startfile(str(target))
+            if not target.exists():
+                QMessageBox.warning(
+                    self, "File Not Found",
+                    f"File not found, expected at:\n{target}"
+                )
+                continue
+            try:
+                target_str = str(target.resolve())
+                if sys.platform == "win32":
+                    if folder and path.exists():
+                        subprocess.Popen(["explorer", "/select,", target_str])
+                    else:
+                        os.startfile(target_str)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", target_str])
+                else:
+                    subprocess.Popen(["xdg-open", target_str])
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Error Opening Target",
+                    f"Couldn't open, error: {e}\n\nPath:\n{target}"
+                )
+
+    def _on_double_click(self, index):
+        row = index.row()
+        if 0 <= row < len(self.model.items):
+            job = self.model.items[row]
+            if job.get("status") == "done":
+                self._open_selected(folder=False)
 
     def _show_props(self, j):
         text = "\n".join([
@@ -1044,8 +1057,7 @@ def launch_gui(new_job_hook=None, home_dir=None):
     optional callable the server calls whenever a job is queued — it must
     be safe to invoke from any thread. `home_dir` should be the same Path
     server.py resolved for HOME (portable_home()) so this module reads and
-    writes the exact settings.json the backend is using, instead of always
-    assuming the non-portable ~/Downloads/VideoGrabber default."""
+    writes the exact settings.json the backend is using."""
     global _app, _window, HOME, CONFIG_PATH
     if home_dir is not None:
         HOME = Path(home_dir)
