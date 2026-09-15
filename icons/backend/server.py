@@ -320,7 +320,7 @@ def load_jobs_snapshot():
             for jid, j in snap.items():
                 j["pause_evt"] = threading.Event()
                 j["stop_evt"] = threading.Event()
-                if j["status"] in ("downloading", "queued", "held"):
+                if j["status"] in ("downloading", "queued"):
                     j["status"] = "stopped"
                 JOBS[jid] = j
                 _migrate_extensionless(j)
@@ -435,8 +435,7 @@ def detect_type(url):
 
 
 def new_job(url, filename=None, category=None, referer=None, cookie=None,
-            user_agent=None, job_type=None, format_id=None, target_format=None,
-            defer=False):
+            user_agent=None, job_type=None, format_id=None, target_format=None):
     log(f"new_job: filename={filename!r} url_basename={guess_filename(url)!r}")
     jid = next_job_id()
     jtype = job_type or detect_type(url)
@@ -474,7 +473,7 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
     JOBS[jid] = {
         "id": jid, "url": url, "filename": fname,
         "category": job_cat,
-        "type": jtype, "status": "held" if defer else "queued",
+        "type": jtype, "status": "queued",
         "format_id": format_id, "target_format": target_format,
         "completed_ts": None,
         "size_total": 0, "size_done": 0, "speed": "", "error": None,
@@ -493,7 +492,7 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
         os.system("shutdown /a")
         _SHUTDOWN_PENDING = False
         log("Scheduled shutdown cancelled — new job queued")
-    log(f"job {jid} {'held (deferred)' if defer else 'queued'}: {fname}")
+    log(f"job {jid} queued: {fname}")
     save_jobs_snapshot()
     _fire_new_job_hooks(JOBS[jid])
     return jid
@@ -776,7 +775,7 @@ def maybe_convert_to_mp4(job, dest):
     try:
         r = subprocess.run([ffmpeg, "-i", str(dest)], capture_output=True, timeout=60,
                            creationflags=_CREATE_NO_WINDOW)
-        if b": Video:" not in r.stderr:
+        if b"Video" not in r.stderr:
             log(f"auto-mp4: {dest.name} has no video stream, skipping")
             return dest
     except Exception as e:
@@ -1298,14 +1297,6 @@ def pair():
     return jsonify({"token": STATE.get("api_token", "")})
 
 
-@app.route("/ping", methods=["GET"])
-def ping():
-    """Liveness + pairing-state probe for the Options 'Test connection'
-    button. Unlike /pair this never flips _PAIR_GRANTED, so it can be
-    called any number of times per session."""
-    return jsonify({"ok": True, "paired": _PAIR_GRANTED})
-
-
 @app.route("/download", methods=["POST"])
 def download():
     data = request.get_json(force=True, silent=True) or {}
@@ -1362,7 +1353,6 @@ def batch():
             continue
         ids.append(new_job(
             it["url"], filename=it.get("filename"),
-            category=it.get("category"),
             referer=data.get("referer"), cookie=data.get("cookie"),
             user_agent=data.get("user_agent"),
             format_id=it.get("format_id"),
@@ -1532,7 +1522,8 @@ def _repair_recording(path):
         r = subprocess.run(cmd, capture_output=True, timeout=120,
                            creationflags=_CREATE_NO_WINDOW)
         if r.returncode == 0 and fixed.exists() and fixed.stat().st_size > 0:
-            os.replace(str(fixed), str(path))
+            path.unlink()
+            fixed.rename(path)
             log(f"recording repaired: {path.name}")
             return path
         err = (r.stderr or b"")[-300:].decode(errors="replace")
@@ -1592,7 +1583,7 @@ def upload():
     dest = _repair_recording(dest)
 
     jid = new_job(url=f"upload:///{dest.name}", filename=dest.name,
-                  category="Video", job_type="generic", defer=True)
+                  category="Video", job_type="generic")
     job = JOBS[jid]
 
     ok, reason = _probe_recording(dest)
@@ -2546,16 +2537,8 @@ def _cleanup_stale_parts(max_age_hours=24):
         except Exception:
             pass
     count = 0
-    roots = {Path(STATE["output_dir"])}
     try:
-        for d in load_settings().get("per_category_dirs", {}).values():
-            if d:
-                roots.add(Path(d))
-    except Exception:
-        pass
-    try:
-        for root in roots:
-          for part in root.rglob("*.part*"):
+        for part in Path(STATE["output_dir"]).rglob("*.part*"):
             if str(part) in active:
                 continue
             try:

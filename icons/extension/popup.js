@@ -133,9 +133,7 @@ function rowEl(it) {
     const tab = it.tabRef || currentTab || {};
     chrome.runtime.sendMessage(
       { type: "RELAY_DOWNLOAD", url: it.url, pageUrl: tab.url,
-        tabId: tab.id,
-        filename: /\.(mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|flac|m3u8|mpd|pdf|zip|rar|7z|exe|msi|dmg)(\?|#|$)/i.test(it.url)
-          ? fileName(it.url) : undefined },
+        tabId: tab.id, filename: tab.title },
       (resp) => {
         bDl.textContent = "⬇";
         setStatus(resp && resp.ok ? `Sent ${fileName(it.url)} ✓`
@@ -209,7 +207,6 @@ function showTab(mode) {
 
 async function loadCurrent() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) { setItems([], null); return; } // tab closed mid-query
   currentTab = tab;
   chrome.runtime.sendMessage({ type: "GET_VIDEOS", tabId: tab.id }, (resp) => {
     setItems((resp && resp.videos) || [], tab);
@@ -347,13 +344,7 @@ async function grabAll(tab) {
       target: { tabId: tab.id, allFrames: true },
       func: scanPageForDownloads,
     });
-    // Same URL can surface from several frames (iframe + parent) — dedupe.
-    const seen = new Set();
-    results = frames.flatMap((f) => f.result || []).filter((r) => {
-      if (seen.has(r.url)) return false;
-      seen.add(r.url);
-      return true;
-    });
+    results = frames.flatMap((f) => f.result || []);
   } catch (e) {
     resultEl.textContent = "Couldn't scan this page.";
     return;
@@ -384,11 +375,8 @@ async function grabAll(tab) {
       setStatus(`Copied ${urls.length} URL(s) ✓`));
   });
   document.getElementById("btnToggle").addEventListener("click", () => {
-    // Toggle only what the user can see — hidden (filtered/searched-out)
-    // items must not get swept into a batch download.
-    const vis = visibleItems();
-    const allChecked = vis.length > 0 && vis.every((i) => i.checked);
-    vis.forEach((i) => { i.checked = !allChecked; });
+    const allChecked = mediaItems.length > 0 && mediaItems.every((i) => i.checked);
+    mediaItems.forEach((i) => { i.checked = !allChecked; });
     renderMedia();
   });
   document.getElementById("btnFilter").addEventListener("click", () => {
@@ -417,10 +405,8 @@ async function grabAll(tab) {
 
   // grab-all section
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  currentTab = tab || null;
-  if (tab) {
-    document.getElementById("grabAllBtn").addEventListener("click", () => grabAll(tab));
-  }
+  currentTab = tab;
+  document.getElementById("grabAllBtn").addEventListener("click", () => grabAll(tab));
   document.getElementById("grabToggleAll").addEventListener("click", () => {
     const allChecked = grabItems.every((i) => i.checked);
     grabItems = grabItems.map((i) => ({ ...i, checked: !allChecked }));
@@ -435,7 +421,7 @@ async function grabAll(tab) {
       { type: "RELAY_BATCH", items: selected, pageUrl: tab.url },
       (resp) => {
         resultEl.textContent = resp && resp.ok
-          ? `Sent ${(resp.job_ids || []).length} item(s) to Grabber ✓`
+          ? `Sent ${resp.job_ids.length} item(s) to Grabber ✓`
           : (resp && resp.error) || "Failed to send.";
         if (resp && resp.ok) {
           grabItems = [];

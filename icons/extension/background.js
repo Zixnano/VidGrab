@@ -29,8 +29,8 @@ function addItem(tabId, item) {
     item.timestamp = Date.now();
   }
   m.set(item.url, item);
-  chrome.action.setBadgeText({ tabId, text: String(m.size) }).catch(() => {});
-  chrome.action.setBadgeBackgroundColor({ tabId, color: "#2e7d32" }).catch(() => {});
+  chrome.action.setBadgeText({ tabId, text: String(m.size) });
+  chrome.action.setBadgeBackgroundColor({ tabId, color: "#2e7d32" });
 }
 
 chrome.webRequest.onBeforeRequest.addListener(
@@ -63,7 +63,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId === 0) {
     videoMap.delete(details.tabId);
-    chrome.action.setBadgeText({ tabId: details.tabId, text: "" }).catch(() => {});
+    chrome.action.setBadgeText({ tabId: details.tabId, text: "" });
   }
 });
 
@@ -102,34 +102,25 @@ async function authedFetch(path, options = {}) {
   return { res, unpaired: false };
 }
 
-let _pairInFlight = null; // module-level guard: concurrent wakes share one pair attempt
 async function pairIfNeeded() {
   // Auto-pairing: if no token is stored, ask the desktop app for one.
   // The app only answers on localhost and only once per session.
   const { apiToken } = await chrome.storage.local.get("apiToken");
   if (apiToken) return;
-  if (!_pairInFlight) {
-    _pairInFlight = (async () => {
-      try {
-        const res = await fetch(`${BACKEND_BASE}/pair`, { method: "POST" });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.token) {
-            await chrome.storage.local.set({ apiToken: data.token });
-            console.debug("Video Grabber: paired automatically");
-          }
-        } else {
-          console.debug("Video Grabber: pair request rejected (", res.status, ")");
-        }
-      } catch (e) {
-        console.debug("Video Grabber: auto-pair failed (app not running?)", e);
+  try {
+    const res = await fetch(`${BACKEND_BASE}/pair`, { method: "POST" });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.token) {
+        await chrome.storage.local.set({ apiToken: data.token });
+        console.debug("Video Grabber: paired automatically");
       }
-    })();
-    // Let the next wake retry if this attempt failed.
-    _pairInFlight = _pairInFlight.then(() => { _pairInFlight = null; },
-                                       () => { _pairInFlight = null; });
+    } else {
+      console.debug("Video Grabber: pair request rejected (", res.status, ")");
+    }
+  } catch (e) {
+    console.debug("Video Grabber: auto-pair failed (app not running?)", e);
   }
-  return _pairInFlight;
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -189,7 +180,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
     // No recognizable extension — one HEAD probe for an attachment
     // disposition; anything else is left alone.
     try {
-      const head = await fetch(item.url, { method: "HEAD", credentials: "include" });
+      const head = await fetch(item.url, { method: "HEAD" });
       const cd = head.headers.get("content-disposition") || "";
       if (!/attachment/i.test(cd)) return;
     } catch (e) {
@@ -212,9 +203,8 @@ chrome.downloads.onCreated.addListener(async (item) => {
   } catch (e) {}
 
   const cookie = await cookieHeaderFor(item.url).catch(() => "");
-  let handedOff = false;
   try {
-    const { res } = await authedFetch("/download", {
+    await authedFetch("/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -225,14 +215,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
         filename: filename,
       }),
     });
-    handedOff = res.ok;
   } catch (e) {
-    handedOff = false;
-  }
-  if (!handedOff) {
-    // The browser download was already cancelled — give it back to the
-    // browser if the app rejected the handoff (validation error, unpaired,
-    // app busy...) so the user's click never just vanishes.
     try {
       chrome.downloads.download({ url: item.url, filename: filename || undefined });
     } catch (_) {}
@@ -248,7 +231,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "CLEAR_VIDEOS") {
     videoMap.delete(msg.tabId);
-    chrome.action.setBadgeText({ tabId: msg.tabId, text: "" }).catch(() => {});
+    chrome.action.setBadgeText({ tabId: msg.tabId, text: "" });
     sendResponse({ ok: true });
     return false;
   }

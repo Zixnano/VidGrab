@@ -344,7 +344,7 @@ class DownloadModel(QAbstractTableModel):
             if path.exists():
                 urls.append(QUrl.fromLocalFile(str(path)))
         if not urls:
-            return QMimeData()  # empty drag payload, never None
+            return None
         mime = QMimeData()
         mime.setUrls(urls)
         return mime
@@ -374,9 +374,6 @@ class ProgressDelegate(QStyledItemDelegate):
         converting = str(value).startswith("conv")
         painter.save()
         rect = option.rect.adjusted(6, 14, -6, -14)
-        if rect.height() < 4:
-            # Very short rows: keep the bar drawable instead of negative-height.
-            rect.setHeight(4)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#1d2a35"))
         painter.drawRoundedRect(rect, 5, 5)
@@ -1591,7 +1588,6 @@ class MainWindow(QMainWindow):
                 self._open_selected(folder=False, job_id=job["id"])
 
     def _show_props(self, j):
-        path = _path_for(j)
         text = "\n".join([
             f"Name:     {j['filename']}",
             f"URL:      {j['url']}",
@@ -1600,8 +1596,8 @@ class MainWindow(QMainWindow):
             f"Category: {j['category']}",
             f"Size:     {fmt_bytes(j.get('size_total'))}",
             f"Done:     {fmt_bytes(j.get('size_done'))}",
-            f"Path:     {path}",
-            f"Exists:   {path.exists()}",
+            f"Path:     {_path_for(j)}",
+            f"Exists:   {_path_for(j).exists()}",
             f"Completed:{fmt_ts(j.get('completed_ts'))}",
         ])
         QMessageBox.information(self, "Properties", text)

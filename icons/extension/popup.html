@@ -1,0 +1,102 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  body { width: 380px; font: 13px -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 10px; color: #222; }
+  h1 { font-size: 14px; margin: 0 0 6px; }
+  #status { font-size: 12px; margin-bottom: 8px; padding: 6px 8px; border-radius: 6px; }
+  .ok { background: #e8f5e9; color: #2e7d32; }
+  .bad { background: #fdecea; color: #c62828; }
+
+  .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .tab { flex: 1; padding: 6px; font-size: 12px; border: 1px solid #ddd; background: #fafafa;
+         border-radius: 6px; cursor: pointer; }
+  .tab.active { background: #2e7d32; color: #fff; border-color: #2e7d32; }
+
+  #otherTabs { margin-bottom: 6px; }
+  .otab { display: flex; justify-content: space-between; padding: 5px 8px; border: 1px solid #eee;
+          border-radius: 6px; margin-bottom: 4px; cursor: pointer; font-size: 12px; }
+  .otab:hover { background: #f5f5f5; }
+  .otab.sel { border-color: #2e7d32; background: #e8f5e9; }
+
+  .mrow { display: flex; align-items: center; gap: 6px; border: 1px solid #eee;
+          border-radius: 6px; padding: 5px 7px; margin-bottom: 4px; }
+  .mrow input[type=checkbox] { flex-shrink: 0; }
+  .mrow .mname { font-size: 12px; word-break: break-all; flex: 1; }
+  .mrow .macts { flex-shrink: 0; white-space: nowrap; }
+  .mrow .macts button { font-size: 12px; padding: 2px 5px; cursor: pointer; }
+
+  .toolbar { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0 4px; }
+  .toolbar button { flex: 1 1 auto; font-size: 11px; padding: 4px 6px; cursor: pointer; }
+  .toolbar button:disabled { opacity: 0.4; cursor: default; }
+
+  #filterPanel { border: 1px solid #eee; border-radius: 6px; padding: 6px 8px;
+                 margin-bottom: 6px; font-size: 12px; display: none; }
+  #filterPanel label { margin-right: 10px; }
+  #searchInput { width: 100%; box-sizing: border-box; padding: 5px 8px; margin-bottom: 6px;
+                 border: 1px solid #ddd; border-radius: 6px; font-size: 12px; display: none; }
+
+  .empty { color: #888; font-size: 12px; padding: 12px 0; text-align: center; }
+  #mediaStatus { font-size: 11px; color: #555; min-height: 14px; margin-bottom: 4px; }
+
+  /* secondary action: page scan (unchanged feature) */
+  .grab-item { display: flex; align-items: flex-start; gap: 6px; border: 1px solid #eee;
+    border-radius: 6px; padding: 5px 7px; margin-bottom: 4px; }
+  .grab-item input[type=checkbox] { margin-top: 3px; flex-shrink: 0; }
+  .grab-item .name { font-size: 12px; word-break: break-all; }
+  .grab-toolbar { display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 6px; }
+  .grab-toolbar button { font-size: 11px; padding: 3px 8px; cursor: pointer; }
+  #grabSendBtn { width: 100%; padding: 6px; margin-top: 6px; cursor: pointer; }
+  #grabSendBtn:disabled { opacity: 0.5; cursor: default; }
+  .divider { border-top: 1px solid #eee; margin: 10px 0 8px; }
+</style>
+</head>
+<body>
+  <h1>Video Grabber</h1>
+  <div id="status">Checking desktop app…</div>
+
+  <div class="tabs">
+    <button id="tabCurrent" class="tab active">Current Page</button>
+    <button id="tabOther" class="tab">Other Pages</button>
+  </div>
+  <div id="otherTabs" style="display:none;"></div>
+  <div id="searchInputWrap"><input id="searchInput" type="text" placeholder="Filter by name or URL…"/></div>
+  <div id="filterPanel">
+    <label><input type="checkbox" value="mp4" checked/> mp4</label>
+    <label><input type="checkbox" value="webm" checked/> webm</label>
+    <label><input type="checkbox" value="m3u8" checked/> m3u8</label>
+    <label><input type="checkbox" value="mp3" checked/> mp3</label>
+    <label><input type="checkbox" value="image" checked/> image</label>
+    <label><input type="checkbox" value="doc" checked/> doc</label>
+    <label><input type="checkbox" value="archive" checked/> archive</label>
+    <label><input type="checkbox" value="programs" checked/> programs</label>
+    <label><input type="checkbox" value="other" checked/> other</label>
+  </div>
+  <div id="mediaList"><div class="empty">Scanning this tab…</div></div>
+  <div id="mediaStatus"></div>
+
+  <div class="toolbar">
+    <button id="btnMerge" disabled title="Download checked items, merging HLS streams">Merge</button>
+    <button id="btnDownload" title="Download checked items">Download</button>
+    <button id="btnCopy" title="Copy checked URLs">Copy</button>
+    <button id="btnToggle" title="Check/uncheck all">Toggle</button>
+    <button id="btnFilter" title="Filter by type">Filter</button>
+    <button id="btnClear" title="Clear this tab's detected list">Clear</button>
+    <button id="btnSearch" title="Search">Search</button>
+  </div>
+
+  <div class="divider"></div>
+  <button id="grabAllBtn" style="width:100%;padding:6px;margin-bottom:8px;cursor:pointer;">🔍 Grab all media/files on this page</button>
+  <div id="grabResult" style="font-size:11px;color:#555;margin-bottom:8px;"></div>
+  <div id="grabToolbar" class="grab-toolbar" style="display:none;">
+    <span id="grabCount" style="font-size:11px;color:#555;"></span>
+    <button id="grabToggleAll">Select none</button>
+  </div>
+  <div id="grabChecklist"></div>
+  <button id="grabSendBtn" style="display:none;">Send selected to Grabber</button>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -32,36 +32,6 @@
     return r.width > 80 && r.height > 60;
   }
 
-  // Single delegated drag handlers for every pill. Installing
-  // mousemove/mouseup per wire() leaked a pair of window listeners each
-  // time a player was rewired; a long SPA session would accumulate them.
-  let _drag = null;
-  window.addEventListener("mousemove", (e) => {
-    if (!_drag) return;
-    const { wrap, video, offset, start } = _drag;
-    const r = video.getBoundingClientRect();
-    const nx = start.dx + (e.clientX - start.x);
-    const ny = start.dy + (e.clientY - start.y);
-    // Keep the pill inside the viewport.
-    offset.dx = Math.max(8 - r.left,
-      Math.min(nx, innerWidth - r.left - wrap.offsetWidth - 8));
-    offset.dy = Math.max(8 - r.top,
-      Math.min(ny, innerHeight - r.top - wrap.offsetHeight - 8));
-    wrap.__vgPosition();
-  });
-  window.addEventListener("mouseup", () => {
-    if (!_drag) return;
-    const { wrap, offset, isTopFrame } = _drag;
-    _drag = null;
-    wrap.style.cursor = "grab";
-    if (isTopFrame) {
-      try {
-        localStorage.setItem(`vg_pill_offset_${location.hostname}`,
-                             JSON.stringify(offset));
-      } catch (e) {}
-    }
-  });
-
   function makeOverlay(video) {
     const wrap = document.createElement("div");
     wrap.style.cssText = `
@@ -134,23 +104,49 @@
         ? "flex" : "none";
     }
     position();
-    wrap.__vgPosition = position;
     const reposition = () => requestAnimationFrame(position);
     window.addEventListener("scroll", reposition, true);
     window.addEventListener("resize", reposition);
     const ro = new ResizeObserver(reposition);
     ro.observe(video);
 
-    // ---- drag to reposition (module-level delegated handlers; see _drag) ----
+    // ---- drag to reposition (position memory per site) ----
     wrap.style.cursor = "grab";
+    let dragging = false;
+    let dragStart = null;
+
     wrap.addEventListener("mousedown", (e) => {
       // Ignore drags starting on a button, the close X, or the open menu.
       if (e.target.closest("button") || menu.contains(e.target)) return;
-      _drag = { wrap, video, offset,
-                start: { x: e.clientX, y: e.clientY, dx: offset.dx, dy: offset.dy },
-                isTopFrame };
+      dragging = true;
+      dragStart = { x: e.clientX, y: e.clientY, dx: offset.dx, dy: offset.dy };
       wrap.style.cursor = "grabbing";
       e.preventDefault();
+    });
+
+    window.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const r = video.getBoundingClientRect();
+      const nx = dragStart.dx + (e.clientX - dragStart.x);
+      const ny = dragStart.dy + (e.clientY - dragStart.y);
+      // Keep the pill inside the viewport.
+      offset.dx = Math.max(8 - r.left,
+        Math.min(nx, innerWidth - r.left - wrap.offsetWidth - 8));
+      offset.dy = Math.max(8 - r.top,
+        Math.min(ny, innerHeight - r.top - wrap.offsetHeight - 8));
+      position();
+    });
+
+    window.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      wrap.style.cursor = "grab";
+      if (isTopFrame) {
+        try {
+          localStorage.setItem(`vg_pill_offset_${location.hostname}`,
+                               JSON.stringify(offset));
+        } catch (e) {}
+      }
     });
 
     wrap.addEventListener("dblclick", (e) => {
@@ -209,14 +205,9 @@
       FORMAT_CACHE.set(url, new Promise((resolve) => {
         try {
           chrome.runtime.sendMessage({ type: "PROBE_FORMATS", url }, (resp) => {
-            // Don't cache failures — the app may just be starting up.
-            if (chrome.runtime.lastError || !resp || resp.ok === false) {
-              FORMAT_CACHE.delete(url);
-            }
             resolve(chrome.runtime.lastError ? null : resp);
           });
         } catch (e) {
-          FORMAT_CACHE.delete(url);
           resolve(null);
         }
       }));
@@ -277,8 +268,7 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    const base = (filenameBase || "recording").replace(/\.webm$/i, "");
-  a.download = `${base}.webm`;
+    a.download = `${filenameBase || "recording"}.webm`;
     document.documentElement.appendChild(a);
     a.click();
     a.remove();
@@ -303,8 +293,6 @@
       return;
     }
     if (stream.getVideoTracks().length === 0) {
-      // Audio-only capture is useless for video — release the stream.
-      stream.getTracks().forEach((t) => t.stop());
       setLabel(overlay, "Can't record on this site", "#e53935");
       return;
     }
@@ -386,27 +374,6 @@
       if (!overlay.wrap.contains(e.target)) closeMenu();
     }
 
-    // Keep the menu on-screen: flip above the pill when there's no room
-    // below, and hug the right edge when the pill is near the viewport edge.
-    function placeMenu() {
-      const m = overlay.menu;
-      const r = overlay.wrap.getBoundingClientRect();
-      const below = innerHeight - r.bottom;
-      const above = r.top;
-      if (m.offsetHeight > below - 8 && above > below) {
-        m.style.top = "auto"; m.style.bottom = "100%";
-        m.style.marginTop = "0"; m.style.marginBottom = "6px";
-      } else {
-        m.style.top = "100%"; m.style.bottom = "auto";
-        m.style.marginTop = "6px"; m.style.marginBottom = "0";
-      }
-      if (r.left + m.offsetWidth > innerWidth - 8) {
-        m.style.left = "auto"; m.style.right = "0";
-      } else {
-        m.style.left = "0"; m.style.right = "auto";
-      }
-    }
-
     function sendChoice({ format_id = null, target_format = null,
                          bypass_dialog = false } = {}) {
       closeMenu();
@@ -460,14 +427,13 @@
       // source, and the click handler always opens it.
       if (blob || mse) {
         // Blob/MSE sources: no file to download directly.
-        if (isExtractorSite()) {
+        if (mse || isExtractorSite()) {
           addMenuItem(menu, "Send page URL to yt-dlp", {},
             () => handleSendPageUrl(video, overlay, closeMenu));
         }
         addMenuItem(menu, "Record live now", {},
           () => { closeMenu(); handleRecordToggle(video, overlay); });
         menu.style.display = "flex";
-        placeMenu();
         document.addEventListener("click", onDocClick, true);
         return;
       }
@@ -497,7 +463,6 @@
         () => sendChoice({ target_format: "opus" }));
 
       menu.style.display = "flex";
-      placeMenu();
       document.addEventListener("click", onDocClick, true);
 
       probeFormatsCached(video.currentSrc).then((data) => {

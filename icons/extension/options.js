@@ -16,24 +16,6 @@
     statusEl.textContent = "Contacting app…";
     statusEl.className = "";
     try {
-      const ping = await fetch("http://127.0.0.1:5757/ping");
-      if (ping.status === 404) {
-        statusEl.textContent = "App reachable but outdated — update Video Grabber, then retry.";
-        statusEl.className = "bad";
-        return;
-      }
-      if (!ping.ok) throw new Error("no response");
-      const state = await ping.json().catch(() => ({}));
-      if (state.paired) {
-        if (!tokenInput.value.trim()) {
-          statusEl.textContent = "App is paired, but this extension has no token — copy it from the app's Tools menu.";
-          statusEl.className = "bad";
-          return;
-        }
-        statusEl.textContent = "App reachable ✓ — already paired this session.";
-        statusEl.className = "ok";
-        return;
-      }
       const res = await fetch("http://127.0.0.1:5757/pair", { method: "POST" });
       if (res.ok) {
         const data = await res.json();
@@ -45,10 +27,10 @@
           return;
         }
       }
-      statusEl.textContent = "App reachable but pairing refused — restart the app to re-pair.";
+      statusEl.textContent = "App unreachable or pairing already granted this session.";
       statusEl.className = "bad";
     } catch (e) {
-      statusEl.textContent = "App unreachable — is Video Grabber running?";
+      statusEl.textContent = `Error: ${e}`;
       statusEl.className = "bad";
     }
   });
