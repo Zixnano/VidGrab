@@ -19,11 +19,11 @@ pip install -r requirements.txt
 REM grab a static ffmpeg build (needed for merging/converting)
 curl -L -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
 tar -xf ffmpeg.zip
-REM copy the extracted ffmpeg.exe into backend\
+REM copy the extracted ffmpeg.exe AND ffprobe.exe into backend\
 
 pyinstaller --onedir --noconsole --name VideoGrabber --icon=VideoGrabber.ico ^
     --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 ^
-    --add-binary "ffmpeg.exe;." server.py
+    --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." server.py
 ```
 
 ## Important: the output is a FOLDER, not a single file

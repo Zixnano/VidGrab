@@ -18,6 +18,14 @@
   // the only viable move is to hand the PAGE URL to yt-dlp (site extractor).
   const MSE_ONLY_HOSTS = [/twitch\.tv$/i];
   const isMseOnlySite = () => MSE_ONLY_HOSTS.some((rx) => rx.test(location.hostname));
+  // Sites where yt-dlp's page extractor beats downloading the stream file.
+  const EXTRACTOR_HOSTS = [
+    /(^|\.)youtube\.com$/i, /(^|\.)youtu\.be$/i, /(^|\.)twitch\.tv$/i,
+    /(^|\.)vimeo\.com$/i, /(^|\.)dailymotion\.com$/i, /(^|\.)twitter\.com$/i,
+    /(^|\.)x\.com$/i, /(^|\.)reddit\.com$/i, /(^|\.)facebook\.com$/i,
+    /(^|\.)instagram\.com$/i, /(^|\.)tiktok\.com$/i, /(^|\.)bilibili\.com$/i,
+  ];
+  const isExtractorSite = () => EXTRACTOR_HOSTS.some((rx) => rx.test(location.hostname));
 
   function isVisible(el) {
     const r = el.getBoundingClientRect();
@@ -74,10 +82,22 @@
     wrap.appendChild(menu);
     document.documentElement.appendChild(wrap);
 
+    // Per-site drag offset, persisted in localStorage (top frame only —
+    // an iframe's location.hostname is the parent's, so sub-frame pills
+    // would share and fight over the same key).
+    const isTopFrame = window === window.top;
+    let offset = { dx: 8, dy: 8 };
+    if (isTopFrame) {
+      try {
+        const saved = localStorage.getItem(`vg_pill_offset_${location.hostname}`);
+        if (saved) offset = JSON.parse(saved);
+      } catch (e) {}
+    }
+
     function position() {
       const r = video.getBoundingClientRect();
-      wrap.style.top = Math.max(8, r.top + 8) + "px";
-      wrap.style.left = Math.max(8, r.left + 8) + "px";
+      wrap.style.top = Math.max(8, r.top + offset.dy) + "px";
+      wrap.style.left = Math.max(8, r.left + offset.dx) + "px";
       wrap.style.display = isVisible(video)
         && r.bottom > 0 && r.top < innerHeight
         && r.right > 0 && r.left < innerWidth
@@ -89,6 +109,55 @@
     window.addEventListener("resize", reposition);
     const ro = new ResizeObserver(reposition);
     ro.observe(video);
+
+    // ---- drag to reposition (position memory per site) ----
+    wrap.style.cursor = "grab";
+    let dragging = false;
+    let dragStart = null;
+
+    wrap.addEventListener("mousedown", (e) => {
+      // Ignore drags starting on a button, the close X, or the open menu.
+      if (e.target.closest("button") || menu.contains(e.target)) return;
+      dragging = true;
+      dragStart = { x: e.clientX, y: e.clientY, dx: offset.dx, dy: offset.dy };
+      wrap.style.cursor = "grabbing";
+      e.preventDefault();
+    });
+
+    window.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const r = video.getBoundingClientRect();
+      const nx = dragStart.dx + (e.clientX - dragStart.x);
+      const ny = dragStart.dy + (e.clientY - dragStart.y);
+      // Keep the pill inside the viewport.
+      offset.dx = Math.max(8 - r.left,
+        Math.min(nx, innerWidth - r.left - wrap.offsetWidth - 8));
+      offset.dy = Math.max(8 - r.top,
+        Math.min(ny, innerHeight - r.top - wrap.offsetHeight - 8));
+      position();
+    });
+
+    window.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      wrap.style.cursor = "grab";
+      if (isTopFrame) {
+        try {
+          localStorage.setItem(`vg_pill_offset_${location.hostname}`,
+                               JSON.stringify(offset));
+        } catch (e) {}
+      }
+    });
+
+    wrap.addEventListener("dblclick", (e) => {
+      // Double-click the pill body (not a button) resets its position.
+      if (e.target.closest("button") || menu.contains(e.target)) return;
+      offset = { dx: 8, dy: 8 };
+      if (isTopFrame) {
+        try { localStorage.removeItem(`vg_pill_offset_${location.hostname}`); } catch (e) {}
+      }
+      position();
+    });
 
     return { wrap, btn, label, icon, menu, position };
   }
@@ -169,7 +238,8 @@
     menu.appendChild(el);
   }
 
-  async function handleSendPageUrl(video, overlay) {
+  async function handleSendPageUrl(video, overlay, closeMenu) {
+    if (closeMenu) closeMenu();
     setLabel(overlay, "Sending…");
     const guessName = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
     chrome.runtime.sendMessage(
@@ -240,26 +310,43 @@
     recorder.onstop = () => {
       const blob = new Blob(chunks, { type: "video/webm" });
       const guessName = (document.title || "recording").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
-      // Hand the recording to the desktop app instead of <a download> (which
-      // drops it in the browser's Downloads folder the app never watches).
-      // FormData can't cross chrome.runtime.sendMessage, so we pass the raw
-      // ArrayBuffer (structured-cloneable) and the service worker builds the
-      // multipart request. Tradeoff vs base64: no +33% bloat, but the whole
-      // buffer is held in memory — if the app is down or the upload fails,
-      // the <a download> fallback below still saves the recording.
-      blob.arrayBuffer().then((buffer) => {
-        chrome.runtime.sendMessage(
-          { type: "UPLOAD_RECORDING", buffer, filename: guessName + ".webm" },
-          (resp) => {
-            if (chrome.runtime.lastError || !resp || !resp.ok) {
-              saveBlob(blob, guessName);
-              setLabel(overlay, "Saved ✓ (browser) — Record again", "#4caf50");
-            } else {
-              setLabel(overlay, "Sent to app ✓ — Record again", "#4caf50");
-            }
-            RECORDERS.delete(video);
+      // Hand the recording to the desktop app. The blob is POSTed directly
+      // from here — chrome.runtime.sendMessage caps messages around 32MB,
+      // and truncated payloads were producing corrupt files. Only a tiny
+      // one-time nonce crosses the message channel.
+      chrome.runtime.sendMessage({ type: "GET_UPLOAD_NONCE" }, async (nresp) => {
+        if (chrome.runtime.lastError || !nresp || !nresp.ok || !nresp.nonce) {
+          // App unreachable / unpaired — browser download so the take
+          // isn't lost.
+          saveBlob(blob, guessName);
+          setLabel(overlay, "Saved ✓ (browser) — Record again", "#4caf50");
+          RECORDERS.delete(video);
+          return;
+        }
+        try {
+          const form = new FormData();
+          form.append("file", blob, guessName + ".webm");
+          const res = await fetch("http://127.0.0.1:5757/upload", {
+            method: "POST",
+            headers: { "X-Upload-Nonce": nresp.nonce },
+            body: form,
+          });
+          if (res.ok) {
+            setLabel(overlay, "Sent to app ✓ — Record again", "#4caf50");
+          } else {
+            // The app received the file but rejected it (e.g. corrupt
+            // recording). Surface the error — do NOT silently drop a
+            // broken file into the browser's Downloads folder.
+            const data = await res.json().catch(() => ({}));
+            setLabel(overlay, (data.error || "Upload rejected").slice(0, 40), "#e53935");
           }
-        );
+        } catch (e) {
+          // Network-level failure mid-upload (app killed, etc.) — the
+          // take only exists in this blob, so save it locally.
+          saveBlob(blob, guessName);
+          setLabel(overlay, "Saved ✓ (browser) — Record again", "#4caf50");
+        }
+        RECORDERS.delete(video);
       });
     };
     recorder.start(1000);
@@ -326,14 +413,36 @@
       const menu = overlay.menu;
       menu.innerHTML = "";
 
+      const blob = isBlob();
+      const mse = isMseOnlySite();
       addMenuItem(menu, streamInfo(video), { header: true });
-      addMenuItem(menu, "Best quality", {}, () => {
-        // Direct media files (.webm/.mkv/... served straight to <video>):
-        // take the file as-is — forcing mp4 would mean a full re-encode.
-        // Page URLs (yt-dlp path): default to mp4, which is a fast remux.
+
+      // Mode picker: the menu offers every mode that makes sense for this
+      // source, and the click handler always opens it.
+      if (blob || mse) {
+        // Blob/MSE sources: no file to download directly.
+        if (mse || isExtractorSite()) {
+          addMenuItem(menu, "Send page URL to yt-dlp", {},
+            () => handleSendPageUrl(video, overlay, closeMenu));
+        }
+        addMenuItem(menu, "Record live now", {},
+          () => { closeMenu(); handleRecordToggle(video, overlay); });
+        menu.style.display = "flex";
+        document.addEventListener("click", onDocClick, true);
+        return;
+      }
+
+      // Direct URL: download is primary, record + extractor as alternates.
+      addMenuItem(menu, "Download file", {}, () => {
         const directFile = /\.(mp4|webm|mkv|mov|m4v|avi)(\?|#|$)/i.test(video.currentSrc || "");
         sendChoice(directFile ? {} : { target_format: "mp4" });
       });
+      addMenuItem(menu, "Record live instead", {},
+        () => { closeMenu(); handleRecordToggle(video, overlay); });
+      if (isExtractorSite()) {
+        addMenuItem(menu, "Send page URL to yt-dlp", {},
+          () => handleSendPageUrl(video, overlay, closeMenu));
+      }
       addDivider(menu);
       const fmtBox = document.createElement("div");
       menu.appendChild(fmtBox);
@@ -346,22 +455,21 @@
         () => sendChoice({ target_format: "flac" }));
       addMenuItem(menu, "Extract audio → Opus", {},
         () => sendChoice({ target_format: "opus" }));
-      addDivider(menu);
-      addMenuItem(menu, "Send page URL to Grabber (no menu)", { dim: true },
-        () => { closeMenu(); handleSendPageUrl(video, overlay); });
 
       menu.style.display = "flex";
       document.addEventListener("click", onDocClick, true);
 
-      // Populate formats async; if the probe fails the menu still works —
-      // Best quality + audio extraction are always usable.
       probeFormatsCached(video.currentSrc).then((data) => {
         if (seq !== menuSeq || !menuOpen) return; // stale probe or menu closed
         loadingEl.remove();
+        // Best quality first: direct files stay as-is, page URLs default mp4.
+        addMenuItem(fmtBox, "Best quality", {}, () => {
+          const directFile = /\.(mp4|webm|mkv|mov|m4v|avi)(\?|#|$)/i.test(video.currentSrc || "");
+          sendChoice(directFile ? {} : { target_format: "mp4" });
+        });
         const formats = (data && data.formats) || [];
         if (!formats.length) {
-          addMenuItem(fmtBox,
-            "No format list — Best quality will be used",
+          addMenuItem(fmtBox, "No format list — Download file will be used",
             { dim: true, header: true });
           return;
         }
@@ -376,7 +484,7 @@
     const refresh = () => {
       if (RECORDERS.has(video)) return; // don't clobber label mid-recording
       if (isMseOnlySite()) {
-        setLabel(overlay, "Send page URL to Grabber", "#b388ff");
+        setLabel(overlay, "Send page URL ▾", "#b388ff");
         return;
       }
       if (!video.currentSrc) {
@@ -384,7 +492,7 @@
         return;
       }
       if (isBlob()) {
-        setLabel(overlay, "Record this video", "#e53935");
+        setLabel(overlay, "Record this video ▾", "#e53935");
       } else {
         setLabel(overlay, "Download ▾", "#4caf50");
       }
@@ -397,10 +505,8 @@
       e.stopPropagation();
       e.preventDefault();
       if (RECORDERS.has(video)) { handleRecordToggle(video, overlay); return; }
-      if (isMseOnlySite()) { handleSendPageUrl(video, overlay); return; }
-      if (isBlob()) { handleRecordToggle(video, overlay); return; }
-      if (!video.currentSrc) return;
-      toggleMenu();
+      if (!video.currentSrc && !isBlob()) return;
+      toggleMenu(); // the menu offers every applicable mode; user picks
     });
   }
 

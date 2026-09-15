@@ -25,10 +25,14 @@ function extOf(url) {
 
 function categoryOf(url) {
   const e = extOf(url);
-  if (["mp4", "m4v", "mov"].includes(e)) return "mp4";
+  if (["mp4", "m4v", "mov", "avi"].includes(e)) return "mp4";
   if (e === "webm" || e === "mkv") return "webm";
   if (e === "m3u8" || e === "mpd") return "m3u8";
-  if (["mp3", "m4a", "aac", "wav", "flac", "opus"].includes(e)) return "mp3";
+  if (["mp3", "m4a", "aac", "wav", "flac", "opus", "ogg"].includes(e)) return "mp3";
+  if (["jpg", "jpeg", "png", "gif", "webp", "avif", "svg", "bmp", "ico"].includes(e)) return "image";
+  if (["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "txt", "epub"].includes(e)) return "doc";
+  if (["zip", "rar", "7z", "tar", "gz"].includes(e)) return "archive";
+  if (["exe", "msi", "dmg"].includes(e)) return "programs";
   return "other";
 }
 

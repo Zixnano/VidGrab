@@ -96,6 +96,12 @@ def register_new_job_hook(fn):
 
 
 def _fire_new_job_hooks(job):
+    global _LAST_HOOK_TS
+    with _NEW_JOB_HOOK_LOCK:
+        now = time.time()
+        if now - _LAST_HOOK_TS < 1.5:
+            return
+        _LAST_HOOK_TS = now
     for fn in _ON_NEW_JOB_HOOKS:
         try:
             fn(job)
@@ -105,22 +111,66 @@ def _fire_new_job_hooks(job):
 
 JOBS = {}
 JOB_COUNTER = 0
+_SHUTDOWN_PENDING = False
 JOB_LOCK = threading.Lock()
+
+# Debounce for new-job hooks: a 50-item batch must not raise the window
+# 50 times (each raise is a hide/show flicker on Windows).
+_NEW_JOB_HOOK_LOCK = threading.Lock()
+_LAST_HOOK_TS = 0.0
 LOG_QUEUE = queue.Queue()
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": r"chrome-extension://.*"}}, supports_credentials=False)
+# Content-script fetches carry the PAGE's origin (not the extension's), so
+# the direct recording upload from content.js needs broader CORS on /upload.
+# Safe: /upload is gated by a one-time nonce that can only be obtained with
+# the API token — a random web page can't forge one, so wider origins here
+# expose nothing. Every other route stays extension-origin-only.
+CORS(app, resources={
+    r"/*": {"origins": r"chrome-extension://.*"},
+    r"/upload": {"origins": r".*"},
+}, supports_credentials=False)
 
 TOKEN_PROTECTED_PATHS = {
     "/download", "/batch", "/pause", "/resume", "/stop", "/delete",
     "/probe", "/rules", "/jobs", "/stats", "/convert", "/logs",
-    "/category", "/probe-head", "/settings", "/probe-formats", "/upload",
+    "/category", "/probe-head", "/settings", "/probe-formats",
+    "/upload-token",
 }
 
 # Random per-launch key, embedded in the LAN web UI's action links so that
 # unauthenticated page can still drive the token-protected action endpoints
 # without exposing them to anyone else on the network.
 REMOTE_KEY = secrets.token_hex(8)
+
+# One-time nonces for /upload: content scripts fetch the recording straight
+# to the backend (bypassing the ~32MB chrome.runtime.sendMessage cap), but
+# they can't read the long-lived API token. The nonce bridges that: issued
+# via the token-authenticated /upload-token, consumed exactly once.
+_UPLOAD_NONCES = {}  # nonce -> created_ts
+_UPLOAD_NONCE_LOCK = threading.Lock()
+
+
+def _issue_upload_nonce():
+    nonce = secrets.token_hex(16)
+    with _UPLOAD_NONCE_LOCK:
+        now = time.time()
+        for k, ts in list(_UPLOAD_NONCES.items()):
+            if now - ts > 300:
+                del _UPLOAD_NONCES[k]
+        _UPLOAD_NONCES[nonce] = now
+    return nonce
+
+
+def _consume_upload_nonce(nonce):
+    if not nonce:
+        return False
+    with _UPLOAD_NONCE_LOCK:
+        if nonce in _UPLOAD_NONCES:
+            del _UPLOAD_NONCES[nonce]
+            return True
+    return False
+
 
 # Auto-pairing: one successful /pair per app session. The endpoint is
 # deliberately NOT in TOKEN_PROTECTED_PATHS — it's guarded by the
@@ -132,6 +182,12 @@ _PAIR_GRANTED = False
 def _require_api_token():
     if request.method == "OPTIONS":
         return
+    # /upload accepts a one-time nonce instead of the long-lived token,
+    # because content scripts can't read chrome.storage.local.
+    if request.path == "/upload":
+        if _consume_upload_nonce(request.headers.get("X-Upload-Nonce", "")):
+            return
+        return jsonify({"error": "missing or invalid upload nonce"}), 401
     if request.path not in TOKEN_PROTECTED_PATHS and not any(
         request.path.startswith(p + "/") for p in TOKEN_PROTECTED_PATHS
     ):
@@ -177,18 +233,48 @@ def save_settings():
     os.replace(tmp, CONFIG_PATH)
 
 
+_SNAPSHOT_LOCK = threading.Lock()
+
+
 def save_jobs_snapshot():
     """Persist a plain (non-Event) view of jobs so history survives restarts."""
-    try:
-        snap = {}
-        for jid, j in JOBS.items():
-            snap[jid] = {k: v for k, v in j.items()
-                         if k not in ("pause_evt", "stop_evt", "cookie", "referer", "user_agent", "error")}
-        tmp = JOBS_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(snap, indent=2))
-        os.replace(tmp, JOBS_PATH)
-    except Exception as e:
-        log(f"couldn't save job history: {e}")
+    # Serialized: /convert's progress thread and a finishing download can
+    # otherwise clobber each other's .tmp file.
+    with _SNAPSHOT_LOCK:
+        try:
+            snap = {}
+            for jid, j in JOBS.items():
+                snap[jid] = {k: v for k, v in j.items()
+                             if k not in ("pause_evt", "stop_evt", "cookie", "referer", "user_agent", "error")}
+            # Cap history at MAX_HISTORY jobs — always keep non-done jobs,
+            # fill the rest with the newest done ones.
+            MAX_HISTORY = 2000
+            if len(snap) > MAX_HISTORY:
+                entries = sorted(snap.items(),
+                                 key=lambda kv: kv[1].get("created_ts", 0),
+                                 reverse=True)
+                kept = {}
+                done_count = 0
+                for jid, j in entries:
+                    if j.get("status") != "done":
+                        kept[jid] = j
+                    elif done_count < MAX_HISTORY:
+                        kept[jid] = j
+                        done_count += 1
+                snap = kept
+            # Prune in-memory done jobs too so the GUI doesn't list thousands.
+            if len(JOBS) > MAX_HISTORY + 500:
+                done = sorted(((jid, j) for jid, j in JOBS.items()
+                               if j.get("status") == "done"),
+                              key=lambda kv: kv[1].get("completed_ts")
+                                             or kv[1].get("created_ts", 0))
+                for jid, _ in done[:-MAX_HISTORY]:
+                    JOBS.pop(jid, None)
+            tmp = JOBS_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(snap, indent=2))
+            os.replace(tmp, JOBS_PATH)
+        except Exception as e:
+            log(f"couldn't save job history: {e}")
 
 
 def _migrate_extensionless(job):
@@ -303,6 +389,21 @@ def guess_filename(url, content_disposition=None):
     return safe_filename(unquote(name))
 
 
+def _unique_path(path):
+    """If path exists, append ' (2)', ' (3)', ... before the extension."""
+    if not path.exists():
+        return path
+    stem, ext = os.path.splitext(path.name)
+    i = 2
+    while True:
+        candidate = path.with_name(f"{stem} ({i}){ext}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+        if i > 1000:
+            return path  # give up, unlikely
+
+
 def category_for(filename):
     ext = os.path.splitext(filename)[1].lower()
     return CATEGORY_MAP.get(ext, "Other")
@@ -347,6 +448,7 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
         "category": job_cat,
         "type": jtype, "status": "queued",
         "format_id": format_id, "target_format": target_format,
+        "completed_ts": None,
         "size_total": 0, "size_done": 0, "speed": "", "error": None,
         "referer": referer, "cookie": cookie, "user_agent": user_agent,
         "created_ts": time.time(),
@@ -358,6 +460,11 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
         log(f"job {jid}: skipped — '.{ext}' is disabled in Options → File Types")
         save_jobs_snapshot()
         return jid
+    global _SHUTDOWN_PENDING
+    if _SHUTDOWN_PENDING:
+        os.system("shutdown /a")
+        _SHUTDOWN_PENDING = False
+        log("Scheduled shutdown cancelled — new job queued")
     log(f"job {jid} queued: {fname}")
     save_jobs_snapshot()
     _fire_new_job_hooks(JOBS[jid])
@@ -470,6 +577,16 @@ def _dest_for(job):
 def stat_for(job):
     dest = _dest_for(job)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # Collision handling: "name (2).ext" — but ONLY when the job hasn't
+    # started yet (no .part file, no bytes downloaded), otherwise we'd
+    # rename a file mid-resume. Side effect on job["filename"] is
+    # intentional: _dest_for stays pure and every caller agrees on the name.
+    part = dest.with_suffix(dest.suffix + ".part")
+    if not part.exists() and not job.get("size_done") and dest.exists():
+        unique = _unique_path(dest)
+        if unique.name != dest.name:
+            job["filename"] = unique.name
+            dest = unique
     return dest
 
 
@@ -509,10 +626,14 @@ def scan_file(path):
 
 
 def maybe_shutdown_if_idle():
+    global _SHUTDOWN_PENDING
     if not STATE.get("auto_shutdown"):
         return
     if any(j["status"] in ("downloading", "queued") for j in JOBS.values()):
         return
+    if _SHUTDOWN_PENDING:
+        return
+    _SHUTDOWN_PENDING = True
     log("Queue empty — shutting down in 60s (cancel with `shutdown /a`)")
     os.system("shutdown /s /t 60")
 
@@ -856,8 +977,14 @@ def run_generic_segmented(job_id):
             with open(p, "rb") as inp:
                 shutil.copyfileobj(inp, out)
             p.unlink()
+    # Many CDNs misreport Content-Length — warn, don't fail.
+    actual = dest.stat().st_size
+    if total and actual < total - 1:
+        log(f"job {job_id}: WARNING — size mismatch (got {actual}, expected {total})")
+        job["error"] = f"size mismatch: {actual}/{total}"
     dest = maybe_convert_target(job, dest)
     job["status"] = "done"
+    job["completed_ts"] = time.time()
     job["speed"] = ""
     record_stat(job["size_done"])
     log(f"job {job_id}: complete ✓ ({dest.name}, {SEGMENT_COUNT}x)")
@@ -934,8 +1061,15 @@ def _run_generic_single(job_id):
                         job["speed"] = f"{rate/1024:.0f} KB/s"
                         last_report, last_bytes = now, job["size_done"]
             os.replace(part, dest)
+            # Many CDNs misreport Content-Length — warn, don't fail.
+            actual = dest.stat().st_size
+            if job["size_total"] and actual < job["size_total"] - 1:
+                log(f"job {job_id}: WARNING — size mismatch (got {actual}, "
+                    f"expected {job['size_total']})")
+                job["error"] = f"size mismatch: {actual}/{job['size_total']}"
             dest = maybe_convert_target(job, dest)
             job["status"] = "done"
+            job["completed_ts"] = time.time()
             job["speed"] = ""
             record_stat(job["size_done"])
             log(f"job {job_id}: complete ✓ ({dest.name})")
@@ -1044,12 +1178,16 @@ def run_ytdlp(job_id):
             if matches:
                 real = max(matches, key=lambda p: p.stat().st_size)
                 job["filename"] = real.name
-                real = maybe_convert_to_mp4(job, real)
+                # maybe_convert_target falls back to auto-mp4 when the job
+                # has no explicit target, and honors target_format even
+                # when auto_mp4 is off.
+                real = maybe_convert_target(job, real)
                 job["filename"] = real.name
                 job["size_total"] = job["size_done"] = real.stat().st_size
         except Exception as e:
             log(f"job {job_id}: post-download filename fixup failed: {e}")
         job["status"] = "done"
+        job["completed_ts"] = time.time()
         log(f"job {job_id}: complete ✓ ({job['filename']})")
         try:
             d = stat_for(job)
@@ -1275,6 +1413,66 @@ def probe_formats():
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 
 
+@app.route("/upload-token", methods=["POST"])
+def upload_token():
+    return jsonify({"nonce": _issue_upload_nonce()})
+
+
+def _repair_recording(path):
+    """MediaRecorder produces fragmented WebM that Windows Media Player
+    rejects. Remux with ffmpeg, forcing it to synthesize missing timestamps.
+    Returns the path to the repaired file (equals `path` on failure)."""
+    ffmpeg = "ffmpeg"
+    if getattr(sys, "frozen", False):
+        ffmpeg = str(Path(sys._MEIPASS) / "ffmpeg.exe")
+    fixed = path.with_name(path.stem + ".fixed" + path.suffix)
+    cmd = [ffmpeg, "-y", "-fflags", "+genpts", "-i", str(path),
+           "-c", "copy", str(fixed)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=120,
+                           creationflags=_CREATE_NO_WINDOW)
+        if r.returncode == 0 and fixed.exists() and fixed.stat().st_size > 0:
+            path.unlink()
+            fixed.rename(path)
+            log(f"recording repaired: {path.name}")
+            return path
+        err = (r.stderr or b"")[-300:].decode(errors="replace")
+        log(f"recording repair failed (rc={r.returncode}): {err}")
+    except Exception as e:
+        log(f"recording repair failed: {e}")
+    if fixed.exists():
+        try:
+            fixed.unlink()
+        except OSError:
+            pass
+    return path
+
+
+def _probe_recording(path):
+    """Run ffprobe on an uploaded recording. Returns (ok, reason)."""
+    ffprobe = "ffprobe"
+    if getattr(sys, "frozen", False):
+        ffprobe = str(Path(sys._MEIPASS) / "ffprobe.exe")
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, timeout=30, text=True, errors="replace",
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0:
+            return False, (r.stderr or "").strip()[:200] or "ffprobe failed"
+        try:
+            dur = float((r.stdout or "").strip())
+            if dur <= 0:
+                return False, "zero duration"
+        except (TypeError, ValueError):
+            return False, "unreadable duration"
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
 @app.route("/upload", methods=["POST"])
 def upload():
     """Direct handoff for extension screen recordings (multipart, one file)."""
@@ -1290,16 +1488,30 @@ def upload():
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / filename
     f.save(str(dest))
+    log(f"recording upload: {dest.name} ({dest.stat().st_size} bytes)")
+
+    dest = _repair_recording(dest)
+
     jid = new_job(url=f"upload:///{dest.name}", filename=dest.name,
                   category="Video", job_type="generic")
     job = JOBS[jid]
+
+    ok, reason = _probe_recording(dest)
+    if not ok:
+        job["status"] = "error"
+        job["error"] = f"corrupt recording: {reason}"
+        log(f"uploaded recording is corrupt: {reason}")
+        save_jobs_snapshot()
+        _fire_new_job_hooks(job)
+        return jsonify({"ok": False, "error": f"corrupt recording: {reason}"}), 400
+
+    log(f"recording validated: {dest.name} ({dest.stat().st_size} bytes)")
     job["status"] = "done"
-    if dest.exists():
-        job["size_total"] = job["size_done"] = dest.stat().st_size
+    job["size_total"] = job["size_done"] = dest.stat().st_size
     dest = maybe_convert_to_mp4(job, dest)  # .webm → .mp4 when auto_mp4 is on
+    job["completed_ts"] = time.time()
     save_jobs_snapshot()
     _fire_new_job_hooks(job)
-    log(f"uploaded recording: {dest.name}")
     return jsonify({"ok": True, "job_id": jid})
 
 
@@ -2197,6 +2409,45 @@ def start_clipboard_watcher(root):
     root.after(1500, tick)
 
 
+def _cleanup_stale_parts(max_age_hours=24):
+    """Delete .part files older than max_age_hours with no active job."""
+    cutoff = time.time() - max_age_hours * 3600
+    active = set()
+    for j in JOBS.values():
+        try:
+            p = _dest_for(j)
+            active.add(str(p.with_suffix(p.suffix + ".part")))
+        except Exception:
+            pass
+    count = 0
+    try:
+        for part in Path(STATE["output_dir"]).rglob("*.part*"):
+            if str(part) in active:
+                continue
+            try:
+                if part.stat().st_mtime < cutoff:
+                    part.unlink()
+                    count += 1
+            except OSError:
+                pass
+    except Exception as e:
+        log(f"stale .part cleanup failed: {e}")
+    if count:
+        log(f"cleaned up {count} stale partial file(s)")
+
+
+def _port_in_use(port):
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
 def main():
     global HOME, CONFIG_PATH, JOBS_PATH
     h = portable_home()
@@ -2205,7 +2456,12 @@ def main():
     JOBS_PATH = HOME / "jobs.json"
     HOME.mkdir(parents=True, exist_ok=True)
     load_settings()
+    if _port_in_use(APP_PORT):
+        log(f"Port {APP_PORT} is already in use — another Video Grabber "
+            f"instance may be running. Exiting.")
+        sys.exit(1)
     load_jobs_snapshot()
+    _cleanup_stale_parts()
 
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=dispatcher_loop, daemon=True).start()

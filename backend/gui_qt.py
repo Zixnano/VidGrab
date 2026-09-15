@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -18,7 +19,7 @@ from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, Qt, QTimer, Signal, QMimeData, QUrl,
     QItemSelectionModel,
 )
-from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
     QLabel, QPushButton, QToolButton, QLineEdit, QTableView, QHeaderView,
@@ -44,6 +45,28 @@ WARN = "#ffca28"
 CATEGORIES = ["Video", "Music", "Compressed", "Documents", "Programs", "Other"]
 
 _ICON_CACHE = {}
+
+
+_TRAY_ICONS = {}
+
+
+def _make_tray_icon(active: bool):
+    """Green dot while downloading, grey when idle — like IDM's tray."""
+    key = "active" if active else "idle"
+    if key in _TRAY_ICONS:
+        return _TRAY_ICONS[key]
+    color = QColor(ACCENT if active else "#666666")
+    pm = QPixmap(32, 32)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(color)
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(4, 4, 24, 24)
+    p.end()
+    icon = QIcon(pm)
+    _TRAY_ICONS[key] = icon
+    return icon
 
 
 def _status_icon(status):
@@ -77,6 +100,18 @@ def load_settings():
 
 def load_token():
     return load_settings().get("api_token", "")
+
+
+def fmt_ts(ts):
+    if not ts:
+        return "—"
+    dt = datetime.fromtimestamp(ts)
+    now = datetime.now()
+    if dt.date() == now.date():
+        return dt.strftime("%H:%M:%S")
+    if dt.year == now.year:
+        return dt.strftime("%b %d, %H:%M")
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def fmt_bytes(n):
@@ -157,14 +192,13 @@ class ApiClient:
         return data.get("logs", [])
 
     def save_setting(self, key, value):
-        try:
-            self._req("POST", "/settings", json={key: value})
-        except Exception:
-            pass
+        # Errors propagate: callers (toggle_queue, SettingsDialog._save)
+        # show them; swallowing here made those handlers dead code.
+        self._req("POST", "/settings", json={key: value})
 
 
 class DownloadModel(QAbstractTableModel):
-    HEADERS = ["Name", "Size", "Progress", "Speed", "Status", "Category"]
+    HEADERS = ["Name", "Size", "Progress", "Speed", "Status", "Category", "Completed"]
 
     def __init__(self, parent_window=None):
         super().__init__()
@@ -211,6 +245,13 @@ class DownloadModel(QAbstractTableModel):
                 pct = "100%"
             status = (f"converting → {j['converting']}" if j.get("converting")
                       else j["status"])
+            if col == 6:
+                # Pre-column jobs: fall back to created_ts when done so the
+                # column is still useful for sorting.
+                ts = j.get("completed_ts")
+                if not ts and j.get("status") == "done":
+                    ts = j.get("created_ts")
+                return fmt_ts(ts)
             return [
                 j["filename"],
                 fmt_bytes(j.get("size_total")),
@@ -232,7 +273,7 @@ class DownloadModel(QAbstractTableModel):
                     return QColor(WARN)
                 if s == "skipped":
                     return QColor("#607d8b")
-            if col in (1, 3):
+            if col in (1, 3, 6):
                 return QColor("#b8c4cf")
             if col == 5:
                 return QColor("#a9b7c5")
@@ -468,14 +509,14 @@ class SettingsDialog(QDialog):
         dl = QFormLayout(d)
         self.max_concurrent = QSpinBox()
         self.max_concurrent.setRange(1, 16)
-        self.max_concurrent.setValue(int(s.get("max_concurrent", 3)))
+        self.max_concurrent.setValue(int(s.get("max_concurrent") or 3))
         dl.addRow("Max simultaneous downloads", self.max_concurrent)
         self.speed_limit_kbps = QSpinBox()
         self.speed_limit_kbps.setRange(0, 10_000_000)
         self.speed_limit_kbps.setSingleStep(100)
         self.speed_limit_kbps.setSuffix(" KB/s")
         self.speed_limit_kbps.setSpecialValueText("unlimited")
-        self.speed_limit_kbps.setValue(int(s.get("speed_limit_kbps", 0)))
+        self.speed_limit_kbps.setValue(int(s.get("speed_limit_kbps") or 0))
         dl.addRow("Speed limit", self.speed_limit_kbps)
         self.auto_mp4 = QCheckBox("Auto-convert downloaded videos to MP4")
         self.auto_mp4.setChecked(bool(s.get("auto_mp4", True)))
@@ -509,18 +550,18 @@ class SettingsDialog(QDialog):
         self.connection_timeout = QSpinBox()
         self.connection_timeout.setRange(5, 120)
         self.connection_timeout.setSuffix(" s")
-        self.connection_timeout.setValue(int(s.get("connection_timeout", 20)))
+        self.connection_timeout.setValue(int(s.get("connection_timeout") or 20))
         cl.addRow("Connection timeout", self.connection_timeout)
         self.max_retries = QSpinBox()
         self.max_retries.setRange(0, 20)
-        self.max_retries.setValue(int(s.get("max_retries", 3)))
+        self.max_retries.setValue(int(s.get("max_retries") or 3))
         cl.addRow("Max retries", self.max_retries)
         self.min_speed_kbps = QSpinBox()
         self.min_speed_kbps.setRange(0, 10_000_000)
         self.min_speed_kbps.setSingleStep(50)
         self.min_speed_kbps.setSuffix(" KB/s")
         self.min_speed_kbps.setSpecialValueText("off")
-        self.min_speed_kbps.setValue(int(s.get("min_speed_kbps", 0)))
+        self.min_speed_kbps.setValue(int(s.get("min_speed_kbps") or 0))
         cl.addRow("Abort if slower than", self.min_speed_kbps)
         tabs.addTab(c, "Connection")
 
@@ -543,8 +584,9 @@ class SettingsDialog(QDialog):
         ftl.addRow("Check to DISABLE auto-capture for that type:")
         self.ft_checks = {}
         disabled = s.get("file_types_overrides", {})
-        for ext in ["mp4", "mkv", "webm", "mov", "mp3", "wav", "flac", "m4a",
-                    "zip", "rar", "7z", "pdf", "doc", "docx", "txt", "exe", "msi"]:
+        for ext in ["mp4", "mkv", "webm", "mov", "avi", "mp3", "wav", "flac",
+                    "m4a", "aac", "zip", "rar", "7z", "tar", "gz", "pdf", "doc",
+                    "docx", "ppt", "pptx", "txt", "exe", "msi", "dmg"]:
             cb = QCheckBox(f".{ext}")
             cb.setChecked(disabled.get(ext) is False)
             self.ft_checks[ext] = cb
@@ -571,6 +613,13 @@ class SettingsDialog(QDialog):
         QApplication.clipboard().setText(self.token_edit.text())
 
     def _save(self):
+        try:
+            self._save_inner()
+        except Exception as e:
+            QMessageBox.critical(self, "Settings error",
+                                 f"Couldn't save settings:\n{e}")
+
+    def _save_inner(self):
         if self.api:
             for key, widget in [
                 ("force_on_top", self.force_on_top),
@@ -799,7 +848,7 @@ class MainWindow(QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self._tray = QSystemTrayIcon(self)
-        self._tray.setIcon(self.style().standardIcon(QStyle.SP_ArrowDown))
+        self._tray.setIcon(_make_tray_icon(False))
         self._tray.setToolTip("Video Grabber")
         menu = QMenu()
         a_restore = menu.addAction("Restore")
@@ -946,7 +995,7 @@ class MainWindow(QMainWindow):
         self.table.customContextMenuRequested.connect(self.context_menu)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        for c in range(1, 6):
+        for c in range(1, 7):
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.table.setShowGrid(False)
         self.table.setDragEnabled(True)
@@ -1058,6 +1107,10 @@ class MainWindow(QMainWindow):
                 if getattr(self, "_done_seeded", False):
                     self._recently_done[jid] = 1.0
         self._done_seeded = True
+        # Tray icon reflects download activity (cached icon swap, ~1/sec).
+        if getattr(self, "_tray", None):
+            active = any(j.get("status") == "downloading" for j in self.all_items)
+            self._tray.setIcon(_make_tray_icon(active))
         # Snapshot the selection before the model reset wipes it, then restore.
         selected_ids = {j["id"] for j in self._selected_rows()}
         self.apply_filter(self.search.text())
@@ -1094,25 +1147,36 @@ class MainWindow(QMainWindow):
     def _on_new_job(self, job):
         if not load_settings().get("force_on_top", True):
             return
-        if not self.isVisible() or self.isMinimized():
+        # Already focused — raising would only cause a flicker.
+        if self.isVisible() and not self.isMinimized() and self.isActiveWindow():
+            return
+        if self.isMinimized():
             self.showNormal()
         self.raise_()
         self.activateWindow()
-        was_topmost = self.windowFlags() & Qt.WindowStaysOnTopHint
-        if not was_topmost:
+        # Only flip the topmost flag if it isn't set — toggling a window
+        # flag forces a hide/show cycle on Windows (the batch flicker).
+        if not (self.windowFlags() & Qt.WindowStaysOnTopHint):
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
             self.show()
             QTimer.singleShot(400, self._clear_topmost)
 
     def _clear_topmost(self):
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
-        self.show()
+        if self.windowFlags() & Qt.WindowStaysOnTopHint:
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+            self.show()
 
     def open_bandwidth_profiles(self):
-        BandwidthProfilesDialog(self, self.api).exec()
+        try:
+            BandwidthProfilesDialog(self, self.api).exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Bandwidth profiles error", str(e))
 
     def open_settings(self):
-        SettingsDialog(self, self.api).exec()
+        try:
+            SettingsDialog(self, self.api).exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Settings error", str(e))
 
     def toggle_queue(self):
         """Flip the dispatcher's queue_running flag via /settings."""
@@ -1122,12 +1186,15 @@ class MainWindow(QMainWindow):
                 self.api.save_setting("queue_running", running)
             except Exception as e:
                 QMessageBox.warning(self, "Error", str(e))
-        self._update_queue_btn()
+        # Pass the value we just set — re-reading from disk here can race
+        # the server's save and show the stale label until next refresh.
+        self._update_queue_btn(running)
 
-    def _update_queue_btn(self):
+    def _update_queue_btn(self, running=None):
         if not hasattr(self, "queue_btn"):
             return
-        running = bool(load_settings().get("queue_running", True))
+        if running is None:
+            running = bool(load_settings().get("queue_running", True))
         self.queue_btn.setText("⏸  Pause Queue" if running else "⏵  Start Queue")
         self.queue_btn.setToolTip(
             "Pause the whole download queue" if running
@@ -1180,6 +1247,8 @@ class MainWindow(QMainWindow):
                     return x.get("status", "")
                 if c == 5:
                     return x.get("category", "").lower()
+                if c == 6:
+                    return x.get("completed_ts", 0) or 0
                 return 0
             src = sorted(src, key=sort_key, reverse=not self._sort_ascending)
         else:
@@ -1405,7 +1474,10 @@ class MainWindow(QMainWindow):
                 target_str = str(target.resolve())
                 if sys.platform == "win32":
                     if folder and path.exists():
-                        subprocess.Popen(["explorer", "/select,", target_str])
+                        # explorer wants /select,<path> as ONE argument —
+                        # as a list it silently opens the wrong folder.
+                        # String form, no shell=True.
+                        subprocess.Popen(f'explorer /select,"{target_str}"')
                     else:
                         os.startfile(target_str)
                 elif sys.platform == "darwin":
@@ -1434,6 +1506,7 @@ class MainWindow(QMainWindow):
             f"Category: {j['category']}",
             f"Size:     {fmt_bytes(j.get('size_total'))}",
             f"Done:     {fmt_bytes(j.get('size_done'))}",
+            f"Completed:{fmt_ts(j.get('completed_ts'))}",
         ])
         QMessageBox.information(self, "Properties", text)
 

@@ -8,8 +8,8 @@
 
 const BACKEND_BASE = "http://127.0.0.1:5757";
 
-const MEDIA_EXT_REGEX = /\.(mp4|m4v|mov|webm|mkv|m3u8|mpd)(\?|#|$)/i;
-const MEDIA_CT_REGEX = /^(video\/|application\/vnd\.apple\.mpegurl|application\/x-mpegurl|application\/dash\+xml|audio\/mpegurl)/i;
+const MEDIA_EXT_REGEX = /\.(mp4|m4v|mov|webm|mkv|avi|m3u8|mpd|mp3|m4a|aac|wav|flac|opus|ogg|jpg|jpeg|png|gif|webp|avif|svg|bmp|ico|pdf|zip|rar|7z|tar|gz|exe|msi|dmg|doc|docx|xls|xlsx|ppt|pptx|csv|txt|epub)(\?|#|$)/i;
+const MEDIA_CT_REGEX = /^(video\/|audio\/|image\/|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml|pdf|zip|x-7z-compressed|x-rar-compressed|x-tar|x-gzip|x-msdownload|x-msi|vnd\.openxmlformats-officedocument|vnd\.ms-excel|vnd\.ms-powerpoint|msword|epub\+zip)|application\/octet-stream)/i;
 
 // tabId -> Map(url -> item)
 const videoMap = new Map();
@@ -39,7 +39,7 @@ chrome.webRequest.onBeforeRequest.addListener(
       addItem(details.tabId, { url: details.url, source: "url-pattern", contentType: null });
     }
   },
-  { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] }
+  { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other", "image", "font"] }
 );
 
 chrome.webRequest.onHeadersReceived.addListener(
@@ -169,6 +169,24 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (!item.url) return;
   if (item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   if (item.byExtensionId === chrome.runtime.id) return;
+
+  // Only intercept URLs that look like intentional downloads. Without
+  // these gates, browser-internal fetches get hijacked (the v3.3 flood).
+  const KNOWN_EXTS = /\.(mp4|m4v|mov|webm|mkv|avi|mp3|m4a|wav|flac|zip|rar|7z|tar|gz|pdf|doc|docx|xls|xlsx|ppt|pptx|exe|msi|dmg|iso|epub)(\?|#|$)/i;
+  const isLocalhost = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])/i.test(item.url);
+  const isIpAddress = /^https?:\/\/\d{1,3}(\.\d{1,3}){3}/.test(item.url);
+  if (isLocalhost || isIpAddress) return;
+  if (!KNOWN_EXTS.test(item.url)) {
+    // No recognizable extension — one HEAD probe for an attachment
+    // disposition; anything else is left alone.
+    try {
+      const head = await fetch(item.url, { method: "HEAD" });
+      const cd = head.headers.get("content-disposition") || "";
+      if (!/attachment/i.test(cd)) return;
+    } catch (e) {
+      return;
+    }
+  }
 
   try {
     chrome.downloads.cancel(item.id);
@@ -309,34 +327,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // async
   }
 
-  if (msg.type === "UPLOAD_RECORDING") {
-    // Screen-recording handoff from content.js's recorder.onstop. The content
-    // script can't read chrome.storage.local and FormData can't cross
-    // chrome.runtime.sendMessage, so it sends the raw ArrayBuffer (structured
-    // clone) plus the desired filename; we attach the pairing token here and
-    // build the multipart request. On any failure content.js falls back to
-    // a plain <a download>, so a rejected sendResponse never loses the take.
+  if (msg.type === "GET_UPLOAD_NONCE") {
+    // One-time nonce for a direct content-script -> backend upload. The
+    // recording itself no longer crosses chrome.runtime.sendMessage (32MB
+    // cap truncated long takes and produced corrupt files); only this
+    // tiny nonce does.
     (async () => {
-      const alive = await checkBackend();
-      if (!alive) {
-        sendResponse({ ok: false, error: "Video Grabber app isn't running." });
-        return;
-      }
       try {
-        const file = new File([msg.buffer], msg.filename || "recording.webm",
-                              { type: "video/webm" });
-        const form = new FormData();
-        form.append("file", file);
-        const { res, unpaired } = await authedFetch("/upload", {
-          method: "POST",
-          body: form, // no Content-Type header — fetch sets the boundary
-        });
+        const { res, unpaired } = await authedFetch("/upload-token", { method: "POST" });
         if (unpaired) {
-          sendResponse({ ok: false, error: "Not paired yet — open the extension's Options page and paste in the pairing token from the desktop app." });
+          sendResponse({ ok: false, error: "not paired" });
           return;
         }
-        const data = await res.json().catch(() => ({}));
-        sendResponse({ ok: res.ok, job_id: data.job_id, error: data.error });
+        const data = await res.json();
+        sendResponse({ ok: res.ok, nonce: data.nonce, error: data.error });
       } catch (e) {
         sendResponse({ ok: false, error: String(e) });
       }
