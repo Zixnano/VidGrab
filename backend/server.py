@@ -17,6 +17,7 @@ Freeze with PyInstaller — see build_exe.md.
 """
 
 import glob
+import html
 import json
 import os
 import re
@@ -54,6 +55,83 @@ CATEGORY_MAP = {
     ".exe": "Programs", ".msi": "Programs", ".dmg": "Programs",
 }
 DIRECT_EXT_RE = re.compile(r"\.(mp4|m4v|mov|webm|mkv|avi|mp3|wav|flac|m4a|aac|zip|rar|7z|tar|gz|pdf|docx?|pptx?|txt|exe|msi|dmg)(\?|#|$)", re.I)
+
+# --- yt-dlp YouTube runtime helpers -----------------------------------------
+
+_YTDLP_JS_RUNTIME_CACHE = None
+
+
+def find_js_runtime():
+    """Return {'deno': path} or {'node': path} for yt-dlp, or {}.
+
+    yt-dlp needs an external JavaScript runtime to solve YouTube's
+    signature challenges since v2026.07.04. Deno is preferred (single
+    binary); Node 22+ works if Deno is absent.
+
+    Search order:
+      1. Next to the exe (frozen) or the project dir (dev) — a bundled copy
+      2. System PATH
+    """
+    global _YTDLP_JS_RUNTIME_CACHE
+    if _YTDLP_JS_RUNTIME_CACHE is not None:
+        return _YTDLP_JS_RUNTIME_CACHE
+
+    candidates = []
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent
+    candidates += [
+        (base / "deno.exe", "deno"),
+        (base / "deno", "deno"),
+        (base / "node.exe", "node"),
+        (base / "node", "node"),
+    ]
+
+    for name, key in (("deno", "deno"), ("node", "node")):
+        which = shutil.which(name)
+        if which:
+            candidates.append((Path(which), key))
+
+    for path, key in candidates:
+        try:
+            if path.exists() and path.is_file():
+                _YTDLP_JS_RUNTIME_CACHE = {key: str(path)}
+                log(f"yt-dlp JS runtime: {key} at {path}")
+                return _YTDLP_JS_RUNTIME_CACHE
+        except OSError:
+            continue
+
+    log("yt-dlp JS runtime: none found — YouTube formats will be limited. "
+        "Install Deno (https://deno.land) or Node 22+ and restart.")
+    _YTDLP_JS_RUNTIME_CACHE = {}
+    return _YTDLP_JS_RUNTIME_CACHE
+
+
+def _ytdlp_version_check():
+    """Log a warning if yt-dlp is more than 30 days old. YouTube extraction
+    breaks regularly; stale versions fail silently."""
+    try:
+        from importlib.metadata import version as _v, PackageNotFoundError
+        try:
+            v = _v("yt-dlp")
+        except PackageNotFoundError:
+            log("yt-dlp not installed as a package — skipping version check")
+            return
+        try:
+            from datetime import date
+            parts = v.split(".")
+            if len(parts) >= 3 and parts[0].isdigit():
+                release = date(int(parts[0]), int(parts[1]), int(parts[2]))
+                age = (date.today() - release).days
+                if age > 30:
+                    log(f"yt-dlp {v} is {age} days old — consider updating "
+                        f"(pip install -U yt-dlp) for YouTube support.")
+        except (ValueError, IndexError):
+            pass
+    except Exception as e:
+        log(f"yt-dlp version check failed: {e}")
+
 
 STATE = {
     "output_dir": str(HOME),
@@ -465,6 +543,8 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
     # Apply per-site rules
     netloc = urlparse(url).netloc
     for rule in STATE.get("rules", []):
+        if not isinstance(rule, dict):
+            continue
         pattern = rule.get("domain", "").strip().lstrip("*.")
         if pattern and (netloc == pattern or netloc.endswith("." + pattern)):
             if "category" in rule:
@@ -680,7 +760,16 @@ def maybe_extract_archive(job, dest):
         out = dest.with_suffix("")
         out.mkdir(exist_ok=True)
         with zipfile.ZipFile(dest) as z:
-            z.extractall(out)
+            out_resolved = out.resolve()
+            for member in z.infolist():
+                target = (out / member.filename).resolve()
+                # zip-slip guard: reject any member whose extracted path
+                # would land outside `out` (e.g. "../../etc/passwd").
+                if target != out_resolved and out_resolved not in target.parents:
+                    log(f"auto-extract: skipped unsafe path in {dest.name}: "
+                        f"{member.filename!r}")
+                    continue
+                z.extract(member, out)
         log(f"extracted {dest.name} → {out.name}/")
     except Exception as e:
         log(f"auto-extract failed for {dest.name}: {e}")
@@ -1174,7 +1263,22 @@ def run_ytdlp(job_id):
         "writeautomaticsub": True,
         "subtitleslangs": ["en"],
         "embedsubs": True,
+        # YouTube: give yt-dlp every client worth trying. tv is currently
+        # the most reliable; the others are fallbacks yt-dlp rotates
+        # through automatically when one fails.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv", "web_safari", "android_vr", "web"],
+            },
+        },
+        "socket_timeout": 30,
     }
+
+    js_runtime = find_js_runtime()
+    if js_runtime:
+        ydl_opts["js_runtimes"] = js_runtime
+
+    ydl_opts["extractor_args"].setdefault("youtubepot-bgutilhttp", {})
     if job.get("format_id"):
         ydl_opts["format"] = job["format_id"]
     tf = (job.get("target_format") or "").lower()
@@ -1417,6 +1521,12 @@ def redownload(job_id):
     job = JOBS.get(job_id)
     if not job:
         return jsonify({"error": "unknown job"}), 404
+    if job["status"] == "downloading":
+        # The running download thread only checks stop_evt between chunks.
+        # set() immediately followed by clear() here gives it no reliable
+        # window to observe the signal, so the old thread can keep writing
+        # to the same .part file the freshly-dispatched job also writes to.
+        return jsonify({"error": "job is actively downloading — stop it first"}), 400
     job["stop_evt"].set()
     cleanup_partial_files(job)
     job["pause_evt"].clear()
@@ -1471,7 +1581,18 @@ def probe_formats():
     url = data.get("url")
     if not url:
         return jsonify({"error": "missing url"}), 400
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    opts = {
+        "quiet": True, "no_warnings": True, "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv", "web_safari", "android_vr", "web"],
+            },
+        },
+        "socket_timeout": 30,
+    }
+    js_runtime = find_js_runtime()
+    if js_runtime:
+        opts["js_runtimes"] = js_runtime
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -1770,7 +1891,7 @@ def update_settings():
 @app.route("/remote", methods=["GET"])
 def remote_ui():
     rows = "".join(
-        f"<tr><td>{j['filename']}</td><td>{j['status']}</td>"
+        f"<tr><td>{html.escape(j['filename'])}</td><td>{html.escape(j['status'])}</td>"
         f"<td><a href='/pause/{jid}?key={REMOTE_KEY}'>pause</a> "
         f"<a href='/resume/{jid}?key={REMOTE_KEY}'>resume</a> "
         f"<a href='/stop/{jid}?key={REMOTE_KEY}'>stop</a></td></tr>"
@@ -2590,6 +2711,7 @@ def main():
     JOBS_PATH = HOME / "jobs.json"
     HOME.mkdir(parents=True, exist_ok=True)
     load_settings()
+    _ytdlp_version_check()
     if _port_in_use(APP_PORT):
         log(f"Port {APP_PORT} is already in use — another Video Grabber "
             f"instance may be running. Exiting.")

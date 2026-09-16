@@ -21,9 +21,14 @@ curl -L -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentia
 tar -xf ffmpeg.zip
 REM copy the extracted ffmpeg.exe AND ffprobe.exe into backend\
 
+REM grab Deno (needed for yt-dlp to solve YouTube's signature challenges)
+curl -L -o deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip
+tar -xf deno.zip
+REM copy the extracted deno.exe into backend\
+
 pyinstaller --onedir --noconsole --name VideoGrabber --icon=VideoGrabber.ico ^
     --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 ^
-    --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." server.py
+    --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --add-binary "deno.exe;." server.py
 ```
 
 ## Important: the output is a FOLDER, not a single file

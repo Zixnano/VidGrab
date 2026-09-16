@@ -459,11 +459,70 @@
       // Mode picker: the menu offers every mode that makes sense for this
       // source, and the click handler always opens it.
       if (blob || mse) {
-        // Blob/MSE sources: no file to download directly.
+        // Blob/MSE sources: no direct file. On extractor sites, ask the
+        // backend to resolve the PAGE URL — that gives us the same quality
+        // ladder IDM shows. On non-extractor MSE sites, only recording.
         if (isExtractorSite()) {
-          addMenuItem(menu, "Send page URL to yt-dlp", {},
+          addMenuItem(menu, "Download with yt-dlp", {},
             () => handleSendPageUrl(video, overlay, closeMenu));
+          addDivider(menu);
+          const fmtBox = document.createElement("div");
+          menu.appendChild(fmtBox);
+          const loadingEl = addMenuItem(fmtBox, "Loading formats…",
+            { dim: true, header: true });
+          menu.style.display = "flex";
+          placeMenu();
+          document.addEventListener("click", onDocClick, true);
+          probeFormatsCached(location.href).then((data) => {
+            if (seq !== menuSeq || !menuOpen) return;
+            loadingEl.remove();
+            const formats = (data && data.formats) || [];
+            if (!formats.length) {
+              const msg = (data && data.error)
+                ? `No formats (${data.error})`
+                : "No format list available";
+              addMenuItem(fmtBox, msg, { dim: true, header: true });
+            } else {
+              for (const f of formats.slice(0, 12)) {
+                const tf = f.ext === "webm" ? "webm" : null;
+                addMenuItem(fmtBox, formatLabel(f), {},
+                  () => {
+                    closeMenu();
+                    setLabel(overlay, "Sending…");
+                    chrome.runtime.sendMessage({
+                      type: "SHOW_ADD_DIALOG",
+                      url: location.href,
+                      pageUrl: location.href,
+                      filename: (document.title || "video")
+                        .replace(/[\\/:*?"<>|]/g, "_").slice(0, 80),
+                      format_id: f.format_id,
+                      target_format: tf,
+                    }, (resp) => {
+                      if (chrome.runtime.lastError) {
+                        setLabel(overlay, "Extension error", "#e53935");
+                        return;
+                      }
+                      if (resp && resp.ok) {
+                        setLabel(overlay,
+                          resp.auto_queued ? "Queued ✓" : "Sent to app ✓",
+                          "#4caf50");
+                        setTimeout(() => setLabel(overlay, "Download ▾", "#4caf50"), 2500);
+                      } else {
+                        setLabel(overlay,
+                          (resp && resp.error) || "Failed", "#e53935");
+                      }
+                    });
+                  });
+              }
+            }
+          });
+          addDivider(menu);
+          addMenuItem(menu, "Record live now", {},
+            () => { closeMenu(); handleRecordToggle(video, overlay); });
+          return;
         }
+
+        // Non-extractor MSE: only recording is possible.
         addMenuItem(menu, "Record live now", {},
           () => { closeMenu(); handleRecordToggle(video, overlay); });
         menu.style.display = "flex";
