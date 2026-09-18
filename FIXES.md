@@ -257,3 +257,47 @@ stray workflows/ removed from zip (Task 5), venv simulation DEFERRED with
 honest sandbox probe + user-side commands (Task 6). Reported mismatch:
 watchdog crash not reproducible from this tree (guarded import); fix stands
 on feature-correctness grounds.
+
+---
+
+# v4.0.4 — workflow Deno step paths (CI: doubled backend\backend\)
+
+**File:** .github/workflows/build-exe.yml — "Download and bundle Deno" step
+**Root cause:** the job declares `defaults.run.working-directory: backend`,
+so every step already executes inside backend/. The Deno step I added in
+v4.0.1 prefixed its paths with `backend\`, resolving to
+`backend\backend\deno.zip` at CI time (matching the ffmpeg step's INTENT
+but not its actual bare-path convention — ffmpeg uses `ffmpeg.zip` / `.
+\ffmpeg.exe`). My mistake for writing from assumption instead of matching
+the file's established pattern.
+**Change (the three `backend\` prefixes only):**
+- `-OutFile "backend\deno.zip"` → `-OutFile "deno.zip"`
+- `-DestinationPath "backend\_deno"` → `-DestinationPath "_deno"`
+- `Copy-Item "backend\_deno\deno.exe" "backend\deno.exe"` → `Copy-Item "_deno\deno.exe" "deno.exe"`
+Everything else in the file untouched (defaults, ffmpeg step, Build exe
+step with all four collect-alls + three add-binaries, artifact path).
+
+**Verify:**
+```
+$ findstr "OutFile" .github\workflows\build-exe.yml
+  Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile "deno.zip"
+$ findstr "Copy-Item" .github\workflows\build-exe.yml
+  Copy-Item $ffmpegExe.FullName -Destination .\ffmpeg.exe
+  Copy-Item $ffprobeExe.FullName -Destination .\ffprobe.exe
+  Copy-Item "_deno\deno.exe" "deno.exe"
+  → Deno step paths: no backend\ prefix ✅ (ffmpeg lines also bare, consistent)
+```
+Static consistency check: every run-block path in the file is now bare or
+`./`-relative (only the artifact `path:` stays repo-relative
+`backend/dist/VideoGrabber/`, which is correct — `path:` ignores
+defaults.run).
+
+**Regression note (process):** this file's Deno step has now been
+path-corrected three times because each pass regenerated the step from
+assumption. The v4.0.4 file was patched IN PLACE from the v4.0.3 file —
+only the three lines above changed — so no other correction was at risk of
+being lost.
+
+## SESSION_LOG entry — v4.0.4
+**Completed:** iteration 29. Deno step paths fixed to bare (working-dir is
+backend/); workflow edited in place; findstr checks green; manifest 4.0.4.
