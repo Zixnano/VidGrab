@@ -16,14 +16,17 @@ from pathlib import Path
 
 import requests
 from PySide6.QtCore import (
-    QAbstractTableModel, QModelIndex, Qt, QTimer, Signal, QMimeData, QUrl,
-    QItemSelectionModel,
+    QAbstractTableModel, QModelIndex, Qt, QTimer, QThread, Signal, QMimeData, QUrl,
+    QItemSelectionModel, QPropertyAnimation, QEasingCurve, QAbstractAnimation,
+    QElapsedTimer,
 )
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtWidgets import QGraphicsOpacityEffect, QTextEdit
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
     QLabel, QPushButton, QToolButton, QLineEdit, QTableView, QHeaderView,
     QMenu, QMessageBox, QDialog, QDialogButtonBox, QFormLayout, QComboBox,
+    QColorDialog, QTableWidget, QTableWidgetItem,
     QStatusBar, QSizePolicy, QAbstractItemView, QStyledItemDelegate,
     QInputDialog, QFileDialog, QCheckBox, QSystemTrayIcon, QStyle,
     QSpinBox, QListWidget, QListWidgetItem, QTabWidget,
@@ -33,14 +36,20 @@ BACKEND_BASE = "http://127.0.0.1:5757"
 HOME = Path.home() / "Downloads" / "VideoGrabber"
 CONFIG_PATH = HOME / "settings.json"
 
-ACCENT = "#4caf50"
-BG = "#0b1117"
-PANEL = "#101922"
-BORDER = "#22313f"
-TEXT = "#e6edf3"
-MUTED = "#8b9aaa"
-DANGER = "#ef5350"
-WARN = "#ffca28"
+# Palette-derived (single source of truth: palette.py).
+from palette import resolve_palette
+
+_PAL = resolve_palette()
+ACCENT = _PAL["accent"]
+BG = _PAL["bg_base"]
+PANEL = _PAL["bg_panel"]
+BORDER = _PAL["border"]
+TEXT = _PAL["text"]
+MUTED = _PAL["text_muted"]
+DANGER = _PAL["error"]
+WARN = _PAL["warning"]
+SUCCESS = _PAL["success"]
+TRACK = _PAL["bg_elevated"]   # progress-bar track
 
 CATEGORIES = ["Video", "Music", "Compressed", "Documents", "Programs", "Other"]
 
@@ -181,7 +190,7 @@ class ApiClient:
         return list(data.values())
 
     def add(self, url, filename=None, category=None, description=None,
-            format_id=None, target_format=None):
+            format_id=None, target_format=None, resolution=None, multi=False):
         body = {"url": url}
         if filename:
             body["filename"] = filename
@@ -193,6 +202,10 @@ class ApiClient:
             body["format_id"] = format_id
         if target_format:
             body["target_format"] = target_format
+        if resolution:
+            body["resolution"] = resolution
+        if multi:
+            body["multi"] = True
         return self._req("POST", "/download", json=body)
 
     def pause(self, jid):
@@ -272,14 +285,13 @@ class DownloadModel(QAbstractTableModel):
                 )
         if role == Qt.DisplayRole:
             pct = "—"
-            if j.get("converting"):
+            if j.get("phase") == "converting":
                 pct = f"conv {j.get('conversion_progress', 0)}%"
             elif j.get("size_total"):
                 pct = f"{(j.get('size_done', 0) / j['size_total'] * 100):.0f}%"
             elif j["status"] == "done":
                 pct = "100%"
-            status = (f"converting → {j['converting']}" if j.get("converting")
-                      else j["status"])
+            status = (f"converting → {j.get('converting_fmt', '')}" if j.get("phase") == "converting" else j["status"])
             if col == 6:
                 # Pre-column jobs: fall back to created_ts when done so the
                 # column is still useful for sorting.
@@ -297,7 +309,7 @@ class DownloadModel(QAbstractTableModel):
             ][col]
         if role == Qt.ForegroundRole:
             if col == 4:
-                if j.get("converting"):
+                if j.get("phase") == "converting":
                     return QColor(WARN)
                 s = j["status"]
                 if s == "done":
@@ -362,23 +374,55 @@ def _path_for(job):
     return cat_dir / name
 
 
+def _progress_pct(job):
+    """Numeric progress straight from the job dict (no string parsing):
+    conversion progress while converting, otherwise size_done/size_total
+    with a zero-total guard. Queued/paused/done jobs report 0."""
+    if job.get("phase") == "converting":
+        return float(job.get("conversion_progress") or 0)
+    total = job.get("size_total") or 0
+    return (job.get("size_done") or 0) / total * 100 if total else 0.0
+
+
 class ProgressDelegate(QStyledItemDelegate):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 12.2: per-row interpolation toward the newest value over 100 ms.
+        self._shown = {}  # row -> [from_value, to_value, QElapsedTimer]
+        self.animations_enabled = True  # 12.5: refreshed by MainWindow
+
+    def _animated_pct(self, row, target):
+        entry = self._shown.get(row)
+        if entry is None:
+            timer = QElapsedTimer()
+            timer.start()
+            self._shown[row] = [target, target, timer]
+            return target
+        old, current, timer = entry
+        if target != current:
+            entry[0], entry[1] = current, target
+            timer.restart()
+        if not self.animations_enabled:
+            entry[0] = target
+            return target
+        f = min(1.0, timer.elapsed() / 100.0)
+        f = 1.0 - (1.0 - f) ** 3  # ease-out across the 100 ms window
+        return entry[0] + (entry[1] - entry[0]) * f
+
     def paint(self, painter, option, index):
         if index.column() != 2:
             super().paint(painter, option, index)
             return
-        value = index.data(Qt.DisplayRole) or "0%"
-        # "conv 37%" (conversion progress) and plain "37%" both parse here.
-        m = re.search(r"(\d+)", str(value))
-        pct = float(m.group(1)) if m else 0
-        converting = str(value).startswith("conv")
+        job = index.model().items[index.row()]
+        converting = job.get("phase") == "converting"
+        pct = self._animated_pct(index.row(), _progress_pct(job))
         painter.save()
         rect = option.rect.adjusted(6, 14, -6, -14)
         if rect.height() < 4:
             # Very short rows: keep the bar drawable instead of negative-height.
             rect.setHeight(4)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#1d2a35"))
+        painter.setBrush(QColor(TRACK))
         painter.drawRoundedRect(rect, 5, 5)
         fill = int(rect.width() * max(0, min(100, pct)) / 100)
         if fill > 0:
@@ -396,12 +440,14 @@ class AddDownloadDialog(QDialog):
     # Carries (probe_seq, response_dict) from the background probe thread —
     # Qt widgets are only touched in the slot, never in the thread.
     _formats_ready = Signal(object)
+    _head_ready = Signal(object)
 
     def __init__(self, parent=None, api=None, prefill_url="",
                  prefill_format_id=None, prefill_target_format=None):
         super().__init__(parent)
         self.api = api
         self._probe_seq = 0
+        self._head_seq = 0
         self._prefill_format_id = prefill_format_id
         self._prefill_target_format = prefill_target_format
         self.setWindowTitle("Download File Info")
@@ -411,10 +457,24 @@ class AddDownloadDialog(QDialog):
         self.url.setPlaceholderText("https://example.com/file.mp4")
         self.url.editingFinished.connect(self._probe)
         form.addRow("URL", self.url)
-        self.quality = QComboBox()
-        self.quality.addItem("Best available")
-        form.addRow("Quality", self.quality)
+        quality_row = QHBoxLayout()
+        self.quality = QListWidget()
+        self.quality.setSelectionMode(QAbstractItemView.NoSelection)
+        self.quality.setMaximumHeight(170)
+        self.quality.itemChanged.connect(self._update_preview)
+        quality_row.addWidget(self.quality)
+        quality_btns = QVBoxLayout()
+        self.select_best_btn = QPushButton("Select best")
+        self.select_best_btn.clicked.connect(self._select_best)
+        quality_btns.addWidget(self.select_best_btn)
+        quality_btns.addStretch(1)
+        quality_row.addLayout(quality_btns)
+        form.addRow("Quality", quality_row)
+        self.queue_preview = QLabel("Best available (1 file)")
+        self.queue_preview.setStyleSheet(f"color: {MUTED};")
+        form.addRow("Queue", self.queue_preview)
         self._formats_ready.connect(self._on_formats)
+        self._head_ready.connect(self._on_head_ready)
         self.category = QComboBox()
         self.category.addItems(CATEGORIES)
         form.addRow("Category", self.category)
@@ -455,24 +515,42 @@ class AddDownloadDialog(QDialog):
             self.save_path.setText(d)
 
     def _probe(self):
-        url = self.url.text().strip()
-        if not url or not self.api:
+        if not self.api:
             return
-        try:
-            r = self.api.probe_head(url)
-            size = r.get("size", 0)
-            self.size_label.setText(fmt_bytes(size) if size else "unknown")
-        except Exception:
-            self.size_label.setText("unknown")
+        url = self.url.text().strip()
+        if not url:
+            return
+        # 11.2: HEAD probe moves off the UI thread (it blocked every
+        # editingFinished). A seq counter drops stale responses.
+        self._head_seq += 1
+        seq = self._head_seq
+
+        def worker():
+            try:
+                r = self.api.probe_head(url)
+                data = {"size": r.get("size", 0)}
+            except Exception:
+                data = {"size": 0}
+            self._head_ready.emit((seq, data))
+
+        threading.Thread(target=worker, daemon=True).start()
         self._probe_formats(url)
 
+    def _on_head_ready(self, payload):
+        seq, data = payload
+        if seq != self._head_seq:
+            return  # stale response for an older URL
+        size = data.get("size", 0)
+        self.size_label.setText(fmt_bytes(size) if size else "unknown")
     def _probe_formats(self, url):
         """Ask the backend which formats exist, off the UI thread. A seq
         counter drops stale responses when the URL changes quickly."""
         self._probe_seq += 1
         seq = self._probe_seq
         self.quality.clear()
-        self.quality.addItem("Loading formats…")
+        placeholder = QListWidgetItem("Loading formats…")
+        placeholder.setFlags(Qt.NoItemFlags)
+        self.quality.addItem(placeholder)
         self.quality.setEnabled(False)
 
         def worker():
@@ -489,15 +567,38 @@ class AddDownloadDialog(QDialog):
         if seq != self._probe_seq:
             return  # stale — a newer probe superseded this one
         self.quality.clear()
-        self.quality.addItem("Best available")
         for f in data.get("formats") or []:
-            self.quality.addItem(self._format_label(f), f.get("format_id"))
+            item = QListWidgetItem(self._format_label(f))
+            # format_id lives in UserRole, resolution in UserRole+1, ext in
+            # UserRole+2 — if these are lost, values() returns names instead
+            # of IDs and every multi-quality download fails.
+            item.setData(Qt.UserRole, str(f.get("format_id") or ""))
+            item.setData(Qt.UserRole + 1, f.get("resolution") or "")
+            item.setData(Qt.UserRole + 2, f.get("ext") or "")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.quality.addItem(item)
+        for codec in ("mp3", "flac", "opus", "m4a"):
+            item = QListWidgetItem(f"Audio only · {codec.upper()}")
+            item.setData(Qt.UserRole, "audio:" + codec)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.quality.addItem(item)
         self.quality.setEnabled(True)
         # Pill-sent format pre-selection ("720p" item opens pre-selected).
         if self._prefill_format_id:
-            idx = self.quality.findData(self._prefill_format_id)
-            if idx >= 0:
-                self.quality.setCurrentIndex(idx)
+            want = str(self._prefill_format_id)
+            for i in range(self.quality.count()):
+                if self.quality.item(i).data(Qt.UserRole) == want:
+                    self.quality.item(i).setCheckState(Qt.Checked)
+                    break
+        if self._prefill_target_format:
+            want = "audio:" + self._prefill_target_format.lower()
+            for i in range(self.quality.count()):
+                if self.quality.item(i).data(Qt.UserRole) == want:
+                    self.quality.item(i).setCheckState(Qt.Checked)
+                    break
+        self._update_preview()
 
     @staticmethod
     def _format_label(f):
@@ -509,17 +610,90 @@ class AddDownloadDialog(QDialog):
         kind = "audio only" if vc == "none" else f"{vc}/{ac}"
         return " · ".join(p for p in (res, ext, kind, size) if p)
 
+    def _select_best(self):
+        """Check the highest-quality row (the probe lists best first)."""
+        for i in range(self.quality.count()):
+            self.quality.item(i).setCheckState(Qt.Unchecked)
+        if self.quality.count():
+            self.quality.item(0).setCheckState(Qt.Checked)
+
+    def _checked_rows(self):
+        """[(format_id_or_audio, resolution, ext)] for checked rows."""
+        rows = []
+        for i in range(self.quality.count()):
+            item = self.quality.item(i)
+            if item.checkState() != Qt.Checked:
+                continue
+            data = item.data(Qt.UserRole)
+            if isinstance(data, str) and data.startswith("audio:"):
+                rows.append((data, None, data.split(":", 1)[1]))
+            else:
+                rows.append((data or None,
+                             item.data(Qt.UserRole + 1) or None,
+                             item.data(Qt.UserRole + 2) or None))
+        return rows
+
+    @staticmethod
+    def _res_suffix(resolution):
+        """Mirror of jobs._resolution_suffix — keep in sync."""
+        res = str(resolution or "").strip()
+        m = re.match(r"^\d+x(\d+)$", res)
+        return f"{m.group(1)}p" if m else re.sub(r"[^0-9A-Za-z]+", "", res)
+
+    def _update_preview(self, *_):
+        """Filename preview — refreshes as boxes are checked."""
+        preview = getattr(self, "queue_preview", None)
+        if preview is None:
+            return  # signal can fire mid-__init__ before the label exists
+        url = self.url.text().strip()
+        raw = re.sub(r"[?#].*$", "", url).rstrip("/")
+        stem = re.sub(r'[<>:"/\\|?*]', "",
+                      os.path.splitext(os.path.basename(raw))[0]) or "download"
+        rows = self._checked_rows()
+        n_video = sum(1 for r in rows if not str(r[0] or "").startswith("audio:"))
+        names = []
+        for data, res, ext in rows:
+            if str(data or "").startswith("audio:"):
+                names.append(f"{stem}.{data.split(':', 1)[1]}")
+            elif n_video > 1 and res:
+                names.append(f"{stem}_{self._res_suffix(res)}.{ext or 'mp4'}")
+            else:
+                names.append(f"{stem}.{ext or 'mp4'}")
+        if not names:
+            preview.setText("Best available (1 file)")
+        else:
+            preview.setText(f"{len(names)} file(s): " + ", ".join(names))
+
     def values(self):
-        return {
-            "url": self.url.text().strip(),
-            "category": self.category.currentText(),
-            "save_path": self.save_path.text().strip(),
-            "remember": self.remember.isChecked(),
-            "description": self.description.text().strip(),
-            "format_id": self.quality.currentData(),
-            "skip_dialog": self.skip_dialog.isChecked(),
-            "target_format": self._prefill_target_format,
-        }
+        """One dict per checked row, ready for ApiClient.add. When nothing
+        is checked, a single best-available dict (format_id=None) — the
+        legacy single-format behavior."""
+        checked = self._checked_rows()
+        if not checked:
+            # Nothing checked: single best-available job, honoring any
+            # pill-sent audio-extraction prefill.
+            checked = [(None, None, None)]
+            prefill_tfmt = self._prefill_target_format
+        else:
+            prefill_tfmt = None
+        out = []
+        for data, res, ext in checked:
+            if str(data or "").startswith("audio:"):
+                fid, tfmt = None, data.split(":", 1)[1]
+            else:
+                fid, tfmt = data, prefill_tfmt
+            out.append({
+                "url": self.url.text().strip(),
+                "category": self.category.currentText(),
+                "save_path": self.save_path.text().strip(),
+                "remember": self.remember.isChecked(),
+                "description": self.description.text().strip(),
+                "format_id": fid,
+                "target_format": tfmt,
+                "resolution": res,
+                "skip_dialog": self.skip_dialog.isChecked(),
+            })
+        return out
 
 
 class SettingsDialog(QDialog):
@@ -552,7 +726,52 @@ class SettingsDialog(QDialog):
         for w in (self.force_on_top, self.close_to_tray,
                   self.watch_recording_folder, self.clipboard_monitor):
             gl.addRow(w)
+        # v4 (Session 6): theme controls
+        self.accent = s.get("accent", "#26c6da")
+        self._theme_tokens = dict(s.get("theme_tokens") or {})
+        self.accent_btn = QPushButton(f"Accent: {self.accent}")
+        self.accent_btn.setStyleSheet(f"background: {self.accent}; color: #0a0a0f;")
+        self.accent_btn.clicked.connect(self._pick_accent)
+        gl.addRow("Accent color", self.accent_btn)
+        self.theme_preset = QComboBox()
+        self.theme_preset.addItems(["amoled_black", "dark_gray", "high_contrast"])
+        preset = s.get("theme_preset", "amoled_black")
+        if preset not in ("amoled_black", "dark_gray", "high_contrast"):
+            preset = "amoled_black"
+        self.theme_preset.setCurrentText(preset)
+        gl.addRow("Theme preset", self.theme_preset)
+        self.animations_enabled = QCheckBox("Enable animations")
+        self.animations_enabled.setChecked(bool(s.get("animations_enabled", True)))
+        gl.addRow(self.animations_enabled)
         tabs.addTab(g, "General")
+
+        # ---- Theme tab (Session 13) ----
+        tw = QWidget()
+        tl = QVBoxLayout(tw)
+        self.tok_table = QTableWidget(0, 3)
+        self.tok_table.setHorizontalHeaderLabels(["Token", "Color", ""])
+        self.tok_table.horizontalHeader().setStretchLastSection(True)
+        for name in ("bg_base", "bg_panel", "bg_elevated", "border", "border_hi",
+                     "text", "text_muted", "text_dim", "accent", "accent_dim",
+                     "success", "warning", "error", "info"):
+            self._add_token_row(name)
+        tl.addWidget(self.tok_table)
+        row = QHBoxLayout()
+        exp = QPushButton("Export theme…")
+        imp = QPushButton("Import theme…")
+        exp.clicked.connect(self._export_theme)
+        imp.clicked.connect(self._import_theme)
+        row.addWidget(exp)
+        row.addWidget(imp)
+        row.addStretch(1)
+        tl.addLayout(row)
+        tl.addWidget(QLabel("Preview (QSS snippet with current overrides)"))
+        self.theme_preview = QTextEdit()
+        self.theme_preview.setReadOnly(True)
+        self.theme_preview.setMaximumHeight(150)
+        tl.addWidget(self.theme_preview)
+        self._refresh_theme_preview()
+        tabs.addTab(tw, "Theme")
 
         # ---- Downloads ----
         d = QWidget()
@@ -571,6 +790,15 @@ class SettingsDialog(QDialog):
         self.auto_mp4 = QCheckBox("Auto-convert downloaded videos to MP4")
         self.auto_mp4.setChecked(bool(s.get("auto_mp4", True)))
         dl.addRow(self.auto_mp4)
+        self.prefer_source_quality = QCheckBox(
+            "Prefer source quality (keep original container/codecs)")
+        self.prefer_source_quality.setChecked(
+            bool(s.get("prefer_source_quality", True)))
+        dl.addRow(self.prefer_source_quality)
+        self.subtitle_languages = QLineEdit(
+            ", ".join(s.get("subtitle_languages", ["en"])))
+        self.subtitle_languages.setPlaceholderText("en, es, ...")
+        dl.addRow("Subtitle languages", self.subtitle_languages)
         tabs.addTab(d, "Downloads")
 
         # ---- Post-Download ----
@@ -643,6 +871,66 @@ class SettingsDialog(QDialog):
             ftl.addRow(cb)
         tabs.addTab(ft, "File Types")
 
+        # ---- Engines (Session 9 wires this up) ----
+        en = QWidget()
+        enl = QVBoxLayout(en)
+        self.engine_checks = {}
+        disabled = set(s.get("engines_disabled") or [])
+        for name in ("yt-dlp", "streamlink"):
+            cb = QCheckBox(f"Enable {name}")
+            cb.setChecked(name not in disabled)
+            self.engine_checks[name] = cb
+            enl.addWidget(cb)
+        enl.addWidget(QLabel("Engine priority (drag to reorder):"))
+        self.engine_priority = QListWidget()
+        self.engine_priority.setDragDropMode(QAbstractItemView.InternalMove)
+        order = [n for n in (s.get("preferred_engines") or [])
+                 if n in ("yt-dlp", "streamlink")]
+        for n in ("yt-dlp", "streamlink"):
+            if n not in order:
+                order.append(n)
+        for n in order:
+            self.engine_priority.addItem(n)
+        enl.addWidget(self.engine_priority)
+        btn_row = QHBoxLayout()
+        chk_btn = QPushButton("Check for update")
+        chk_btn.clicked.connect(self._check_engine_updates)
+        btn_row.addWidget(chk_btn)
+        btn_row.addStretch(1)
+        enl.addLayout(btn_row)
+        note = QLabel("Versions are checked on demand; updates are never "
+                      "installed automatically.")
+        note.setStyleSheet(f"color: {MUTED};")
+        enl.addWidget(note)
+        enl.addStretch(1)
+        tabs.addTab(en, "Engines")
+
+        # ---- Rules: per-site category + engine ----
+        ru = QWidget()
+        rul = QVBoxLayout(ru)
+        self.rules_table = QTableWidget(0, 3)
+        self.rules_table.setHorizontalHeaderLabels(["Domain", "Category", "Engine"])
+        self.rules_table.horizontalHeader().setStretchLastSection(True)
+        rules = s.get("rules", []) or []
+        engines = s.get("per_site_engine", {}) or {}
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            self._add_rule_row(rule.get("domain", ""),
+                               rule.get("category", "Other"),
+                               engines.get(rule.get("domain", ""), "auto"))
+        rul.addWidget(self.rules_table)
+        btns = QHBoxLayout()
+        add_btn = QPushButton("Add rule")
+        add_btn.clicked.connect(lambda: self._add_rule_row("", "Other", "auto"))
+        del_btn = QPushButton("Remove selected")
+        del_btn.clicked.connect(self._remove_rule_row)
+        btns.addWidget(add_btn)
+        btns.addWidget(del_btn)
+        btns.addStretch(1)
+        rul.addLayout(btns)
+        tabs.addTab(ru, "Rules")
+
         # ---- Pairing ----
         pr = QWidget()
         prl = QFormLayout(pr)
@@ -662,12 +950,149 @@ class SettingsDialog(QDialog):
     def _copy_token(self):
         QApplication.clipboard().setText(self.token_edit.text())
 
+    CATEGORIES = ("Video", "Music", "Compressed", "Documents", "Programs", "Other")
+    ENGINES = ("auto", "yt-dlp", "streamlink")
+
+    def _check_engine_updates(self):
+        """Manual version check: reports via dialog + log; never auto-updates."""
+        import json as _json
+        import subprocess as _sp
+        from settings import log
+        lines = []
+        for name in ("yt-dlp", "streamlink"):
+            try:
+                if name == "yt-dlp":
+                    import yt_dlp
+                    local = yt_dlp.version.__version__
+                else:
+                    r = _sp.run(["streamlink", "--version"],
+                                capture_output=True, text=True, timeout=15)
+                    local = (r.stdout or r.stderr).strip().splitlines()[0]
+                latest = None
+                try:
+                    p = requests.get(f"https://pypi.org/pypi/{name}/json",
+                                     timeout=5).json()
+                    latest = p.get("info", {}).get("version")
+                except Exception:
+                    pass
+                if latest and latest != local:
+                    lines.append(f"{name}: local {local}, latest {latest} — update available")
+                else:
+                    lines.append(f"{name}: {local}" + ("" if latest else " (latest unknown)"))
+            except Exception as e:
+                lines.append(f"{name}: check failed — {e}")
+        log("engine update check: " + "; ".join(lines))
+        QMessageBox.information(self, "Engine versions", "\n".join(lines))
+
+    def _add_token_row(self, name):
+        from palette import resolve_palette
+        base = resolve_palette({})[name]
+        r = self.tok_table.rowCount()
+        self.tok_table.insertRow(r)
+        self.tok_table.setItem(r, 0, QTableWidgetItem(name))
+        btn = QPushButton(self._theme_tokens.get(name, base))
+        btn.setStyleSheet(f"background: {btn.text()}; color: #fff; border: 0;")
+        btn.clicked.connect(lambda _=False, n=name, b=btn: self._pick_token_color(n, b))
+        self.tok_table.setCellWidget(r, 1, btn)
+        reset = QPushButton("Reset")
+        reset.clicked.connect(lambda _=False, n=name, b=btn: self._reset_token(n, b))
+        self.tok_table.setCellWidget(r, 2, reset)
+
+    def _pick_token_color(self, name, btn):
+        from palette import resolve_palette
+        cur = QColor(self._theme_tokens.get(name, resolve_palette({})[name]))
+        c = QColorDialog.getColor(cur, self, f"Color for {name}")
+        if c.isValid():
+            self._theme_tokens[name] = c.name()
+            btn.setText(c.name())
+            btn.setStyleSheet(f"background: {c.name()}; color: #fff; border: 0;")
+            self._refresh_theme_preview()
+
+    def _reset_token(self, name, btn):
+        from palette import resolve_palette
+        self._theme_tokens.pop(name, None)
+        base = resolve_palette({})[name]
+        btn.setText(base)
+        btn.setStyleSheet(f"background: {base}; color: #fff; border: 0;")
+        self._refresh_theme_preview()
+
+    def _refresh_theme_preview(self):
+        from gui_style import build_qss
+        merged = dict(load_settings())
+        merged["theme_tokens"] = dict(self._theme_tokens)
+        self.theme_preview.setPlainText(build_qss(merged))
+
+    def _export_theme(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export theme", "theme.json",
+                                              "JSON (*.json)")
+        if not path:
+            return
+        theme = {"theme_preset": self.theme_preset.currentText(),
+                 "accent": self.accent,
+                 "theme_tokens": dict(self._theme_tokens)}
+        Path(path).write_text(json.dumps(theme, indent=2, sort_keys=True),
+                              encoding="utf-8")
+
+    def _import_theme(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import theme", "",
+                                              "JSON (*.json)")
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+            if data.get("accent"):
+                self.accent = str(data["accent"])
+                self.accent_btn.setText(f"Accent: {self.accent}")
+                self.accent_btn.setStyleSheet(
+                    f"background: {self.accent}; color: #0a0a0f;")
+            if data.get("theme_preset"):
+                i = self.theme_preset.findText(str(data["theme_preset"]))
+                if i >= 0:
+                    self.theme_preset.setCurrentIndex(i)
+            toks = data.get("theme_tokens")
+            self._theme_tokens = dict(toks) if isinstance(toks, dict) else {}
+            self.tok_table.setRowCount(0)
+            for name in ("bg_base", "bg_panel", "bg_elevated", "border", "border_hi",
+                         "text", "text_muted", "text_dim", "accent", "accent_dim",
+                         "success", "warning", "error", "info"):
+                self._add_token_row(name)
+            self._refresh_theme_preview()
+        except Exception as e:
+            QMessageBox.warning(self, "Import failed", str(e))
+
+    def _pick_accent(self):
+        c = QColorDialog.getColor()
+        if c.isValid():
+            self.accent = c.name()
+            self.accent_btn.setText(f"Accent: {self.accent}")
+            self.accent_btn.setStyleSheet(f"background: {self.accent}; color: #0a0a0f;")
+
+    def _add_rule_row(self, domain, category, engine):
+        row = self.rules_table.rowCount()
+        self.rules_table.insertRow(row)
+        self.rules_table.setItem(row, 0, QTableWidgetItem(domain))
+        cat = QComboBox(); cat.addItems(self.CATEGORIES)
+        cat.setCurrentText(category if category in self.CATEGORIES else "Other")
+        self.rules_table.setCellWidget(row, 1, cat)
+        eng = QComboBox(); eng.addItems(self.ENGINES)
+        eng.setCurrentText(engine if engine in self.ENGINES else "auto")
+        self.rules_table.setCellWidget(row, 2, eng)
+
+    def _remove_rule_row(self):
+        rows = sorted({i.row() for i in self.rules_table.selectedIndexes()},
+                      reverse=True)
+        for r in rows:
+            self.rules_table.removeRow(r)
+
     def _save(self):
         try:
             self._save_inner()
         except Exception as e:
             QMessageBox.critical(self, "Settings error",
                                  f"Couldn't save settings:\n{e}")
+
 
     def _save_inner(self):
         if self.api:
@@ -701,6 +1126,41 @@ class SettingsDialog(QDialog):
             self.api.save_setting("file_types_overrides",
                                   {ext: not cb.isChecked()
                                    for ext, cb in self.ft_checks.items()})
+            # --- v4 (Session 6) ---
+            self.api.save_setting("accent", self.accent)
+            self.api.save_setting("theme_preset", self.theme_preset.currentText())
+            self.api.save_setting("theme_tokens", self._theme_tokens)
+            # 13.2: rebuild QSS from the freshly saved settings and reapply
+            # app-wide so theme changes land without a restart.
+            from gui_style import build_qss
+            QApplication.instance().setStyleSheet(build_qss(load_settings()))
+            self.api.save_setting("animations_enabled",
+                                  self.animations_enabled.isChecked())
+            self.api.save_setting("prefer_source_quality",
+                                  self.prefer_source_quality.isChecked())
+            langs = [x.strip() for x in
+                     self.subtitle_languages.text().split(",") if x.strip()]
+            self.api.save_setting("subtitle_languages", langs or ["en"])
+            rules, engines = [], {}
+            for row in range(self.rules_table.rowCount()):
+                dom = self.rules_table.item(row, 0)
+                dom = dom.text().strip() if dom else ""
+                if not dom:
+                    continue
+                cat = self.rules_table.cellWidget(row, 1).currentText()
+                eng = self.rules_table.cellWidget(row, 2).currentText()
+                rules.append({"domain": dom, "category": cat})
+                if eng != "auto":
+                    engines[dom] = eng
+            self.api.save_setting("rules", rules)
+            self.api.save_setting("per_site_engine", engines)
+            self.api.save_setting(
+                "engines_disabled",
+                [n for n, cb in self.engine_checks.items() if not cb.isChecked()])
+            self.api.save_setting(
+                "preferred_engines",
+                [self.engine_priority.item(i).text()
+                 for i in range(self.engine_priority.count())])
         self.accept()
 
 
@@ -856,6 +1316,56 @@ class Sidebar(QFrame):
         layout.addWidget(btn)
         self.buttons[name] = btn
 
+def _fade_widget(widget, enabled, duration=150):
+    """Fade `widget` in over `duration` ms, OutCubic (Session 12.1). No-op
+    when animations are disabled; the graphics effect is removed on finish
+    so rendering and hit-testing return to normal."""
+    if not enabled:
+        return
+    effect = QGraphicsOpacityEffect(widget)
+    widget.setGraphicsEffect(effect)
+    anim = QPropertyAnimation(effect, b"opacity", widget)
+    anim.setDuration(duration)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.OutCubic)
+    anim.finished.connect(lambda: widget.setGraphicsEffect(None))
+    anim.start(QAbstractAnimation.DeleteWhenStopped)
+
+
+def _fade_dialog(dialog, enabled, duration=120):
+    """Opacity fade for dialogs (Session 12.3). The dialog's own event loop
+    (exec) keeps the animation running; no-op when animations are off."""
+    if not enabled:
+        return
+    dialog.setWindowOpacity(0.0)
+    anim = QPropertyAnimation(dialog, b"windowOpacity", dialog)
+    anim.setDuration(duration)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.OutCubic)
+    anim.start(QAbstractAnimation.DeleteWhenStopped)
+
+
+class _ApiFetchWorker(QThread):
+    """Runs a blocking ApiClient call off the GUI thread (Session 11.1).
+    Queued-signal delivery applies the result back in the GUI thread; the
+    window waits for in-flight workers in closeEvent so the app can exit
+    cleanly."""
+    result = Signal(object)
+    failed = Signal()
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.result.emit(self._fn())
+        except Exception:
+            self.failed.emit()
+
+
 class MainWindow(QMainWindow):
     # Carries the pill payload from /show-add-dialog to the GUI thread.
     _show_dialog_signal = Signal(object)
@@ -873,6 +1383,18 @@ class MainWindow(QMainWindow):
         self._done_seen = set()
         self._recently_done = {}
         self._sort_column = None
+        self._refresh_worker = None
+        self._logs_worker = None
+        # Settings snapshot fetched on the worker thread each refresh —
+        # the GUI thread never reads settings.json on the hot path (11.2).
+        self._gui_settings = {}
+        self.animations_enabled = True
+        # 12.2: ~30 fps viewport repaint while a download is active so
+        # progress interpolation actually renders. Self-guarding no-op.
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(33)
+        self._anim_timer.timeout.connect(self._tick_animations)
+        self._anim_timer.start()
         self._sort_ascending = True
         self.setWindowTitle("Video Grabber")
         self.resize(1200, 760)
@@ -908,23 +1430,29 @@ class MainWindow(QMainWindow):
                                   prefill_url=payload.get("url", ""),
                                   prefill_format_id=payload.get("format_id"),
                                   prefill_target_format=payload.get("target_format"))
+            _fade_dialog(d, self.animations_enabled)
             result = d.exec()
             if result not in (QDialog.Accepted, 2):
                 return
             v = d.values()
-            if not v["url"]:
+            if not v or not v[0]["url"]:
                 return
-            if v.get("remember") and v.get("save_path"):
+            common = v[0]
+            if common.get("remember") and common.get("save_path"):
                 try:
                     self.api.save_setting("per_category_dirs",
-                                          {v["category"]: v["save_path"]})
+                                          {common["category"]: common["save_path"]})
                 except Exception:
                     pass
-            self.api.add(v["url"], category=v["category"],
-                         description=v["description"],
-                         format_id=v.get("format_id"),
-                         target_format=v.get("target_format"))
-            if v.get("skip_dialog"):
+            total = len(v)
+            for item in v:
+                self.api.add(item["url"], category=item["category"],
+                             description=item["description"],
+                             format_id=item.get("format_id"),
+                             target_format=item.get("target_format"),
+                             resolution=item.get("resolution"),
+                             multi=total > 1)
+            if common.get("skip_dialog"):
                 try:
                     self.api.save_setting("skip_add_dialog", True)
                 except Exception:
@@ -1019,6 +1547,11 @@ class MainWindow(QMainWindow):
                 )
             return
         self._quitting = True
+        # 11.1: stop in-flight fetch workers — a running QThread at exit
+        # hangs the app.
+        for w in (self._refresh_worker, self._logs_worker):
+            if w is not None:
+                w.wait(2000)
         if self._tray:
             self._tray.hide()
         event.accept()
@@ -1170,7 +1703,7 @@ class MainWindow(QMainWindow):
             font-size: 11px;
         }}
         #BottomStatus {{ background: #0a1016; border-top: 1px solid {BORDER}; color: #718493; }}
-        #StatusLabel {{ color: {ACCENT}; padding-left: 10px; }}
+        #StatusLabel {{ color: {SUCCESS}; padding-left: 10px; }}
         QDialog {{ background: {PANEL}; }}
         QLineEdit, QComboBox {{
             background: #0d151d; border: 1px solid #293b49;
@@ -1181,14 +1714,49 @@ class MainWindow(QMainWindow):
         QPushButton:hover {{ background: #20313e; }}
         """)
 
-    def refresh(self):
+    def _tick_animations(self):
+        if not self.animations_enabled:
+            return
         try:
-            self.all_items = self.api.jobs()
-            self.status_label.setText("● Connected")
-            self.status_label.setStyleSheet(f"color: {ACCENT}; padding-left: 10px;")
-        except Exception:
-            self.status_label.setText("● Backend offline")
-            self.status_label.setStyleSheet(f"color: {DANGER}; padding-left: 10px;")
+            if any(j.get("status") == "downloading" for j in self.all_items):
+                self.table.viewport().update()
+        except RuntimeError:
+            self._anim_timer.stop()  # widgets torn down during exit
+
+    def refresh(self):
+        # 11.1: HTTP off the GUI thread. If a fetch is still in flight
+        # (slow backend), skip this tick instead of piling up requests.
+        if self._refresh_worker is not None:
+            return
+
+        def fetch():
+            return self.api.jobs(), load_settings()
+
+        self._refresh_worker = _ApiFetchWorker(fetch, self)
+        self._refresh_worker.result.connect(self._on_refreshed, Qt.QueuedConnection)
+        self._refresh_worker.failed.connect(self._on_refresh_failed, Qt.QueuedConnection)
+        self._refresh_worker.finished.connect(self._refresh_worker_done)
+        self._refresh_worker.start()
+
+    def _refresh_worker_done(self):
+        self._refresh_worker = None
+
+    def _on_refresh_failed(self):
+        self.status_label.setText("● Backend offline")
+        self.status_label.setStyleSheet(f"color: {DANGER}; padding-left: 10px;")
+
+    def _on_refreshed(self, payload):
+        items, settings = payload
+        self.all_items = items
+        # 11.3: re-read every tick — a Settings-dialog toggle propagates
+        # within ~1s; nothing is cached from startup.
+        self._gui_settings = settings
+        self.animations_enabled = bool(settings.get("animations_enabled", True))
+        delegate = self.table.itemDelegate()
+        if delegate is not None:
+            delegate.animations_enabled = self.animations_enabled
+        self.status_label.setText("● Connected")
+        self.status_label.setStyleSheet(f"color: {SUCCESS}; padding-left: 10px;")
         for j in self.all_items:
             jid = j.get("id")
             if j.get("status") == "done" and jid not in self._done_seen:
@@ -1210,7 +1778,11 @@ class MainWindow(QMainWindow):
                     if j["id"] in selected_ids:
                         sm.select(self.model.index(r, 0),
                                   QItemSelectionModel.Select | QItemSelectionModel.Rows)
-
+        # 12.1: rows inserted/removed -> fade the viewport in (150 ms).
+        visible_ids = frozenset(j["id"] for j in self.model.items)
+        if visible_ids != getattr(self, "_last_visible_ids", None):
+            self._last_visible_ids = visible_ids
+            _fade_widget(self.table.viewport(), self.animations_enabled)
     def _tick_fade(self):
         if not self._recently_done:
             return
@@ -1226,15 +1798,21 @@ class MainWindow(QMainWindow):
         self.table.viewport().update()
 
     def refresh_logs(self):
+        if self._logs_worker is not None:
+            return
+        self._logs_worker = _ApiFetchWorker(self.api.logs, self)
+        self._logs_worker.result.connect(self._on_logs_refreshed, Qt.QueuedConnection)
+        self._logs_worker.finished.connect(lambda: setattr(self, "_logs_worker", None))
+        self._logs_worker.start()
+
+    def _on_logs_refreshed(self, lines):
         try:
-            lines = self.api.logs()
             if lines:
                 self.log.setText(lines[-1])
         except Exception:
             pass
-
     def _on_new_job(self, job):
-        if not load_settings().get("force_on_top", True):
+        if not self._gui_settings.get("force_on_top", True):
             return
         # Already focused — raising would only cause a flicker.
         if self.isVisible() and not self.isMinimized() and self.isActiveWindow():
@@ -1246,13 +1824,17 @@ class MainWindow(QMainWindow):
 
     def open_bandwidth_profiles(self):
         try:
-            BandwidthProfilesDialog(self, self.api).exec()
+            dlg = BandwidthProfilesDialog(self, self.api)
+            _fade_dialog(dlg, self.animations_enabled)
+            dlg.exec()
         except Exception as e:
             QMessageBox.critical(self, "Bandwidth profiles error", str(e))
 
     def open_settings(self):
         try:
-            SettingsDialog(self, self.api).exec()
+            dlg = SettingsDialog(self, self.api)
+            _fade_dialog(dlg, self.animations_enabled)
+            dlg.exec()
         except Exception as e:
             QMessageBox.critical(self, "Settings error", str(e))
 
@@ -1378,23 +1960,31 @@ class MainWindow(QMainWindow):
 
     def add_download(self):
         d = AddDownloadDialog(self, api=self.api)
+        _fade_dialog(d, self.animations_enabled)
         result = d.exec()
         if result not in (QDialog.Accepted, 2):
             return
         v = d.values()
-        if not v["url"]:
+        if not v or not v[0]["url"]:
             return
-        if v["remember"] and v["save_path"]:
+        common = v[0]
+        if common.get("remember") and common.get("save_path"):
             try:
                 self.api.save_setting("per_category_dirs",
-                                      {v["category"]: v["save_path"]})
+                                      {common["category"]: common["save_path"]})
             except Exception:
                 pass
-        try:
-            self.api.add(v["url"], category=v["category"],
-                         description=v["description"], format_id=v.get("format_id"))
-        except Exception as e:
-            QMessageBox.critical(self, "Add failed", str(e))
+        total = len(v)
+        for item in v:
+            try:
+                self.api.add(item["url"], category=item["category"],
+                             description=item["description"],
+                             format_id=item.get("format_id"),
+                             target_format=item.get("target_format"),
+                             resolution=item.get("resolution"),
+                             multi=total > 1)
+            except Exception as e:
+                QMessageBox.critical(self, "Add failed", str(e))
         self.refresh()
 
     def add_batch(self):
@@ -1440,7 +2030,7 @@ class MainWindow(QMainWindow):
         cat_actions = {cat_menu.addAction(c): c for c in CATEGORIES}
         m.addSeparator()
         conv_menu = m.addMenu("Convert to")
-        conv_actions = {conv_menu.addAction(f): f for f in ["mp4", "mkv", "mp3", "wav"]}
+        conv_actions = {conv_menu.addAction(f): f for f in ["mp4", "mkv", "mp3", "wav", "m4a", "flac", "opus"]}
         m.addSeparator()
         a_remove = m.addAction("Remove")
         a_props = m.addAction("Properties")
@@ -1622,6 +2212,8 @@ def launch_gui(new_job_hook=None, home_dir=None, show_dialog_hook=None):
         HOME = Path(home_dir)
         CONFIG_PATH = HOME / "settings.json"
     _app = QApplication.instance() or QApplication(sys.argv)
+    from gui_style import build_qss
+    _app.setStyleSheet(build_qss(load_settings()))
     _app.setApplicationName("Video Grabber")
     _app.setFont(QFont("Segoe UI", 10))
     _app.setQuitOnLastWindowClosed(False)
