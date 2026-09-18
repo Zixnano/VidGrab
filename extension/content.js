@@ -72,6 +72,9 @@
       pointer-events: auto; user-select: none;
     `;
 
+    wrap.style.transition = "opacity 150ms ease";
+    wrap.style.opacity = "0";
+
     const btn = document.createElement("button");
     btn.style.cssText = `
       display:flex; align-items:center; gap:6px; background:transparent;
@@ -95,7 +98,9 @@
     closeBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       DISMISSED.add(video);
-      wrap.remove();
+      // 12.4: fade out, then remove (close).
+      wrap.style.opacity = "0";
+      setTimeout(() => wrap.remove(), 150);
     });
 
     const menu = document.createElement("div");
@@ -111,6 +116,8 @@
     wrap.appendChild(closeBtn);
     wrap.appendChild(menu);
     document.documentElement.appendChild(wrap);
+    // 12.4: fade the pill in (open); display can't transition, opacity can.
+    requestAnimationFrame(() => { wrap.style.opacity = "1"; });
 
     // Per-site drag offset, persisted in localStorage (top frame only —
     // an iframe's location.hostname is the parent's, so sub-frame pills
@@ -285,51 +292,179 @@
     setTimeout(() => URL.revokeObjectURL(url), 15000);
   }
 
-  function handleRecordToggle(video, overlay) {
-    const state = RECORDERS.get(video);
-    if (state && state.recorder && state.recorder.state === "recording") {
-      state.recorder.stop();
-      return;
+  // Session R: capture quality presets -> bitsPerSecond. "Source" omits
+  // the cap and lets MediaRecorder pick the default for the codec.
+  const REC_QUALITIES = {
+    Low:    { bps: 1_500_000 },
+    Medium: { bps: 4_000_000 },
+    High:   { bps: 8_000_000 },
+    Source: { bps: 0 },
+  };
+  let recQuality = "High";
+
+  const REC_MODES = [
+    { key: "element",     label: "Record element (video+audio)" },
+    { key: "tab",         label: "Record tab (video+audio)" },
+    { key: "tab-audio",   label: "Record tab (audio only)" },
+    { key: "screen",      label: "Record screen…" },
+  ];
+
+  function recPickMime() {
+    // R.3: probe codec support, best first.
+    const candidates = [
+      "video/webm;codecs=vp9,opus",
+      "video/webm;codecs=vp8,opus",
+      "video/webm",
+      "",
+    ];
+    for (const mt of candidates) {
+      if (!mt) return "";
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(mt)) return mt;
     }
-    let stream;
+    return "";
+  }
+
+  function recNotify(title, body) {
+    // R.6: desktop notifications, best-effort (permission may be absent).
     try {
-      stream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
-    } catch (e) {
-      setLabel(overlay, "Can't capture (DRM?)", "#e53935");
-      return;
+      if (!("Notification" in window)) return;
+      const show = () => { try { new Notification(title, { body }); } catch (e) {} };
+      if (Notification.permission === "granted") show();
+      else if (Notification.permission !== "denied") {
+        Notification.requestPermission().then((p) => { if (p === "granted") show(); });
+      }
+    } catch (e) {}
+  }
+
+  function recBaseName(mode) {
+    // R.7: <title> <mode> <quality> YYYYMMDD HHMMSS (sanitized).
+    const title = (document.title || "recording").replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())} ` +
+                  `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    return `${title} ${mode} ${recQuality} ${stamp}`;
+  }
+
+  function makeRecIndicator(state, overlay) {
+    // R.5: floating indicator — elapsed timer, pause/resume, stop.
+    const el = document.createElement("div");
+    el.style.cssText = `position: fixed; left: 12px; bottom: 12px; z-index: 2147483647;
+      background: rgba(20,20,20,.92); color: #fff; font: 12px system-ui, sans-serif;
+      padding: 6px 10px; border-radius: 6px; display: flex; gap: 8px; align-items: center;`;
+    const t = document.createElement("span");
+    const btnPause = document.createElement("button");
+    const btnStop = document.createElement("button");
+    btnPause.textContent = "⏸";
+    btnStop.textContent = "⏹";
+    for (const b of [btnPause, btnStop]) {
+      b.style.cssText = "cursor:pointer;border:0;border-radius:4px;padding:2px 6px;";
     }
-    if (!stream) {
-      setLabel(overlay, "Can't capture (DRM?)", "#e53935");
-      return;
+    el.append(t, btnPause, btnStop);
+    // v4.0.1 Fix 5: the Fullscreen API top layer ignores ordinary-DOM
+    // z-index, so host the indicator inside the fullscreen element while
+    // one exists. Harmless when no element is fullscreen.
+    const host = () => document.fullscreenElement || document.documentElement;
+    host().appendChild(el);
+    state.onFullscreen = () => host().appendChild(el);
+    document.addEventListener("fullscreenchange", state.onFullscreen);
+    state.indicator = el;
+    state.startedAt = Date.now();
+    state.pausedTotal = 0;
+    state.pausedAt = 0;
+    state.tick = setInterval(() => {
+      const paused = state.recorder && state.recorder.state === "paused"
+        ? Date.now() - state.pausedAt : 0;
+      const secs = Math.floor((Date.now() - state.startedAt - state.pausedTotal - paused) / 1000);
+      t.textContent = `${String(Math.floor(secs / 60)).padStart(2, "0")}:${String(secs % 60).padStart(2, "0")}`;
+    }, 500);
+    btnPause.onclick = () => {
+      const r = state.recorder;
+      if (!r) return;
+      if (r.state === "recording") { r.pause(); state.pausedAt = Date.now(); btnPause.textContent = "⏵"; }
+      else if (r.state === "paused") { r.resume(); state.pausedTotal += Date.now() - state.pausedAt; btnPause.textContent = "⏸"; }
+    };
+    btnStop.onclick = () => { if (state.recorder) state.recorder.stop(); };
+    return el;
+  }
+
+  async function startRecording(video, overlay, mode) {
+    // R.1/R.2/R.4: mode-based capture with element -> tab auto-fallback.
+    let stream = null;
+    let usedMode = mode;
+    if (mode === "element") {
+      try {
+        stream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
+      } catch (e) { stream = null; }
+      if (stream && stream.getVideoTracks().length === 0) {
+        stream.getTracks().forEach((t) => t.stop());
+        stream = null;
+      }
+      if (!stream) {
+        // R.2: element capture unavailable (DRM / no tracks) -> offer tab.
+        recNotify("Video Grabber", "Element capture failed — falling back to tab capture.");
+        return startRecording(video, overlay, "tab");
+      }
+    } else if (mode === "tab" || mode === "tab-audio") {
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: mode === "tab"
+            ? { frameRate: { ideal: 30, max: 60 } } : false,
+          audio: {
+            echoCancellation: false, noiseSuppression: false,
+            autoGainControl: false,
+          },
+          // R.9: surface picker defaults to the current tab.
+          preferCurrentTab: true,
+          selfBrowserSurface: "include",
+        });
+      } catch (e) {
+        setLabel(overlay, "Capture cancelled", "#e53935");
+        return;
+      }
+    } else if (mode === "screen") {
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { frameRate: { ideal: 30, max: 60 } },
+          audio: true,
+        });
+      } catch (e) {
+        setLabel(overlay, "Capture cancelled", "#e53935");
+        return;
+      }
     }
-    if (stream.getVideoTracks().length === 0) {
-      // Audio-only capture is useless for video — release the stream.
-      stream.getTracks().forEach((t) => t.stop());
-      setLabel(overlay, "Can't record on this site", "#e53935");
-      return;
-    }
+
     const chunks = [];
+    const mime = recPickMime();
+    const opts = {};
+    if (mime) opts.mimeType = mime;
+    const q = REC_QUALITIES[recQuality] || REC_QUALITIES.High;
+    if (q.bps) opts.videoBitsPerSecond = q.bps;
     let recorder;
     try {
-      recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+      recorder = new MediaRecorder(stream, opts);
     } catch (e) {
-      setLabel(overlay, "Recorder unsupported", "#e53935");
-      return;
+      try { recorder = new MediaRecorder(stream); }
+      catch (e2) {
+        stream.getTracks().forEach((t) => t.stop());
+        setLabel(overlay, "Recorder unsupported", "#e53935");
+        return;
+      }
     }
+    const state = { recorder, stream, mode: usedMode };
     recorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) chunks.push(e.data);
     };
     recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: "video/webm" });
-      const guessName = (document.title || "recording").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
-      // Hand the recording to the desktop app. The blob is POSTed directly
-      // from here — chrome.runtime.sendMessage caps messages around 32MB,
-      // and truncated payloads were producing corrupt files. Only a tiny
-      // one-time nonce crosses the message channel.
+      clearInterval(state.tick);
+      if (state.onFullscreen) document.removeEventListener("fullscreenchange", state.onFullscreen);
+      if (state.indicator) state.indicator.remove();
+      stream.getTracks().forEach((t) => t.stop());
+      const blob = new Blob(chunks, { type: mime || "video/webm" });
+      const guessName = recBaseName(usedMode);
+      recNotify("Video Grabber", `Recording saved — ${usedMode} (${recQuality}).`);
       chrome.runtime.sendMessage({ type: "GET_UPLOAD_NONCE" }, async (nresp) => {
         if (chrome.runtime.lastError || !nresp || !nresp.ok || !nresp.nonce) {
-          // App unreachable / unpaired — browser download so the take
-          // isn't lost.
           saveBlob(blob, guessName);
           setLabel(overlay, "Saved ✓ (browser) — Record again", "#4caf50");
           RECORDERS.delete(video);
@@ -346,15 +481,10 @@
           if (res.ok) {
             setLabel(overlay, "Sent to app ✓ — Record again", "#4caf50");
           } else {
-            // The app received the file but rejected it (e.g. corrupt
-            // recording). Surface the error — do NOT silently drop a
-            // broken file into the browser's Downloads folder.
             const data = await res.json().catch(() => ({}));
             setLabel(overlay, (data.error || "Upload rejected").slice(0, 40), "#e53935");
           }
         } catch (e) {
-          // Network-level failure mid-upload (app killed, etc.) — the
-          // take only exists in this blob, so save it locally.
           saveBlob(blob, guessName);
           setLabel(overlay, "Saved ✓ (browser) — Record again", "#4caf50");
         }
@@ -362,10 +492,41 @@
       });
     };
     recorder.start(1000);
-    RECORDERS.set(video, { recorder });
-    setLabel(overlay, "● Recording — click to stop", "#e53935");
+    RECORDERS.set(video, state);
+    makeRecIndicator(state, overlay);
+    recNotify("Video Grabber", `Recording started — ${usedMode} (${recQuality}).`);
+    setLabel(overlay, "● Recording — see indicator", "#e53935");
   }
 
+  function handleRecordToggle(video, overlay) {
+    // Keep the pill button working: toggles an active recording, else
+    // starts an element capture (with tab fallback inside startRecording).
+    const state = RECORDERS.get(video);
+    if (state && state.recorder && state.recorder.state !== "inactive") {
+      state.recorder.stop();
+      return;
+    }
+    startRecording(video, overlay, "element");
+  }
+
+  function addRecordItems(menu, video, overlay, closeMenu) {
+    // R.1/R.3: quality row (cycles) + the four capture modes.
+    addMenuItem(menu, `Quality: ${recQuality} (click to cycle)`, { dim: true }, () => {
+      const order = ["Low", "Medium", "High", "Source"];
+      recQuality = order[(order.indexOf(recQuality) + 1) % order.length];
+      // Re-render the menu so the row shows the new quality.
+      menu.querySelectorAll("div").forEach(() => {});
+      const hdr = menu.firstChild;
+      if (hdr) hdr.textContent = `Quality: ${recQuality} (click to cycle)`;
+    });
+    for (const m of REC_MODES) {
+      addMenuItem(menu, m.label, {}, () => {
+        closeMenu();
+        startRecording(video, overlay, m.key);
+      });
+    }
+    addDivider(menu);
+  }
   function wire(video) {
     if (HANDLED.has(video) || DISMISSED.has(video)) return;
     HANDLED.add(video);
@@ -517,14 +678,12 @@
             }
           });
           addDivider(menu);
-          addMenuItem(menu, "Record live now", {},
-            () => { closeMenu(); handleRecordToggle(video, overlay); });
+          addRecordItems(menu, video, overlay, closeMenu);
           return;
         }
 
         // Non-extractor MSE: only recording is possible.
-        addMenuItem(menu, "Record live now", {},
-          () => { closeMenu(); handleRecordToggle(video, overlay); });
+        addRecordItems(menu, video, overlay, closeMenu);
         menu.style.display = "flex";
         placeMenu();
         document.addEventListener("click", onDocClick, true);
@@ -536,8 +695,7 @@
         const directFile = /\.(mp4|webm|mkv|mov|m4v|avi)(\?|#|$)/i.test(video.currentSrc || "");
         sendChoice(directFile ? {} : { target_format: "mp4" });
       });
-      addMenuItem(menu, "Record live instead", {},
-        () => { closeMenu(); handleRecordToggle(video, overlay); });
+      addRecordItems(menu, video, overlay, closeMenu);
       if (isExtractorSite()) {
         addMenuItem(menu, "Send page URL to yt-dlp", {},
           () => handleSendPageUrl(video, overlay, closeMenu));

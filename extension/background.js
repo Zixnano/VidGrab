@@ -214,7 +214,9 @@ chrome.downloads.onCreated.addListener(async (item) => {
   const cookie = await cookieHeaderFor(item.url).catch(() => "");
   let handedOff = false;
   try {
-    const { res } = await authedFetch("/download", {
+    // v4.0.1 Fix 1: intercepted downloads open the Add dialog instead of
+    // queueing silently (skip_add_dialog still auto-queues server-side).
+    const { res } = await authedFetch("/show-add-dialog", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
