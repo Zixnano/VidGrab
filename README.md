@@ -7,25 +7,39 @@ files never have to pass through the browser's memory.
 
 ```
 video-grabber/
-├── extension/        Chrome (Manifest V3) extension — load unpacked
+├── extension/          Chrome (Manifest V3) extension — load unpacked
 │   ├── manifest.json
-│   ├── background.js   network sniffing + relays downloads to the app
-│   ├── content.js      the on-page hover button (direct-download or record)
-│   ├── popup.html/js   manual list of everything sniffed on the current tab
-│   └── options.html/js pairing-token storage
-└── backend/           Desktop companion app (Python)
-    ├── server.py        local HTTP server + yt-dlp + Tkinter window
-    ├── requirements.txt
-    └── build_exe.md     how to freeze it into VideoGrabber.exe
+│   ├── background.js     network sniffing + relays downloads to the app
+│   ├── content.js        the on-page hover pill (download / record)
+│   ├── popup.html/js     manual list of everything sniffed on the current tab
+│   ├── options.html/js   pairing-token storage
+│   └── icons/            extension + notification icons (16/32/48/128 PNG)
+├── backend/            Desktop companion app (Python, PySide6)
+│   ├── server.py         Flask entry point (registers routes, serves the GUI)
+│   ├── api.py            HTTP routes (thin; delegates to jobs/downloader)
+│   ├── jobs.py           job registry, status state machine, snapshot/restore
+│   ├── downloader.py     worker pool; generic segmented downloads; conversions
+│   ├── engines.py        yt-dlp / streamlink engines + route_for() routing
+│   ├── settings.py       persistent settings, categories, rules
+│   ├── palette.py        theme tokens + presets
+│   ├── gui_style.py      QSS builder
+│   ├── gui_qt.py         the PySide6 download-manager window
+│   ├── logging_setup.py  rotating log file
+│   ├── requirements.txt
+│   ├── VideoGrabber.ico  app icon (CI --icon expects it here)
+│   └── tests/            pytest suite (run: pytest tests/)
+├── docs/               SMOKE_TEST.md and other guides
+├── .github/workflows/  CI — builds VideoGrabber.exe on Windows
+└── (repo root)         README, CHANGELOG, FIXES, ARCHITECTURE, icons…
 ```
 
 ## Setup (development / using it yourself right now)
 
 1. **Backend**: `cd backend && pip install -r requirements.txt && python server.py`
    A dark PySide6 download-manager window opens, listening on
-   `http://127.0.0.1:5757`. Leave it running. If PySide6 fails to import
-   (e.g. it wasn't installed), the app automatically falls back to the
-   older Tkinter window and logs why.
+   `http://127.0.0.1:5757`. Leave it running. PySide6 is required — there
+   is no fallback window anymore (the old Tkinter fallback was removed in
+   v4.0; the `tkinterdnd2` dependency went with it).
    Files are saved under `%USERPROFILE%\Downloads\VideoGrabber\`.
 2. **Extension**: open `chrome://extensions`, enable Developer Mode, "Load
    unpacked", select the `extension/` folder.
@@ -39,11 +53,15 @@ video-grabber/
      `~/Downloads/VideoGrabber`.
    - **"Send page URL to Grabber"** (purple, MSE-only sites like Twitch) —
      the player exposes no capture-able stream, so the page URL itself is
-     handed to yt-dlp, which has a dedicated extractor for the site.
+     handed to yt-dlp (or streamlink, for live sites), which has a dedicated
+     extractor for the site.
    - **"Record this video"** (red) — the video is playing from a `blob:` URL
-     (MSE-based players), which isn't a downloadable file. Clicking starts
-     `MediaRecorder` capture; click again to stop and save what was
-     captured so far as a `.webm`.
+     (MSE-based players), which isn't a downloadable file. The pill menu
+     offers four capture modes — element (video+audio), tab (video+audio),
+     tab audio-only, and screen — with quality presets (Low/Medium/High/
+     Source). A floating indicator shows the elapsed time with pause/resume
+     and stop; stopping saves what was captured as `.webm` and hands it to
+     the app (desktop notification on start/stop).
 5. The toolbar popup also lists everything the network sniffer has seen on
    the current tab, in case the hover button doesn't appear — "Send to
    Grabber" does the same handoff.
@@ -51,23 +69,55 @@ video-grabber/
 ## To get an actual `VideoGrabber.exe`
 
 PyInstaller builds are platform-specific, so it has to be built on Windows.
-Full steps are in `backend/build_exe.md`. Short version:
+Full context is in `backend/build_exe.md`; the canonical command (matching
+`.github/workflows/build-exe.yml`) is:
 
 ```
 cd backend
 pip install -r requirements.txt
-pyinstaller --onedir --noconsole --name VideoGrabber --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 --add-binary "ffmpeg.exe;." server.py
+pyinstaller --onedir --noconsole --name VideoGrabber --icon=VideoGrabber.ico --collect-all yt_dlp --collect-all PySide6 --collect-all streamlink --collect-all watchdog --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --add-binary "deno.exe;." server.py
 ```
 
-(Or push to GitHub — the workflow in `.github/workflows/build-exe.yml`
-builds the exe on Windows and uploads it as an artifact, ffmpeg bundled.)
+Notes: `streamlink` is bundled for live-site (Twitch) routing; `watchdog`
+for the screen-recording auto-import watcher; `deno.exe` lets yt-dlp solve
+YouTube's JavaScript challenges. Or just push to GitHub — the CI workflow
+downloads ffmpeg/ffprobe/Deno itself and uploads the built exe as an
+artifact. See PACKAGING.md for the release-zip layout rules.
 
-## What's new in v3.2
+## What's new in v4.0
 
-- **New PySide6 GUI** (`backend/gui_qt.py`) replaces Tkinter as the primary
+- **Modular backend**: the old monolithic `server.py` is split into
+  `api` / `jobs` / `downloader` / `engines` / `settings` (+ theme modules),
+  with a proper job status state machine and jobs.json snapshot/restore.
+- **Pluggable engines**: yt-dlp and streamlink behind one interface;
+  `route_for()` picks per URL (Twitch prefers streamlink) and honors
+  per-site engine overrides, engine priority, and disabled engines
+  (Settings → Engines tab).
+- **Multi-quality checklist downloads**: the "Download File Info" dialog
+  shows a checkable format list (plus audio-only MP3/FLAC/Opus/M4A rows) —
+  tick several qualities and one job per selection queues, with the
+  resolution in each filename.
+- **Download quality tuning**: mp4/H.264-preferred format selection, MKV
+  container preservation, transparent-quality MP3 (`-q:a 0`), Opus/M4A
+  bitrate targets, `-crf 18 -preset medium` fallback transcode.
+- **4-mode recorder** (extension): element / tab / tab-audio / screen, with
+  tab fallback when element capture fails, quality presets, floating
+  indicator, and notifications (v4.0.2).
+- **Theming**: three presets + accent picker + per-token color overrides
+  with a live preview (Settings → Theme tab), QSS export/import.
+- **Responsiveness**: all periodic HTTP and settings reads moved off the
+  GUI thread; the app exits cleanly with in-flight fetches.
+- **Animations**: row fades, interpolated progress bars, dialog fades —
+  all gated by an "Enable animations" setting.
+- **Test suite**: `backend/tests/` (pytest) covering palette/QSS, engine
+  options, job state, migrations, and the progress helper.
+
+## v3.2 (historical)
+
+- **PySide6 GUI** (`backend/gui_qt.py`) replaced Tkinter as the primary
   window — dark IDM-style layout, sidebar category filters, sortable table
   with a live progress-bar column, search box, and an activity-log strip.
-  Tkinter is kept as an automatic fallback if PySide6 isn't installed.
+  (The Tkinter fallback itself was removed in v4.0; PySide6 is required.)
 - **Force-on-top on new downloads**: the window un-minimizes and briefly
   flashes to the front whenever a job is queued from any source (extension,
   clipboard, GUI, or an auto-imported screen recording). Toggle via the
@@ -79,21 +129,22 @@ builds the exe on Windows and uploads it as an artifact, ffmpeg bundled.)
 - **Chrome download interception** (opt-in, off by default): a checkbox in
   the extension's Options page — when enabled, clicking any downloadable
   link in Chrome cancels the browser's own download and hands the URL to
-  Video Grabber instead, with cookies/referer/UA attached.
+  Video Grabber instead, with cookies/referer/UA attached (v4.0.1: opens
+  the Add dialog rather than silently queueing).
 - **Drag finished rows out of the Qt window** into Explorer or another app
   (e.g. drop a finished `.mp4` onto VLC).
 - **Auto-convert to MP4**: any video job that lands as `.mkv`/`.webm`/etc.
   gets remuxed (or transcoded if remuxing fails) to `.mp4` automatically.
   Toggle via the `auto_mp4` setting.
 - **"Download File Info" dialog**: URL, category, save-as path with a
-  "remember this path for &lt;category&gt;" checkbox, description, and a
+  "remember this path for <category>" checkbox, description, and a
   live file-size probe before you commit to starting the download.
-- **"Grab all media on this page" now shows a checklist** in the popup —
-  every sniffed file gets a checkbox (checked by default), with a
-  select-all/none toggle, so you can leave out the ones you don't want
-  before sending the batch to the app.
+- **"Grab all media on this page" checklist** in the popup — every sniffed
+  file gets a checkbox (checked by default), with a select-all/none toggle,
+  so you can leave out the ones you don't want before sending the batch to
+  the app.
 
-## Feature set (v3.1)
+## Feature set (v3.1 — still current)
 
 Downloads:
 - **Queue** with pause/resume/stop/delete, per-item or in bulk.
@@ -114,15 +165,13 @@ GUI:
 - Dark download-manager window with live progress, speed, status.
 - **Right-click context menu**: open/open-with/open-folder, rename/move,
   redownload, resume/stop, refresh URL, remove, category change, double-click
-  behavior, play, convert (mp4/mkv/mp3/wav via ffmpeg), properties.
-- **Drag finished downloads out** of the list into Explorer/other apps.
+  behavior, play, convert (mp4/mkv/mp3/wav/m4a/flac/opus via ffmpeg), properties.
 - **Download-finished toast** with Open file / Open folder, auto-dismiss.
-- **Minimize-to-bar**: closing the window drops to a small always-on-top
-  status strip (green dot = active downloads) instead of quitting.
-- **Tabbed Options**: the Settings dialog (toolbar **⚙ Settings** or
-  File → **Settings…**) has General, Downloads, Connection (timeout/retries/
-  min-speed), Save To (default + per-category folders), File Types (disable
-  capture per extension), Post-Download, and Pairing tabs.
+- **Minimize-to-bar / system tray**: closing the window drops to a small
+  always-on-top status strip or tray icon (green = active downloads)
+  instead of quitting.
+- **Tabbed Settings**: General, Downloads, Connection, Save To, File Types,
+  Post-Download, Rules, **Engines**, **Theme**, Pairing.
 - **Post-download actions**: Windows Defender scan, auto-extract zips,
   open containing folder, play sound, shut down PC when queue empties.
 - **Portable mode**: drop a `portable.txt` next to the exe and settings/jobs
@@ -138,13 +187,15 @@ GUI:
 - **DRM'd content (Netflix, Disney+, most paid streaming platforms)**: won't
   work, on purpose. Those streams are encrypted with Widevine/PlayReady;
   there's no legal or reliable technical way for a general tool to decrypt
-  them, and this project doesn't attempt DRM circumvention.
+  them, and this project doesn't attempt DRM circumvention. (The recorder's
+  element capture fails on DRM for the same reason; it falls back to tab
+  capture with a notification.)
 - **Direct `.mp4`/`.m3u8`/`.mpd` links**: this is the strong path. The
   sniffer + yt-dlp combo handles the large majority of "normal" video sites
   (yt-dlp supports 1,800+ sites — that's the engine doing the heavy lifting).
-- **`blob:`/MSE players without DRM**: handled via the record button, but
+- **`blob:`/MSE players without DRM**: handled via the recorder, but
   it's a real-time capture, not a download — it only captures from the
-  moment you click forward, at playback speed, re-encoded to webm.
+  moment you click forward, at playback speed, saved as webm.
 - **Sites that scramble/obfuscate the URL in custom JS**: the generic
   sniffer won't catch these; yt-dlp's per-site extractors cover many of them
   when you hand the page URL to the app directly.
@@ -160,5 +211,3 @@ GUI:
 - **Browser context-menu hooks** ("Download this link with Video Grabber"
   on right-click in Chrome) — doable, just not built yet; the hover pill,
   popup list and page scanner cover the same ground.
-
-

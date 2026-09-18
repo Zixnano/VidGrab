@@ -5,7 +5,7 @@ Concept: a green arrow dropping into a light-grey tray, on a near-black
 and stroke weights are consistent across sizes; 16/32/48 are hand-tuned
 with bolder strokes so the concept survives scaling.
 
-Files:
+Files (shipped in release zips):
   VideoGrabber-1024.svg  app icon master (1024x1024)
   VideoGrabber-128.svg   app icon, 128px
   VideoGrabber-32.svg    app icon, 32px (taskbar)
@@ -15,18 +15,30 @@ Files:
   icon128.svg            extension icon 128x128 (same as app 128)
   tray-32.svg            tray icon: same shape, single #e6edf3 color,
                          transparent background, reads on light/dark bars
+  VideoGrabber-1024.png  raster export of the master
+  VideoGrabber-128.png   raster export, 128px
+  tray-32.png            raster export of the tray icon
+  VideoGrabber.ico       multi-size app/exe icon (root copy; CI uses the
+                         one in backend/, keep both in sync)
+  extension/icons/       icon16/32/48/128.png — extension manifest icons
+                         and chrome.notifications icon
 
-Convert to PNG/ICO (already done — PNG exports live in extension/icons/ and icons/, and backend/VideoGrabber.ico is committed; only redo this if you change the artwork):
+Convert to PNG/ICO (only redo this if you change the artwork):
   1. SVG -> PNG: any free converter works (e.g. https://cloudconvert.com
      or Inkscape: File > Export PNG, one export per size).
   2. PNG -> ICO: https://icoconvert.com (free one-page tool — upload the
      1024 PNG, it outputs a multi-size .ico), or IcoFX on Windows.
-  3. Drop VideoGrabber.ico into backend/ and build with:
+  3. Drop VideoGrabber.ico into backend/ and build with the CI command
+     (see README.md / .github/workflows/build-exe.yml):
 
      pyinstaller --onedir --noconsole --name VideoGrabber ^
          --icon=VideoGrabber.ico ^
-         --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 ^
-         --add-binary "ffmpeg.exe;." server.py
+         --collect-all yt_dlp --collect-all PySide6 ^
+         --collect-all streamlink --collect-all watchdog ^
+         --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." ^
+         --add-binary "deno.exe;." server.py
 
+     (The v3-era `--collect-all tkinterdnd2` flag was removed in v4.0 with
+     the Tkinter fallback; the GUI is PySide6-only.)
   4. Manifest wiring (extension): point manifest.json "icons" and
-     "action.default_icon" at icon16/32/48/128.png.
+     "action.default_icon" at icon16/32/48/128.png (already done).

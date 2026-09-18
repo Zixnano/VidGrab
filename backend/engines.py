@@ -5,11 +5,13 @@ logic that lived in downloader.run_ytdlp and api.probe_formats — behavior
 must be identical. StreamlinkEngine arrives in Session 8.
 """
 import glob
+import os
 import json
 import re
 import shutil
 import subprocess
 import sys
+import traceback
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -45,7 +47,6 @@ class FormatInfo:
         return asdict(self)
 
 
-
 def find_js_runtime():
     """Return {'deno': path} or {'node': path} for yt-dlp, or {}.
 
@@ -55,7 +56,8 @@ def find_js_runtime():
 
     Search order:
       1. Next to the exe (frozen) or the project dir (dev) — a bundled copy
-      2. System PATH
+      2. _MEIPASS (PyInstaller --onedir's _internal/ folder), if frozen
+      3. System PATH
     """
     global _YTDLP_JS_RUNTIME_CACHE
     if _YTDLP_JS_RUNTIME_CACHE is not None:
@@ -63,15 +65,20 @@ def find_js_runtime():
 
     candidates = []
     if getattr(sys, "frozen", False):
-        base = Path(sys.executable).parent
+        bases = [Path(sys.executable).parent]
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            bases.append(Path(meipass))
     else:
-        base = Path(__file__).parent
-    candidates += [
-        (base / "deno.exe", "deno"),
-        (base / "deno", "deno"),
-        (base / "node.exe", "node"),
-        (base / "node", "node"),
-    ]
+        bases = [Path(__file__).parent]
+
+    for base in bases:
+        candidates += [
+            (base / "deno.exe", "deno"),
+            (base / "deno", "deno"),
+            (base / "node.exe", "node"),
+            (base / "node", "node"),
+        ]
 
     for name, key in (("deno", "deno"), ("node", "node")):
         which = shutil.which(name)
@@ -91,7 +98,6 @@ def find_js_runtime():
         "Install Deno (https://deno.land) or Node 22+ and restart.")
     _YTDLP_JS_RUNTIME_CACHE = {}
     return _YTDLP_JS_RUNTIME_CACHE
-
 
 
 def _ytdlp_version_check():
@@ -119,11 +125,8 @@ def _ytdlp_version_check():
         log(f"yt-dlp version check failed: {e}")
 
 
-
-
 class DownloadCancelled(Exception):
     pass
-
 
 
 class Engine(Protocol):
@@ -253,8 +256,31 @@ class YtDlpEngine:
         if getattr(sys, "frozen", False):
             ydl_opts["ffmpeg_location"] = sys._MEIPASS
 
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        # v4.0.5 diagnostics: freeze the environment + full traceback so a
+        # [WinError 2] reports exactly which line/subprocess raised it.
+        diag_opts = dict(ydl_opts)
+        try:
+            hdrs = dict(diag_opts.get("http_headers") or {})
+            if hdrs.get("Cookie"):
+                hdrs["Cookie"] = "<redacted>"
+            diag_opts["http_headers"] = hdrs
+        except Exception:
+            pass
+        try:
+            diag_opts.pop("progress_hooks", None)
+        except Exception:
+            pass
+        log(f"yt-dlp diagnostics: _MEIPASS={getattr(sys, '_MEIPASS', None)} "
+            f"executable={sys.executable} "
+            f"PATH={os.environ.get('PATH', '')[:500]} "
+            f"opts={json.dumps(diag_opts, default=str)[:1500]}")
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception:
+            log(f"job {opts.get('job_id') or dest.name}: FULL TRACEBACK:\n"
+                f"{traceback.format_exc()}")
+            raise
 
         # glob.escape(): "[" / "]" are legal in Windows filenames but wildcards
         # to glob() — titles like "Song [Official Video]" would never match.
