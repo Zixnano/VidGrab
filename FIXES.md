@@ -168,3 +168,92 @@ The audit pass (iteration 26) used sender-detection regexes that required
 `{` immediately after `sendMessage(` — multi-line call sites escaped
 detection. The v4.0.2 gate used a broader pattern and caught both live
 senders. AUDIT.md F2 is corrected in this zip.
+
+---
+
+# v4.0.3 fix pass — frozen-runtime dependency completeness
+
+## Task 1 — watchdog restored to requirements
+`watchdog>=4.0` added (position: after streamlink, before pyinstaller, per spec).
+**Honest code note:** in this tree the ONLY watchdog import is the guarded
+one in downloader.py:225 (`try/except ImportError` + fallback base from the
+earlier defect fix), so the v4.0.2 code would *launch* without the package
+and only lose the recording auto-import feature. The crash as reported
+(`server.py` line 38, hard ModuleNotFoundError) is not reproducible from
+this tree's source — the guarded import logs "watchdog not installed —
+screen-recording auto-import disabled" instead. Your CI build (commit
+bca98d2) may carry local changes. The requirements/collect-all fix stands
+regardless: the feature needs the package.
+
+## Task 2 — PyInstaller collects watchdog
+`.github/workflows/build-exe.yml` pyinstaller line now reads exactly:
+```
+pyinstaller --onedir --noconsole --name VideoGrabber --icon=VideoGrabber.ico --collect-all yt_dlp --collect-all PySide6 --collect-all streamlink --collect-all watchdog --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --add-binary "deno.exe;." server.py
+```
+
+## Task 3 — requirements vs actual imports (authoritative: static AST scan)
+Imports found across backend/*.py (non-stdlib, non-local):
+```
+api.py:        flask, flask_cors, requests, yt_dlp
+downloader.py: requests, watchdog, yt_dlp   (watchdog guarded)
+engines.py:    yt_dlp
+gui_qt.py:     PySide6, requests, yt_dlp
+settings.py:   requests
+```
+Resolution: flask→flask ✅ flask_cors→flask-cors ✅ requests→requests ✅
+yt_dlp→yt-dlp ✅ PySide6→PySide6 ✅ watchdog→**watchdog>=4.0 (ADDED this
+pass)**. `streamlink` is declared but not imported — intentional: it is
+invoked as a CLI subprocess by engines.py, and the collect-all bundles its
+plugins. No unresolvable import names → QUESTIONS.md has no new entries.
+
+## Task 4 — collect-all audit
+`--collect-all` present for: yt_dlp ✅ PySide6 ✅ streamlink ✅ watchdog ✅
+(added this pass). flask/flask-cors/requests are plain packages with no
+runtime submodule loading — correctly without collect-all. Each collected
+package is in requirements ✅.
+
+## Task 5 — stray workflows/ folder
+Removed from this zip (was added in v4.0.1 to mirror disk; your disk copy is
+already deleted). Only `.github/workflows/build-exe.yml` ships. Run
+`git rm -r workflows/` on your side if git still tracks it.
+
+## Task 6 — clean-venv import simulation: DEFERRED (no network in sandbox)
+A true venv + `pip install -r` cannot run here (no network). What WAS run:
+1. Static completeness proof (authoritative): after this pass, every
+   non-stdlib import maps 1:1 to a declared requirement — complete by
+   construction.
+2. Sandbox-interpreter dynamic probe (NOT the clean venv; sandbox lacks
+   most packages by design):
+```
+flask: FAIL ModuleNotFoundError   flask_cors: FAIL ModuleNotFoundError
+requests: OK                      yt_dlp: FAIL ModuleNotFoundError
+PySide6: FAIL ModuleNotFoundError watchdog: FAIL ModuleNotFoundError
+streamlink: FAIL ModuleNotFoundError
+```
+   These failures are sandbox-environment artifacts, not requirements gaps.
+RUN THIS ON YOUR MACHINE (or in CI) to satisfy the Task 6 gate:
+```
+python -m venv vgsim && vgsim\Scripts\activate
+pip install -r backend/requirements.txt
+cd backend && python -c "import server; print('OK: server.py imports cleanly')"
+```
+
+## Task 7 — verification
+```
+requirements.txt: watchdog>=4.0 ✅ pyinstaller>=6.0 ✅ streamlink>=6.0 ✅
+pyinstaller line: --collect-all watchdog ✅ streamlink ✅ yt_dlp ✅ PySide6 ✅ | no tkinterdnd2 ✅
+"Download and bundle Deno" step present above Build exe ✅
+workflows/ (no dot): ABSENT from zip ✅
+```
+
+## Dependencies added this pass: watchdog>=4.0
+## --collect-all flags added this pass: watchdog
+
+## SESSION_LOG entry — v4.0.3
+**Completed:** iteration 28. Restored watchdog to requirements (Task 1),
+added --collect-all watchdog (Task 2), full requirements↔imports audit —
+watchdog was the only gap (Task 3), collect-all audit clean (Task 4),
+stray workflows/ removed from zip (Task 5), venv simulation DEFERRED with
+honest sandbox probe + user-side commands (Task 6). Reported mismatch:
+watchdog crash not reproducible from this tree (guarded import); fix stands
+on feature-correctness grounds.
