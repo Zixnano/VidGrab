@@ -39,9 +39,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile "backend\deno.zip"
-          Expand-Archive "backend\deno.zip" -DestinationPath "backend\_deno" -Force
-          Copy-Item "backend\_deno\deno.exe" "backend\deno.exe"
+          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile "deno.zip"
+          Expand-Archive "deno.zip" -DestinationPath "_deno" -Force
+          Copy-Item "_deno\deno.exe" "deno.exe"
 
       - name: Build exe
         run: |
