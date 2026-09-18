@@ -35,20 +35,12 @@ jobs:
           $ffprobeExe = Get-ChildItem -Path ffmpeg_extracted -Recurse -Filter ffprobe.exe | Select-Object -First 1
           Copy-Item $ffprobeExe.FullName -Destination .\ffprobe.exe
 
-      - name: Download and bundle Deno
-        shell: pwsh
-        run: |
-          $denoUrl = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
-          Invoke-WebRequest -Uri $denoUrl -OutFile deno.zip
-          Expand-Archive -Path deno.zip -DestinationPath deno_extracted
-          Copy-Item deno_extracted\deno.exe -Destination .\deno.exe
-
       - name: Build exe
         run: |
           # --onedir instead of --onefile: onefile re-extracts the entire bundle
           # (PySide6 DLLs, ffmpeg, yt-dlp, Tcl libs) to a temp folder on EVERY
           # launch, costing 30s-minutes. onedir starts instantly.
-          pyinstaller --onedir --noconsole --name VideoGrabber --icon=VideoGrabber.ico --collect-all yt_dlp --collect-all tkinterdnd2 --collect-all PySide6 --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --add-binary "deno.exe;." server.py
+          pyinstaller --onedir --noconsole --name VideoGrabber --icon=VideoGrabber.ico --collect-all yt_dlp --collect-all PySide6 --collect-all streamlink --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --add-binary "deno.exe;." server.py
 
       # onedir output is a FOLDER: dist/VideoGrabber/VideoGrabber.exe plus all
       # its DLLs/assets alongside it. The whole folder must be distributed and

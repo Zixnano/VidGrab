@@ -4,4 +4,5 @@ yt-dlp>=2024.8.6
 requests>=2.31
 PySide6>=6.7
 streamlink>=6.0
+pyinstaller>=6.0
 pytest>=7
