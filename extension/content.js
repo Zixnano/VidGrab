@@ -325,14 +325,13 @@
   }
 
   function recNotify(title, body) {
-    // R.6: desktop notifications, best-effort (permission may be absent).
+    // v4.0.2 Q1: route through chrome.notifications (background page).
+    // Content scripts can't call chrome.notifications themselves, and the
+    // Web Notification API depended on each site's permission — so R.6
+    // notifications rarely appeared. Best-effort, fire-and-forget.
     try {
-      if (!("Notification" in window)) return;
-      const show = () => { try { new Notification(title, { body }); } catch (e) {} };
-      if (Notification.permission === "granted") show();
-      else if (Notification.permission !== "denied") {
-        Notification.requestPermission().then((p) => { if (p === "granted") show(); });
-      }
+      chrome.runtime.sendMessage(
+        { type: "SHOW_NOTIFICATION", title, message: body });
     } catch (e) {}
   }
 

@@ -242,37 +242,6 @@ chrome.downloads.onCreated.addListener(async (item) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "GET_VIDEOS") {
-    const m = videoMap.get(msg.tabId);
-    sendResponse({ videos: m ? Array.from(m.values()) : [] });
-    return false;
-  }
-
-  if (msg.type === "CLEAR_VIDEOS") {
-    videoMap.delete(msg.tabId);
-    chrome.action.setBadgeText({ tabId: msg.tabId, text: "" }).catch(() => {});
-    sendResponse({ ok: true });
-    return false;
-  }
-
-  if (msg.type === "GET_ALL_VIDEOS") {
-    // Every tab with detected media: [{id, url, title, items}]. Tabs that
-    // have been closed since detection are skipped.
-    (async () => {
-      const out = [];
-      for (const [tabId, m] of videoMap) {
-        if (!m.size) continue;
-        try {
-          const tab = await chrome.tabs.get(tabId);
-          out.push({ id: tabId, url: tab.url, title: tab.title,
-                     items: Array.from(m.values()) });
-        } catch (e) { /* tab closed */ }
-      }
-      sendResponse({ tabs: out });
-    })();
-    return true; // async
-  }
-
   if (msg.type === "RELAY_DOWNLOAD") {
     // From content.js overlay OR popup.js
     const tabId = sender.tab ? sender.tab.id : msg.tabId;
@@ -289,6 +258,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "RELAY_BATCH") {
     // items: [{url, filename}], from the popup's "Grab all media on this page"
+    // and media-checklist send buttons. VERIFIED LIVE (popup.js x2 senders) —
+    // audit F2 was wrong about this one; retained.
     const items = msg.items || [];
     (async () => {
       const alive = await checkBackend();
@@ -317,6 +288,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } catch (e) {
         sendResponse({ ok: false, error: String(e) });
       }
+    })();
+    return true; // async
+  }
+
+  if (msg.type === "GET_VIDEOS") {
+    const m = videoMap.get(msg.tabId);
+    sendResponse({ videos: m ? Array.from(m.values()) : [] });
+    return false;
+  }
+
+  if (msg.type === "CLEAR_VIDEOS") {
+    videoMap.delete(msg.tabId);
+    chrome.action.setBadgeText({ tabId: msg.tabId, text: "" }).catch(() => {});
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (msg.type === "GET_ALL_VIDEOS") {
+    // Every tab with detected media: [{id, url, title, items}]. Tabs that
+    // have been closed since detection are skipped.
+    (async () => {
+      const out = [];
+      for (const [tabId, m] of videoMap) {
+        if (!m.size) continue;
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          out.push({ id: tabId, url: tab.url, title: tab.title,
+                     items: Array.from(m.values()) });
+        } catch (e) { /* tab closed */ }
+      }
+      sendResponse({ tabs: out });
     })();
     return true; // async
   }
@@ -405,10 +407,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // async
   }
 
-  if (msg.type === "SAVE_RECORDING") {
-    // content.js captured a blob it couldn't stream to disk itself (rare) —
-    // normally content.js just triggers a normal <a download> click for blobs
-    // since it already has DOM access; this path is a fallback only.
+  if (msg.type === "SHOW_NOTIFICATION") {
+    // v4.0.2 Q1: recorder notifications via chrome.notifications — content
+    // scripts can't call it directly, so recNotify() routes through here.
+    // The "notifications" permission is declared in manifest.json.
+    try {
+      chrome.notifications.create("", {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+        title: String(msg.title || "Video Grabber"),
+        message: String(msg.message || ""),
+      });
+    } catch (e) {}
     sendResponse({ ok: true });
     return false;
   }

@@ -7,8 +7,8 @@ in the build sandbox — run SMOKE_TEST.md on a real machine):
   notification, audio-only tab capture, screen mode with audio.
 - YouTube format probing with live extractor + JS runtime (Deno/Node).
 - `pytest tests/` execution (suite compiles; run where pytest exists).
-- R.7/R.8 naming conflict: recorder saves `.webm` (correct container);
-  R.8's `.mp4` pattern flagged for product decision.
+- Recorder saves WebM by design — container matches MediaRecorder source.
+  Users who want MP4 can convert post-download via the existing conversion UI.
 - `_job_dest` disambiguates at download start; simultaneous same-name
   starts can still race (registry reservation noted as future work).
 - downloader.py retains one stranded dead global (`_YTDLP_JS_RUNTIME_CACHE`

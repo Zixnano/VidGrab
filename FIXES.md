@@ -106,3 +106,65 @@ consistent — tab-audio intentional); Q2 fixed (jobs.json v4 migration +
 test). All gates green: py_compile, node --check, AST sweep, four targeted
 logic tests. DEFERRED: Fix 1 runtime (browser), Fix 3 visual (GUI),
 Fix 5 live (browser), Fix 6 fresh-venv pip install (no network).
+
+---
+
+# v4.0.2 fix pass (audit findings applied)
+
+## Q1 — Recorder notifications actually work now (AUDIT F1)
+**Files:** extension/manifest.json, extension/content.js, extension/background.js
+**Change:** added `"notifications"` to manifest permissions; `recNotify()`
+now sends `{type: "SHOW_NOTIFICATION", title, message}` to the background
+page, which calls `chrome.notifications.create()` (icon: icons/icon128.png).
+**Why not the literal instruction:** content scripts cannot call
+`chrome.notifications` — only background can — so a direct call would have
+silently no-op'd exactly like the Web Notification API did. The message
+route is the same intent, implemented the only way that functions.
+**Verify:** node --check PASS; manifest valid (4.0.2, notifications
+permitted); SHOW_NOTIFICATION sender + handler cross-checked; zero Web
+Notification usage remains. Live display: DEFERRED (needs browser).
+
+## Q2 — Dead code removed — PARTIALLY: audit F2 was wrong (corrected during gates)
+**Removed (truly dead):** `SAVE_RECORDING` handler (zero senders anywhere);
+`_YTDLP_JS_RUNTIME_CACHE = None` stranded global in downloader.py.
+**RETAINED (audit F2 was incorrect):** `RELAY_BATCH` and `RELAY_DOWNLOAD`
+handlers — the v4.0.2 verification gate found live senders my audit's
+narrow sender regex had missed: popup.js sends RELAY_BATCH from both the
+media-checklist send button and "Grab all media" (lines ~293, ~454), and
+RELAY_DOWNLOAD is referenced from popup.js (~135) and content.js (~263,
+~587). Deleting them would have broken the popup's core send features —
+caught before shipping, handlers restored byte-identical.
+**Verify:** node --check PASS; handler/sender matrix: every sent type has
+a handler, every retained handler has a sender; SAVE_RECORDING and the
+stranded global confirmed absent.
+
+## Q3 — Deno stays on releases/latest
+No change (decision recorded).
+
+## F5 — WebM naming resolved
+**File:** KNOWN_ISSUES.md — replaced the open R.7/R.8 question with:
+"Recorder saves WebM by design — container matches MediaRecorder source.
+Users who want MP4 can convert post-download via the existing conversion UI."
+
+## Carried in this zip from the v4.0.1 CI fix
+- backend/requirements.txt: pyinstaller>=6.0 restored.
+- workflows/build-exe.yml AND .github/workflows/build-exe.yml: "Download
+  and bundle Deno" step added; PyInstaller line exact (yt_dlp+PySide6+
+  streamlink collect-alls, ffmpeg/ffprobe/deno add-binaries, no
+  tkinterdnd2).
+
+## F4 / F6 — confirmed no action (correctly assessed).
+
+## SESSION_LOG entry — v4.0.2
+**Completed:** iteration 27. Q1 applied (notifications via background-routed
+chrome.notifications). Q2 corrected during verification: audit F2's
+"RELAY_BATCH/RELAY_DOWNLOAD dead" claim was wrong — live senders found;
+only SAVE_RECORDING + the downloader global removed. F5 closed. Gates:
+node --check, py_compile, JSON validity, full sender/handler matrix — green.
+Zip: VideoGrabber_v4.0.2.
+
+## Process note
+The audit pass (iteration 26) used sender-detection regexes that required
+`{` immediately after `sendMessage(` — multi-line call sites escaped
+detection. The v4.0.2 gate used a broader pattern and caught both live
+senders. AUDIT.md F2 is corrected in this zip.

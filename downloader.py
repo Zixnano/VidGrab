@@ -26,7 +26,6 @@ from logging_setup import log, LOG_QUEUE
 _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 # --- yt-dlp YouTube runtime helpers -----------------------------------------
 
-_YTDLP_JS_RUNTIME_CACHE = None
 
 
 def scan_file(path):

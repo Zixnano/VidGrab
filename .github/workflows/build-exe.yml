@@ -35,6 +35,14 @@ jobs:
           $ffprobeExe = Get-ChildItem -Path ffmpeg_extracted -Recurse -Filter ffprobe.exe | Select-Object -First 1
           Copy-Item $ffprobeExe.FullName -Destination .\ffprobe.exe
 
+      - name: Download and bundle Deno
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile "backend\deno.zip"
+          Expand-Archive "backend\deno.zip" -DestinationPath "backend\_deno" -Force
+          Copy-Item "backend\_deno\deno.exe" "backend\deno.exe"
+
       - name: Build exe
         run: |
           # --onedir instead of --onefile: onefile re-extracts the entire bundle
