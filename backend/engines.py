@@ -125,10 +125,6 @@ def _ytdlp_version_check():
         log(f"yt-dlp version check failed: {e}")
 
 
-class DownloadCancelled(Exception):
-    pass
-
-
 class Engine(Protocol):
     name: str
 
@@ -349,7 +345,6 @@ class StreamlinkEngine:
 
 TWITCH_LIKE_HOSTS = [
     re.compile(r"(^|\.)twitch\.tv$"),
-    re.compile(r"(^|\.)youtube\.com$"),
 ]
 
 
