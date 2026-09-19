@@ -250,6 +250,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       filename: msg.filename,
       format_id: msg.format_id,
       target_format: msg.target_format,
+      download_playlist: msg.download_playlist || false,
     }).then(sendResponse);
     return true; // async
   }
@@ -259,6 +260,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // and media-checklist send buttons. VERIFIED LIVE (popup.js x2 senders) —
     // audit F2 was wrong about this one; retained.
     const items = msg.items || [];
+    // Playlist support: a top-level flag applies to items without their own.
+    if (msg.download_playlist) {
+      for (const it of items) {
+        if (it.download_playlist === undefined) it.download_playlist = true;
+      }
+    }
     (async () => {
       const alive = await checkBackend();
       if (!alive) {
@@ -275,6 +282,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             referer: msg.pageUrl,
             cookie,
             user_agent: navigator.userAgent,
+            download_playlist: msg.download_playlist || false,
           }),
         });
         if (unpaired) {
@@ -368,6 +376,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             user_agent: navigator.userAgent,
             format_id: msg.format_id || null,
             target_format: msg.target_format || null,
+            download_playlist: msg.download_playlist || false,
           }),
         });
         if (unpaired) {

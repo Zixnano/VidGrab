@@ -596,6 +596,7 @@ def run_ytdlp(job_id):
     engine = route_for(job["url"])[0]
     opts = {"headers": headers,
             "job_id": job_id,
+            "download_playlist": job.get("download_playlist", False),
             "target_format": (job.get("target_format") or "").lower(),
             "speed_limit_kbps": effective_speed_limit_kbps()}
     transition(job, JobEvent.START)

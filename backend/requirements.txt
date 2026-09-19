@@ -1,6 +1,6 @@
 flask>=3.0
 flask-cors>=4.0
-yt-dlp>=2024.8.6
+yt-dlp[default]>=2026.8.19
 requests>=2.31
 PySide6>=6.7
 streamlink>=6.0

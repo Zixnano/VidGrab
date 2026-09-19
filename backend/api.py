@@ -155,6 +155,7 @@ def download():
         user_agent=data.get("user_agent"), job_type=data.get("type"),
         format_id=data.get("format_id"), target_format=data.get("target_format"),
         resolution=data.get("resolution"), multi=bool(data.get("multi")),
+        download_playlist=data.get("download_playlist", False),
     )
     return jsonify({"job_id": jid})
 
@@ -174,6 +175,7 @@ def show_add_dialog():
             user_agent=data.get("user_agent"),
             format_id=data.get("format_id"),
             target_format=data.get("target_format"),
+            download_playlist=data.get("download_playlist", False),
         )
         return jsonify({"ok": True, "auto_queued": True, "job_id": jid})
     _fire_show_dialog_hooks({
@@ -204,6 +206,7 @@ def batch():
             format_id=it.get("format_id"),
             target_format=it.get("target_format"),
             resolution=it.get("resolution"), multi=bool(it.get("multi")),
+            download_playlist=it.get("download_playlist", data.get("download_playlist", False)),
         ))
     return jsonify({"job_ids": ids})
 

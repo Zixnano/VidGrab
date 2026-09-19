@@ -14,6 +14,19 @@
   const HANDLED = new WeakSet();
   const DISMISSED = new WeakSet();
   const RECORDERS = new WeakMap();
+
+  // Playlist support: a YouTube watch URL carrying &list=... can be sent
+  // as a single video or as the whole playlist (the backend decides via
+  // the download_playlist flag; list= stays in the URL on purpose).
+  function isPlaylistUrl(url) {
+    try {
+      const u = new URL(url);
+      return u.searchParams.has("list") &&
+             /(^|\.)youtube\.com$/i.test(u.hostname);
+    } catch (e) {
+      return false;
+    }
+  }
   // Sites whose players use MSE in a way captureStream can't record — for these,
   // the only viable move is to hand the PAGE URL to yt-dlp (site extractor).
   const MSE_ONLY_HOSTS = [/twitch\.tv$/i];
@@ -254,7 +267,7 @@
     menu.appendChild(el);
   }
 
-  async function handleSendPageUrl(video, overlay, closeMenu) {
+  async function handleSendPageUrl(video, overlay, closeMenu, download_playlist = false) {
     if (closeMenu) closeMenu();
     setLabel(overlay, "Sending…");
     const guessName = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
@@ -264,6 +277,7 @@
         url: location.href,
         pageUrl: location.href,
         filename: guessName,
+        download_playlist: download_playlist,
       },
       (resp) => {
         if (chrome.runtime.lastError) {
@@ -568,7 +582,7 @@
     }
 
     function sendChoice({ format_id = null, target_format = null,
-                         bypass_dialog = false } = {}) {
+                         bypass_dialog = false, download_playlist = false } = {}) {
       closeMenu();
       setLabel(overlay, "Sending…");
       let base = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
@@ -590,6 +604,7 @@
         filename: ext ? base + ext : undefined,
         format_id: format_id,
         target_format: target_format,
+        download_playlist: download_playlist,
       };
       chrome.runtime.sendMessage(payload, (resp) => {
         if (chrome.runtime.lastError) {
@@ -615,6 +630,14 @@
       const blob = isBlob();
       const mse = isMseOnlySite();
       addMenuItem(menu, streamInfo(video), { header: true });
+
+    if (isPlaylistUrl(location.href)) {
+      addMenuItem(menu, "Download this video only", {},
+        () => sendChoice({ download_playlist: false }));
+      addMenuItem(menu, "Download entire playlist", {},
+        () => sendChoice({ download_playlist: true }));
+      addDivider(menu);
+    }
 
       // Mode picker: the menu offers every mode that makes sense for this
       // source, and the click handler always opens it.

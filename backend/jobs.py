@@ -176,7 +176,7 @@ def _resolution_suffix(resolution):
 
 def new_job(url, filename=None, category=None, referer=None, cookie=None,
             user_agent=None, job_type=None, format_id=None, target_format=None,
-            resolution=None, multi=False, defer=False):
+            resolution=None, multi=False, download_playlist=False, defer=False):
     log(f"new_job: filename={filename!r} url_basename={guess_filename(url)!r}")
     jid = next_job_id()
     jtype = job_type or detect_type(url)
@@ -227,6 +227,7 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
         "category": job_cat,
         "type": jtype, "status": "held" if defer else "queued", "phase": "idle",
         "format_id": format_id, "target_format": target_format,
+        "download_playlist": download_playlist,
         "completed_ts": None,
         "size_total": 0, "size_done": 0, "speed": "", "error": None,
         "referer": referer, "cookie": cookie, "user_agent": user_agent,

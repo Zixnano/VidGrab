@@ -189,7 +189,8 @@ class ApiClient:
         return list(data.values())
 
     def add(self, url, filename=None, category=None, description=None,
-            format_id=None, target_format=None, resolution=None, multi=False):
+            format_id=None, target_format=None, resolution=None, multi=False,
+            download_playlist=False):
         body = {"url": url}
         if filename:
             body["filename"] = filename
@@ -205,6 +206,8 @@ class ApiClient:
             body["resolution"] = resolution
         if multi:
             body["multi"] = True
+        if download_playlist:
+            body["download_playlist"] = True
         return self._req("POST", "/download", json=body)
 
     def pause(self, jid):
@@ -442,6 +445,21 @@ class ProgressDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+def _is_youtube_playlist_url(url):
+    """True for youtube.com watch URLs carrying a &list= param."""
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse((url or "").strip())
+        host = (parsed.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host != "youtube.com":
+            return False
+        return bool(parse_qs(parsed.query).get("list"))
+    except Exception:
+        return False
+
+
 class AddDownloadDialog(QDialog):
     # Carries (probe_seq, response_dict) from the background probe thread —
     # Qt widgets are only touched in the slot, never in the thread.
@@ -483,6 +501,12 @@ class AddDownloadDialog(QDialog):
         self.queue_preview = QLabel("Best available (1 file)")
         self.queue_preview.setStyleSheet(f"color: {MUTED};")
         form.addRow("Queue", self.queue_preview)
+        self.playlist_checkbox = QCheckBox("Download entire playlist")
+        self.playlist_checkbox.setVisible(False)
+        form.addRow("", self.playlist_checkbox)
+        self.url.textChanged.connect(self._update_playlist_visibility)
+        self._update_playlist_visibility()
+
         self._formats_ready.connect(self._on_formats)
         self._head_ready.connect(self._on_head_ready)
         self.category = QComboBox()
@@ -655,6 +679,12 @@ class AddDownloadDialog(QDialog):
         kind = "audio only" if vc == "none" else f"{vc}/{ac}"
         return " · ".join(p for p in (res, ext, kind, size) if p)
 
+    def _update_playlist_visibility(self, *_):
+        show = _is_youtube_playlist_url(self.url.text())
+        self.playlist_checkbox.setVisible(show)
+        if not show:
+            self.playlist_checkbox.setChecked(False)
+
     def _select_best(self):
         """Check the highest-quality row (the probe lists best first)."""
         for i in range(self.quality.count()):
@@ -736,6 +766,8 @@ class AddDownloadDialog(QDialog):
                 "format_id": fid,
                 "target_format": tfmt,
                 "resolution": res,
+                "download_playlist": (self.playlist_checkbox.isVisible()
+                                      and self.playlist_checkbox.isChecked()),
                 "skip_dialog": self.skip_dialog.isChecked(),
             })
         return out
@@ -1654,6 +1686,7 @@ class MainWindow(QMainWindow):
                              format_id=item.get("format_id"),
                              target_format=item.get("target_format"),
                              resolution=item.get("resolution"),
+                             download_playlist=item.get("download_playlist", False),
                              multi=total > 1)
             if common.get("skip_dialog"):
                 try:
@@ -2255,6 +2288,7 @@ class MainWindow(QMainWindow):
                              format_id=item.get("format_id"),
                              target_format=item.get("target_format"),
                              resolution=item.get("resolution"),
+                             download_playlist=item.get("download_playlist", False),
                              multi=total > 1)
             except Exception as e:
                 QMessageBox.critical(self, "Add failed", str(e))
