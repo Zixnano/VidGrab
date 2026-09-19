@@ -467,13 +467,15 @@ class AddDownloadDialog(QDialog):
     _head_ready = Signal(object)
 
     def __init__(self, parent=None, api=None, prefill_url="",
-                 prefill_format_id=None, prefill_target_format=None):
+                 prefill_format_id=None, prefill_target_format=None,
+                 prefill_download_playlist=False):
         super().__init__(parent)
         self.api = api
         self._probe_seq = 0
         self._head_seq = 0
         self._prefill_format_id = prefill_format_id
         self._prefill_target_format = prefill_target_format
+        self._prefill_download_playlist = bool(prefill_download_playlist)
         self.setWindowTitle("Download File Info")
         # Task 3: this dialog is triggered from the browser extension, often
         # while some other window has focus — without this it can open
@@ -506,6 +508,10 @@ class AddDownloadDialog(QDialog):
         form.addRow("", self.playlist_checkbox)
         self.url.textChanged.connect(self._update_playlist_visibility)
         self._update_playlist_visibility()
+        # Pill-initiated "Download entire playlist" pre-checks the box so
+        # the user's pill choice survives into the dialog.
+        if self._prefill_download_playlist and self.playlist_checkbox.isVisible():
+            self.playlist_checkbox.setChecked(True)
 
         self._formats_ready.connect(self._on_formats)
         self._head_ready.connect(self._on_head_ready)
@@ -1664,7 +1670,8 @@ class MainWindow(QMainWindow):
             d = AddDownloadDialog(self, api=self.api,
                                   prefill_url=payload.get("url", ""),
                                   prefill_format_id=payload.get("format_id"),
-                                  prefill_target_format=payload.get("target_format"))
+                                  prefill_target_format=payload.get("target_format"),
+                                  prefill_download_playlist=payload.get("download_playlist", False))
             _fade_dialog(d, self.animations_enabled)
             result = d.exec()
             if result not in (QDialog.Accepted, 2):

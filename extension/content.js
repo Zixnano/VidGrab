@@ -582,7 +582,8 @@
     }
 
     function sendChoice({ format_id = null, target_format = null,
-                         bypass_dialog = false, download_playlist = false } = {}) {
+                         bypass_dialog = false, download_playlist = false,
+                         force_page_url = false } = {}) {
       closeMenu();
       setLabel(overlay, "Sending…");
       let base = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
@@ -599,7 +600,7 @@
         // Normal picks open the app's confirmation dialog (IDM-style);
         // bypass_dialog queues directly.
         type: bypass_dialog ? "RELAY_DOWNLOAD" : "SHOW_ADD_DIALOG",
-        url: video.currentSrc,
+        url: force_page_url ? location.href : video.currentSrc,
         pageUrl: location.href,
         filename: ext ? base + ext : undefined,
         format_id: format_id,
@@ -632,10 +633,13 @@
       addMenuItem(menu, streamInfo(video), { header: true });
 
     if (isPlaylistUrl(location.href)) {
+      // On YouTube (and any extractor site), video.currentSrc is a blob:
+      // URL that yt-dlp can't fetch. The playlist entries are always the
+      // PAGE URL — yt-dlp walks the &list= param itself.
       addMenuItem(menu, "Download this video only", {},
-        () => sendChoice({ download_playlist: false }));
+        () => sendChoice({ download_playlist: false, force_page_url: true }));
       addMenuItem(menu, "Download entire playlist", {},
-        () => sendChoice({ download_playlist: true }));
+        () => sendChoice({ download_playlist: true, force_page_url: true }));
       addDivider(menu);
     }
 

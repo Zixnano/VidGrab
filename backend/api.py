@@ -187,6 +187,7 @@ def show_add_dialog():
         "user_agent": data.get("user_agent"),
         "format_id": data.get("format_id"),
         "target_format": data.get("target_format"),
+        "download_playlist": data.get("download_playlist", False),
     })
     return jsonify({"ok": True, "auto_queued": False})
 
