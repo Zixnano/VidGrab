@@ -12,3 +12,8 @@
 
 3. **Deno version (CI):** the new workflow step downloads Deno
    `releases/latest`. Pin a specific version for reproducible builds?
+   **Resolved in v4.0.9:** pinned to `v2.9.6` via a `DENO_VERSION` job-level
+   env var in `.github/workflows/build-exe.yml` — bump that one value
+   deliberately when you want a newer Deno (e.g. for a YouTube
+   signature-challenge fix) instead of getting whatever's newest on an
+   unrelated push.

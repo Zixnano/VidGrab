@@ -47,8 +47,11 @@ def test_multi_suffix_and_single_unchanged(jm):
     assert jm.JOBS[j2]["filename"] == "Video.mp4"
 
 
-def test_snapshot_writes_via_settings_path(jm):
+def test_snapshot_writes_via_settings_path(jm, tmp_path):
     j1 = jm.new_job("https://youtube.com/watch?v=x")
     jm.save_jobs_snapshot()
-    snap = json.loads(jm.JOBS_PATH.read_text())
+    # jobs.py writes via settings.JOBS_PATH (module-level, set to
+    # tmp_path/"jobs.json" by the fixture) — it has no JOBS_PATH attribute
+    # of its own, so read back from the same path the fixture configured.
+    snap = json.loads((tmp_path / "jobs.json").read_text())
     assert j1 in snap

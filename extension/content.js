@@ -643,7 +643,9 @@
                 : "No format list available";
               addMenuItem(fmtBox, msg, { dim: true, header: true });
             } else {
-              for (const f of formats.slice(0, 12)) {
+              // Task 2: no client-side truncation — the backend already
+              // returns a sorted, sanity-capped list (best quality first).
+              for (const f of formats) {
                 const tf = f.ext === "webm" ? "webm" : null;
                 addMenuItem(fmtBox, formatLabel(f), {},
                   () => {
@@ -730,7 +732,8 @@
             { dim: true, header: true });
           return;
         }
-        for (const f of formats.slice(0, 12)) {
+        // Task 2: no client-side truncation — see note above.
+        for (const f of formats) {
           const tf = f.ext === "webm" ? "webm" : null;
           addMenuItem(fmtBox, formatLabel(f), {},
             () => sendChoice({ format_id: f.format_id, target_format: tf }));

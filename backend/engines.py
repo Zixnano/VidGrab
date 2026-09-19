@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 import time
 from dataclasses import dataclass, asdict
@@ -136,6 +137,36 @@ class Engine(Protocol):
         ...
 
 
+def _write_netscape_cookiefile(cookie_str, url, stem):
+    """Write an extension-supplied 'name=value; name=value' cookie string
+    to a Netscape-format cookie file yt-dlp can read via cookiefile.
+
+    This is the IDM approach: the extension reads cookies from inside the
+    browser (already-decrypted, in memory via chrome.cookies.getAll) and
+    hands them over as a plain string. We never touch the browser's
+    encrypted cookie DB on disk — cookiesfrombrowser cannot work on
+    Chrome 127+ / Vivaldi 6.9+ (App-Bound Encryption; see
+    https://github.com/yt-dlp/yt-dlp/issues/10927). Returns the Path."""
+    netloc = urlparse(url).netloc.split(":")[0]  # strip port if present
+    domain = netloc if netloc.startswith(".") else "." + netloc
+
+    lines = ["# Netscape HTTP Cookie File"]
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")  # partition, not split: values may contain '='
+        name, value = name.strip(), value.strip()
+        if not name:
+            continue
+        lines.append(f"{domain}\tTRUE\t/\tFALSE\t0\t{name}\t{value}")
+
+    safe_stem = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(stem))[:80]
+    path = Path(tempfile.gettempdir()) / f"vg_cookies_{safe_stem}_{os.getpid()}.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 class YtDlpEngine:
     name = "yt-dlp"
 
@@ -145,7 +176,13 @@ class YtDlpEngine:
             "quiet": True,
             "skip_download": True,
             "noplaylist": True,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            # Task 2 fix: the android-only client list used here previously
+            # only exposes a handful of progressive/muxed formats for
+            # YouTube. "web" (and the other clients download() already
+            # uses) is what surfaces the full DASH ladder — video-only and
+            # audio-only streams at every resolution — which is why the
+            # quality menu was showing as few as one entry.
+            "extractor_args": {"youtube": {"player_client": ["tv", "web_safari", "android_vr", "web"]}},
             "socket_timeout": 20,
         }
         js_rt = find_js_runtime()
@@ -155,7 +192,15 @@ class YtDlpEngine:
             info = ydl.extract_info(url, download=False)
         formats = []
         for f in (info.get("formats") or []):
-            if not f.get("vcodec") or f.get("vcodec") == "none":
+            # Storyboards/mhtml thumbnail "formats" aren't real downloadable
+            # streams — skip those. Everything else is kept, INCLUDING
+            # audio-only and video-only streams: video-only entries are
+            # valuable for high resolutions (yt-dlp merges them with an
+            # audio-only stream on download), and audio-only entries are
+            # what formatLabel() on the extension side is designed to show
+            # as "audio only" — filtering them out here made that branch
+            # dead code.
+            if f.get("ext") == "mhtml" or (f.get("vcodec") == "none" and f.get("acodec") == "none"):
                 continue
             note = (f.get("format_note") or "").strip()
             formats.append(FormatInfo(
@@ -168,6 +213,19 @@ class YtDlpEngine:
                 filesize=int(f.get("filesize") or f.get("filesize_approx") or 0),
                 note=note,
             ))
+
+        def _sort_key(fi):
+            m = re.match(r"(\d+)x(\d+)", fi.resolution or "")
+            height = int(m.group(2)) if m else 0
+            is_audio_only = not fi.vcodec or fi.vcodec == "none"
+            has_audio = bool(fi.acodec) and fi.acodec != "none"
+            muxed = (not is_audio_only) and has_audio
+            prefer_mp4_h264 = 0 if (fi.ext == "mp4" and fi.vcodec.startswith("avc1")) else 1
+            # video formats first (by descending resolution, muxed before
+            # video-only, mp4/h264 preferred), audio-only formats last.
+            return (1 if is_audio_only else 0, -height, 0 if muxed else 1, prefer_mp4_h264)
+
+        formats.sort(key=_sort_key)
         return formats
 
     # --- download (core of downloader.run_ytdlp, moved verbatim) ---
@@ -252,6 +310,40 @@ class YtDlpEngine:
         if getattr(sys, "frozen", False):
             ydl_opts["ffmpeg_location"] = sys._MEIPASS
 
+        # IDM-style cookie handoff: the extension sends a plain
+        # "name=value; ..." string (opts["cookie"], falling back to the
+        # Cookie header downloader.py already builds). Write it to a
+        # Netscape cookie file and point yt-dlp at it via cookiefile —
+        # cookiesfrombrowser is gone for good (see helper docstring above).
+        job_tag = opts.get("job_id") or dest.stem
+        cookie_str = opts.get("cookie") or headers.get("Cookie") or ""
+        cookie_file_path = None
+        if cookie_str:
+            try:
+                cookie_file_path = _write_netscape_cookiefile(cookie_str, url, job_tag)
+                ydl_opts["cookiefile"] = str(cookie_file_path)
+                log(f"job {job_tag}: writing extension-supplied cookies to temp file {cookie_file_path}")
+            except Exception as e:
+                log(f"job {job_tag}: failed to write cookie file, continuing without cookies: {e}")
+                cookie_file_path = None
+        else:
+            # BUGS.md #7: a failed chrome.cookies.getAll() or a browser
+            # that isn't logged in means this proceeds unauthenticated —
+            # fine for public videos, but age-restricted/private/
+            # member-only ones will fail later with an opaque 403 or
+            # "requested format not available" and no clue why. Flag it
+            # up front instead of leaving that as a mystery.
+            try:
+                host = urlparse(url).netloc.lower()
+            except Exception:
+                host = ""
+            if "youtube.com" in host or "youtu.be" in host:
+                log(f"job {job_tag}: WARNING — no cookies available for this "
+                    f"YouTube download. Public videos will still work; "
+                    f"age-restricted, private, or member-only videos will "
+                    f"fail (403 / format unavailable). Make sure you're "
+                    f"logged into YouTube in the browser the extension runs in.")
+
         # v4.0.5 diagnostics: freeze the environment + full traceback so a
         # [WinError 2] reports exactly which line/subprocess raised it.
         diag_opts = dict(ydl_opts)
@@ -277,6 +369,12 @@ class YtDlpEngine:
             log(f"job {opts.get('job_id') or dest.name}: FULL TRACEBACK:\n"
                 f"{traceback.format_exc()}")
             raise
+        finally:
+            if cookie_file_path:
+                try:
+                    os.remove(cookie_file_path)
+                except OSError:
+                    pass
 
         # glob.escape(): "[" / "]" are legal in Windows filenames but wildcards
         # to glob() — titles like "Song [Official Video]" would never match.

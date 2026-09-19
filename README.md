@@ -84,6 +84,17 @@ YouTube's JavaScript challenges. Or just push to GitHub — the CI workflow
 downloads ffmpeg/ffprobe/Deno itself and uploads the built exe as an
 artifact. See PACKAGING.md for the release-zip layout rules.
 
+## Pushing changes
+
+`push.bat` (repo root, Windows) automates the usual `git add` → commit →
+pull --rebase → push cycle so pushing doesn't have to be done step by step
+each time. Double-click it, or run it from a terminal with an optional
+commit message: `push.bat "fixed the cookie thing"`. With no message it
+prompts for one (blank is fine — it'll auto-generate one). It pulls with
+`--rebase` before pushing so your commit lands on top of anything new on
+the remote, and it tells you plainly if something needs manual attention
+(a merge conflict, no upstream branch yet, etc.) rather than failing silently.
+
 ## What's new in v4.0
 
 - **Modular backend**: the old monolithic `server.py` is split into

@@ -15,6 +15,7 @@ import time
 from logging_setup import log, LOG_QUEUE
 
 
+APP_VERSION = "4.0.9"  # single source of truth; keep in sync with extension/manifest.json
 APP_PORT = int(os.environ.get("VIDEOGRABBER_PORT", "5757"))
 # Recording upload size cap (nonce-gated /upload endpoint).
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
@@ -22,6 +23,11 @@ MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 HOME = Path.home() / "Downloads" / "VideoGrabber"
 CONFIG_PATH = HOME / "settings.json"
 JOBS_PATH = HOME / "jobs.json"
+
+# Canonical category list (single source of truth — gui_qt.py used to keep
+# its own duplicate copy of this; category_for() below always falls back
+# to "Other" for unmapped extensions, so it's included here too).
+CATEGORIES = ("Video", "Music", "Compressed", "Documents", "Programs", "Other")
 
 CATEGORY_MAP = {
     ".mp4": "Video", ".mkv": "Video", ".webm": "Video", ".avi": "Video", ".mov": "Video", ".m4v": "Video",
@@ -331,6 +337,22 @@ def start_bandwidth_profile_watcher():
 
     threading.Thread(target=loop, daemon=True).start()
 
+
+
+def disk_usage_for(path=None):
+    """Free/total/used bytes for the drive holding `path` (default:
+    STATE['output_dir']). Falls back to HOME if the configured output_dir
+    doesn't exist yet (e.g. a per-category override the user hasn't
+    created). Returns a dict; never raises."""
+    import shutil as _shutil
+    target = Path(path) if path else Path(STATE.get("output_dir") or HOME)
+    while not target.exists() and target != target.parent:
+        target = target.parent
+    try:
+        total, used, free = _shutil.disk_usage(target)
+    except OSError:
+        total = used = free = 0
+    return {"path": str(target), "total": total, "used": used, "free": free}
 
 
 def _dest_for(job):

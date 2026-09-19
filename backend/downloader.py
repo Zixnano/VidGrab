@@ -17,7 +17,7 @@ from settings import (STATE, load_settings, save_settings, safe_filename, _uniqu
                       guess_ext_from_head, stat_for, _dest_for,
                       effective_speed_limit_kbps, LIMITER, get_shutdown_pending,
                       set_shutdown_pending)
-from jobs import (JOBS, save_jobs_snapshot, _fire_new_job_hooks,
+from jobs import (JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks,
                   transition, JobEvent, JobPhase, set_phase)
 from logging_setup import log, LOG_QUEUE
 
@@ -47,7 +47,7 @@ def scan_file(path):
 def maybe_shutdown_if_idle():
     if not STATE.get("auto_shutdown"):
         return
-    if any(j["status"] in ("downloading", "queued") for j in JOBS.values()):
+    if any(j["status"] in ("downloading", "queued") for j in list(JOBS.values())):
         return
     if settings.get_shutdown_pending():
         return
@@ -272,8 +272,30 @@ class _RecordingHandler(FileSystemEventHandler):
                 return
             shutil.copy2(p, dest)
             log(f"auto-imported screen recording: {p.name}")
-            _fire_new_job_hooks({"filename": p.name, "category": "Video",
-                                 "status": "done", "auto_imported": True})
+
+            # BUGS.md #1 fix: this used to only fire _fire_new_job_hooks
+            # with a synthetic dict, so the recording was copied to disk
+            # but never registered anywhere (/jobs, GUI table, jobs.json).
+            # Mirrors the /upload route's pattern for a file that's
+            # already fully written on disk.
+            dest = _repair_recording(dest)
+            jid = new_job(url=f"watch:///{dest.name}", filename=dest.name,
+                          category="Video", job_type="generic", defer=True)
+            job = JOBS[jid]
+            ok, reason = _probe_recording(dest)
+            if not ok:
+                transition(job, JobEvent.FAIL)
+                job["error"] = f"corrupt recording: {reason}"
+                log(f"auto-imported recording is corrupt: {reason}")
+                save_jobs_snapshot()
+                _fire_new_job_hooks(job)
+                return
+            transition(job, JobEvent.COMPLETE)
+            job["size_total"] = job["size_done"] = dest.stat().st_size
+            dest = maybe_convert_to_mp4(job, dest)  # .webm → .mp4 when auto_mp4 is on
+            job["completed_ts"] = time.time()
+            save_jobs_snapshot()
+            _fire_new_job_hooks(job)
         except Exception as e:
             log(f"couldn't import recording {p.name}: {e}")
 
@@ -573,6 +595,7 @@ def run_ytdlp(job_id):
     from engines import route_for
     engine = route_for(job["url"])[0]
     opts = {"headers": headers,
+            "job_id": job_id,
             "target_format": (job.get("target_format") or "").lower(),
             "speed_limit_kbps": effective_speed_limit_kbps()}
     transition(job, JobEvent.START)
@@ -626,7 +649,7 @@ def dispatcher_loop():
         time.sleep(1)
         if not STATE["queue_running"]:
             continue
-        active = sum(1 for j in JOBS.values() if j["status"] == "downloading")
+        active = sum(1 for j in list(JOBS.values()) if j["status"] == "downloading")
         slots = STATE["max_concurrent"] - active
         if slots <= 0:
             continue

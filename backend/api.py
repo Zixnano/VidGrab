@@ -19,7 +19,7 @@ from settings import MAX_UPLOAD_BYTES
 import queue
 import html
 from yt_dlp import YoutubeDL
-from settings import APP_PORT, STATE, save_settings, safe_filename, guess_filename, _unique_path, _dest_for, stat_for
+from settings import APP_PORT, APP_VERSION, STATE, save_settings, safe_filename, guess_filename, _unique_path, _dest_for, stat_for, disk_usage_for
 from jobs import transition, JobEvent, JobPhase, set_phase, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks, _fire_show_dialog_hooks
 
 from logging_setup import log, LOG_QUEUE
@@ -92,7 +92,7 @@ def _require_api_token():
         request.path.startswith(p + "/") for p in TOKEN_PROTECTED_PATHS
     ):
         return
-    if request.args.get("key") == REMOTE_KEY:
+    if secrets.compare_digest(request.args.get("key", ""), REMOTE_KEY):
         return
     supplied = request.headers.get("X-API-Token", "")
     if not supplied or not secrets.compare_digest(supplied, STATE.get("api_token", "")):
@@ -273,7 +273,7 @@ def delete(job_id):
 @app.route("/jobs", methods=["GET"])
 def jobs():
     return jsonify({jid: {k: v for k, v in j.items() if k not in ("pause_evt", "stop_evt")}
-                     for jid, j in JOBS.items()})
+                     for jid, j in list(JOBS.items())})
 
 @app.route("/probe", methods=["POST"])
 def probe():
@@ -317,7 +317,10 @@ def probe_formats():
             last_err = e
     if not formats:
         return jsonify({"error": str(last_err) or "probe failed"}), 500
-    return jsonify({"formats": [f.to_dict() for f in formats][:30]})
+    # Task 2: formats are already sorted (best-first) by the engine; the
+    # cap here is just a sanity ceiling against pathological format lists,
+    # not the thing limiting what the user normally sees.
+    return jsonify({"formats": [f.to_dict() for f in formats][:40]})
 
 @app.route("/upload-token", methods=["POST"])
 def upload_token():
@@ -367,6 +370,14 @@ def upload():
 @app.route("/stats", methods=["GET"])
 def stats():
     return jsonify({"samples": STATE.get("download_stats", [])[-600:]})
+
+@app.route("/version", methods=["GET"])
+def version():
+    return jsonify({"version": APP_VERSION})
+
+@app.route("/diskspace", methods=["GET"])
+def diskspace():
+    return jsonify(disk_usage_for())
 
 @app.route("/convert/<job_id>", methods=["POST"])
 def convert(job_id):
@@ -525,7 +536,7 @@ def remote_ui():
         f"<td><a href='/pause/{jid}?key={REMOTE_KEY}'>pause</a> "
         f"<a href='/resume/{jid}?key={REMOTE_KEY}'>resume</a> "
         f"<a href='/stop/{jid}?key={REMOTE_KEY}'>stop</a></td></tr>"
-        for jid, j in JOBS.items()
+        for jid, j in list(JOBS.items())
     )
     return f"""<!doctype html><meta name=viewport content="width=device-width">
     <title>Video Grabber</title>

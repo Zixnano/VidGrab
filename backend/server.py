@@ -26,7 +26,7 @@ def _cleanup_stale_parts(max_age_hours=24):
     """Delete .part files older than max_age_hours with no active job."""
     cutoff = time.time() - max_age_hours * 3600
     active = set()
-    for j in JOBS.values():
+    for j in list(JOBS.values()):
         try:
             p = _dest_for(j)
             active.add(str(p.with_suffix(p.suffix + ".part")))
@@ -57,6 +57,31 @@ def _cleanup_stale_parts(max_age_hours=24):
         log(f"cleaned up {count} stale partial file(s)")
 
 
+def _cleanup_stale_cookie_files(max_age_hours=6):
+    """Sweep vg_cookies_*.txt left behind in the OS temp dir. engines.py
+    deletes these itself in a finally block after each download, but a
+    hard kill (crash, task-kill, power loss) mid-download skips that —
+    without this they'd accumulate in the temp dir indefinitely, and each
+    one holds a user's session cookies in plaintext."""
+    import glob as _glob
+    import tempfile
+    cutoff = time.time() - max_age_hours * 3600
+    count = 0
+    try:
+        for f in _glob.glob(str(Path(tempfile.gettempdir()) / "vg_cookies_*.txt")):
+            try:
+                p = Path(f)
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    count += 1
+            except OSError:
+                pass
+    except Exception as e:
+        log(f"stale cookie-file cleanup failed: {e}")
+    if count:
+        log(f"cleaned up {count} stale cookie temp file(s)")
+
+
 def _port_in_use(port):
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -80,6 +105,7 @@ def main():
         sys.exit(1)
     load_jobs_snapshot()
     _cleanup_stale_parts()
+    _cleanup_stale_cookie_files()
 
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=dispatcher_loop, daemon=True).start()

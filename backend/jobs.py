@@ -67,7 +67,7 @@ def save_jobs_snapshot():
     with _SNAPSHOT_LOCK:
         try:
             snap = {}
-            for jid, j in JOBS.items():
+            for jid, j in list(JOBS.items()):
                 snap[jid] = {k: v for k, v in j.items()
                              if k not in ("pause_evt", "stop_evt", "cookie", "referer", "user_agent", "error")}
             # Cap history at MAX_HISTORY jobs — always keep non-done jobs,
@@ -88,7 +88,7 @@ def save_jobs_snapshot():
                 snap = kept
             # Prune in-memory done jobs too so the GUI doesn't list thousands.
             if len(JOBS) > MAX_HISTORY + 500:
-                done = sorted(((jid, j) for jid, j in JOBS.items()
+                done = sorted(((jid, j) for jid, j in list(JOBS.items())
                                if j.get("status") == "done"),
                               key=lambda kv: kv[1].get("completed_ts")
                                              or kv[1].get("created_ts", 0))

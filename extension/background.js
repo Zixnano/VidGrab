@@ -179,23 +179,21 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   if (item.byExtensionId === chrome.runtime.id) return;
 
-  // Only intercept URLs that look like intentional downloads. Without
-  // these gates, browser-internal fetches get hijacked (the v3.3 flood).
-  const KNOWN_EXTS = /\.(mp4|m4v|mov|webm|mkv|avi|mp3|m4a|wav|flac|zip|rar|7z|tar|gz|pdf|doc|docx|xls|xlsx|ppt|pptx|exe|msi|dmg|iso|epub)(\?|#|$)/i;
+  // Task 4: every intercepted download opens the app's Add dialog now —
+  // the app is what decides what to do with it, not a hardcoded extension
+  // whitelist. Only true internal-app-request exclusions remain: the
+  // backend itself (localhost/raw IP — these are the app's own HTTP
+  // traffic, not user downloads) and the extension's own downloads
+  // (guarded above by byExtensionId). The old KNOWN_EXTS regex and its
+  // HEAD-probe-for-attachment-disposition fallback are gone — both only
+  // added latency/gaps without changing the user's actual intent, which
+  // is "show me the dialog for every download I click". Users who don't
+  // want the dialog already have the correct escape hatch server-side via
+  // the skip_add_dialog setting (api.py auto-queues instead of prompting);
+  // that logic stays in the backend and is not duplicated here.
   const isLocalhost = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])/i.test(item.url);
   const isIpAddress = /^https?:\/\/\d{1,3}(\.\d{1,3}){3}/.test(item.url);
   if (isLocalhost || isIpAddress) return;
-  if (!KNOWN_EXTS.test(item.url)) {
-    // No recognizable extension — one HEAD probe for an attachment
-    // disposition; anything else is left alone.
-    try {
-      const head = await fetch(item.url, { method: "HEAD", credentials: "include" });
-      const cd = head.headers.get("content-disposition") || "";
-      if (!/attachment/i.test(cd)) return;
-    } catch (e) {
-      return;
-    }
-  }
 
   try {
     chrome.downloads.cancel(item.id);

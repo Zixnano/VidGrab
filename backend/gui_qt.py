@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QColorDialog, QTableWidget, QTableWidgetItem,
     QStatusBar, QSizePolicy, QAbstractItemView, QStyledItemDelegate,
     QInputDialog, QFileDialog, QCheckBox, QSystemTrayIcon, QStyle,
-    QSpinBox, QListWidget, QListWidgetItem, QTabWidget,
+    QSpinBox, QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
 )
 
 BACKEND_BASE = "http://127.0.0.1:5757"
@@ -38,6 +38,7 @@ CONFIG_PATH = HOME / "settings.json"
 
 # Palette-derived (single source of truth: palette.py).
 from palette import resolve_palette
+from settings import CATEGORIES, APP_VERSION  # single source of truth: settings.py
 
 _PAL = resolve_palette()
 ACCENT = _PAL["accent"]
@@ -50,8 +51,6 @@ DANGER = _PAL["error"]
 WARN = _PAL["warning"]
 SUCCESS = _PAL["success"]
 TRACK = _PAL["bg_elevated"]   # progress-bar track
-
-CATEGORIES = ["Video", "Music", "Compressed", "Documents", "Programs", "Other"]
 
 _ICON_CACHE = {}
 
@@ -238,6 +237,13 @@ class ApiClient:
     def logs(self):
         data = self._req("GET", "/logs") or {}
         return data.get("logs", [])
+
+    def version(self):
+        data = self._req("GET", "/version") or {}
+        return data.get("version", "")
+
+    def disk_space(self):
+        return self._req("GET", "/diskspace") or {}
 
     def save_setting(self, key, value):
         # Errors propagate: callers (toggle_queue, SettingsDialog._save)
@@ -451,6 +457,10 @@ class AddDownloadDialog(QDialog):
         self._prefill_format_id = prefill_format_id
         self._prefill_target_format = prefill_target_format
         self.setWindowTitle("Download File Info")
+        # Task 3: this dialog is triggered from the browser extension, often
+        # while some other window has focus — without this it can open
+        # behind everything and look like nothing happened.
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.setMinimumWidth(560)
         form = QFormLayout(self)
         self.url = QLineEdit(prefill_url)
@@ -506,6 +516,13 @@ class AddDownloadDialog(QDialog):
         if prefill_url:
             self._probe()
 
+    def showEvent(self, event):
+        """Task 3: exec()'s internal show() doesn't guarantee focus/front —
+        force it explicitly every time the dialog actually becomes visible."""
+        super().showEvent(event)
+        self.raise_()
+        self.activateWindow()
+
     def _update_remember_label(self, text):
         self.remember.setText(f"Remember this path for “{text}”")
 
@@ -528,10 +545,16 @@ class AddDownloadDialog(QDialog):
         def worker():
             try:
                 r = self.api.probe_head(url)
-                data = {"size": r.get("size", 0)}
+                size = r.get("size", 0)
             except Exception:
-                data = {"size": 0}
-            self._head_ready.emit((seq, data))
+                size = 0
+            try:
+                # QoL: warn if this download would fill up the disk —
+                # cheap enough to fetch alongside the size probe each time.
+                free = self.api.disk_space().get("free", 0)
+            except Exception:
+                free = 0
+            self._head_ready.emit((seq, {"size": size, "free": free}))
 
         threading.Thread(target=worker, daemon=True).start()
         self._probe_formats(url)
@@ -541,7 +564,29 @@ class AddDownloadDialog(QDialog):
         if seq != self._head_seq:
             return  # stale response for an older URL
         size = data.get("size", 0)
-        self.size_label.setText(fmt_bytes(size) if size else "unknown")
+        free = data.get("free", 0)
+        if not size:
+            self.size_label.setText("unknown")
+            self.size_label.setStyleSheet("")
+            self.size_label.setToolTip("")
+            return
+        text = fmt_bytes(size)
+        if free:
+            text += f"   ({fmt_bytes(free)} free on disk)"
+        self.size_label.setText(text)
+        if free and size >= free:
+            self.size_label.setStyleSheet(f"color: {DANGER};")
+            self.size_label.setToolTip(
+                "This file is larger than your available free space — "
+                "the download will likely fail partway through.")
+        elif free and size >= free * 0.9:
+            self.size_label.setStyleSheet(f"color: {WARN};")
+            self.size_label.setToolTip(
+                "This will use most of your remaining free space.")
+        else:
+            self.size_label.setStyleSheet("")
+            self.size_label.setToolTip("")
+
     def _probe_formats(self, url):
         """Ask the backend which formats exist, off the UI thread. A seq
         counter drops stale responses when the URL changes quickly."""
@@ -699,6 +744,23 @@ class AddDownloadDialog(QDialog):
 class SettingsDialog(QDialog):
     """Tabbed settings editor — POSTs each value to /settings on Save."""
 
+    PRESET_LABELS = [("amoled_black", "AMOLED Black"),
+                      ("dark_gray", "Dark Gray"),
+                      ("high_contrast", "High Contrast")]
+    ACCENT_SWATCHES = ["#26c6da", "#7c4dff", "#66bb6a", "#ffa726",
+                       "#ef5350", "#42a5f5", "#ec407a"]
+    TOKEN_ORDER = ("bg_base", "bg_panel", "bg_elevated", "border", "border_hi",
+                   "text", "text_muted", "text_dim", "accent", "accent_dim",
+                   "success", "warning", "error", "info")
+    TOKEN_LABELS = {
+        "bg_base": "Main background", "bg_panel": "Panels",
+        "bg_elevated": "Dialogs / dropdowns", "border": "Borders",
+        "border_hi": "Borders (hover)", "text": "Main text",
+        "text_muted": "Secondary text", "text_dim": "Faint text",
+        "accent": "Accent (fine-tune)", "accent_dim": "Accent (pressed)",
+        "success": "Success", "warning": "Warning", "error": "Error", "info": "Info",
+    }
+
     def __init__(self, parent=None, api=None):
         super().__init__(parent)
         self.api = api
@@ -726,50 +788,114 @@ class SettingsDialog(QDialog):
         for w in (self.force_on_top, self.close_to_tray,
                   self.watch_recording_folder, self.clipboard_monitor):
             gl.addRow(w)
-        # v4 (Session 6): theme controls
+        # v4 (Session 6): self.accent / self._theme_tokens still live here
+        # since _save_inner reads them, but their controls now live in the
+        # Theme tab below — one place for everything theme-related.
         self.accent = s.get("accent", "#26c6da")
         self._theme_tokens = dict(s.get("theme_tokens") or {})
-        self.accent_btn = QPushButton(f"Accent: {self.accent}")
-        self.accent_btn.setStyleSheet(f"background: {self.accent}; color: #0a0a0f;")
-        self.accent_btn.clicked.connect(self._pick_accent)
-        gl.addRow("Accent color", self.accent_btn)
-        self.theme_preset = QComboBox()
-        self.theme_preset.addItems(["amoled_black", "dark_gray", "high_contrast"])
-        preset = s.get("theme_preset", "amoled_black")
-        if preset not in ("amoled_black", "dark_gray", "high_contrast"):
-            preset = "amoled_black"
-        self.theme_preset.setCurrentText(preset)
-        gl.addRow("Theme preset", self.theme_preset)
         self.animations_enabled = QCheckBox("Enable animations")
         self.animations_enabled.setChecked(bool(s.get("animations_enabled", True)))
         gl.addRow(self.animations_enabled)
         tabs.addTab(g, "General")
 
-        # ---- Theme tab (Session 13) ----
+        # ---- Theme tab — redesigned to be approachable, not a raw token
+        # editor. Preset + accent + a real live preview up front; the old
+        # 14-row raw-hex table is still here for power users, just hidden
+        # behind a checkbox instead of being the first thing anyone sees. ----
         tw = QWidget()
         tl = QVBoxLayout(tw)
+        tl.setSpacing(14)
+
+        preset_label = QLabel("Preset")
+        preset_label.setObjectName("SectionLabel")
+        tl.addWidget(preset_label)
+        self.theme_preset = QComboBox()
+        for key, label in self.PRESET_LABELS:
+            self.theme_preset.addItem(label, userData=key)
+        preset = s.get("theme_preset", "amoled_black")
+        if preset not in dict(self.PRESET_LABELS):
+            preset = "amoled_black"
+        idx = self.theme_preset.findData(preset)
+        if idx >= 0:
+            self.theme_preset.setCurrentIndex(idx)
+        self.theme_preset.currentIndexChanged.connect(lambda _i: self._refresh_theme_preview())
+        tl.addWidget(self.theme_preset)
+
+        accent_label = QLabel("Accent color")
+        accent_label.setObjectName("SectionLabel")
+        tl.addWidget(accent_label)
+        accent_row = QHBoxLayout()
+        self._accent_swatches = []
+        for hexcolor in self.ACCENT_SWATCHES:
+            b = QPushButton()
+            b.setFixedSize(28, 28)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(hexcolor)
+            b.clicked.connect(lambda _=False, c=hexcolor: self._set_accent(c))
+            accent_row.addWidget(b)
+            self._accent_swatches.append((hexcolor, b))
+        self.accent_btn = QPushButton(f"Custom…  {self.accent}")
+        self.accent_btn.clicked.connect(self._pick_accent)
+        accent_row.addWidget(self.accent_btn)
+        accent_row.addStretch(1)
+        tl.addLayout(accent_row)
+        self._restyle_accent_swatches()
+
+        preview_label = QLabel("Preview")
+        preview_label.setObjectName("SectionLabel")
+        tl.addWidget(preview_label)
+        self.theme_preview_frame = QFrame()
+        self.theme_preview_frame.setObjectName("ThemePreviewFrame")
+        pf = QVBoxLayout(self.theme_preview_frame)
+        pf.setContentsMargins(16, 16, 16, 16)
+        pf.setSpacing(10)
+        ptitle = QLabel("Video Grabber")
+        ptitle.setObjectName("PreviewTitle")
+        pf.addWidget(ptitle)
+        psub = QLabel("This is roughly what your download list will look like")
+        psub.setObjectName("PreviewMuted")
+        pf.addWidget(psub)
+        pbtn_row = QHBoxLayout()
+        pbtn1 = QPushButton("Download")
+        pbtn1.setObjectName("PreviewPrimary")
+        pbtn2 = QPushButton("Cancel")
+        pbtn2.setObjectName("PreviewSecondary")
+        pbtn_row.addWidget(pbtn1)
+        pbtn_row.addWidget(pbtn2)
+        pbtn_row.addStretch(1)
+        pf.addLayout(pbtn_row)
+        self.theme_preview_bar = QProgressBar()
+        self.theme_preview_bar.setRange(0, 100)
+        self.theme_preview_bar.setValue(64)
+        pf.addWidget(self.theme_preview_bar)
+        tl.addWidget(self.theme_preview_frame)
+
+        self.show_advanced_theme = QCheckBox("Show advanced color overrides")
+        self.show_advanced_theme.setChecked(bool(s.get("theme_tokens")))
+        tl.addWidget(self.show_advanced_theme)
         self.tok_table = QTableWidget(0, 3)
-        self.tok_table.setHorizontalHeaderLabels(["Token", "Color", ""])
+        self.tok_table.setHorizontalHeaderLabels(["Setting", "Color", ""])
         self.tok_table.horizontalHeader().setStretchLastSection(True)
-        for name in ("bg_base", "bg_panel", "bg_elevated", "border", "border_hi",
-                     "text", "text_muted", "text_dim", "accent", "accent_dim",
-                     "success", "warning", "error", "info"):
+        self.tok_table.verticalHeader().setVisible(False)
+        for name in self.TOKEN_ORDER:
             self._add_token_row(name)
+        self.tok_table.setVisible(self.show_advanced_theme.isChecked())
+        self.show_advanced_theme.toggled.connect(self.tok_table.setVisible)
         tl.addWidget(self.tok_table)
+
         row = QHBoxLayout()
         exp = QPushButton("Export theme…")
         imp = QPushButton("Import theme…")
+        reset_theme_btn = QPushButton("Reset to defaults")
         exp.clicked.connect(self._export_theme)
         imp.clicked.connect(self._import_theme)
+        reset_theme_btn.clicked.connect(self._reset_theme_all)
         row.addWidget(exp)
         row.addWidget(imp)
+        row.addWidget(reset_theme_btn)
         row.addStretch(1)
         tl.addLayout(row)
-        tl.addWidget(QLabel("Preview (QSS snippet with current overrides)"))
-        self.theme_preview = QTextEdit()
-        self.theme_preview.setReadOnly(True)
-        self.theme_preview.setMaximumHeight(150)
-        tl.addWidget(self.theme_preview)
+        tl.addStretch(1)
         self._refresh_theme_preview()
         tabs.addTab(tw, "Theme")
 
@@ -950,7 +1076,6 @@ class SettingsDialog(QDialog):
     def _copy_token(self):
         QApplication.clipboard().setText(self.token_edit.text())
 
-    CATEGORIES = ("Video", "Music", "Compressed", "Documents", "Programs", "Other")
     ENGINES = ("auto", "yt-dlp", "streamlink")
 
     def _check_engine_updates(self):
@@ -989,7 +1114,9 @@ class SettingsDialog(QDialog):
         base = resolve_palette({})[name]
         r = self.tok_table.rowCount()
         self.tok_table.insertRow(r)
-        self.tok_table.setItem(r, 0, QTableWidgetItem(name))
+        item = QTableWidgetItem(self.TOKEN_LABELS.get(name, name))
+        item.setToolTip(name)  # raw token key, for anyone editing a theme.json by hand
+        self.tok_table.setItem(r, 0, item)
         btn = QPushButton(self._theme_tokens.get(name, base))
         btn.setStyleSheet(f"background: {btn.text()}; color: #fff; border: 0;")
         btn.clicked.connect(lambda _=False, n=name, b=btn: self._pick_token_color(n, b))
@@ -1001,7 +1128,7 @@ class SettingsDialog(QDialog):
     def _pick_token_color(self, name, btn):
         from palette import resolve_palette
         cur = QColor(self._theme_tokens.get(name, resolve_palette({})[name]))
-        c = QColorDialog.getColor(cur, self, f"Color for {name}")
+        c = QColorDialog.getColor(cur, self, f"Color for {self.TOKEN_LABELS.get(name, name)}")
         if c.isValid():
             self._theme_tokens[name] = c.name()
             btn.setText(c.name())
@@ -1016,18 +1143,84 @@ class SettingsDialog(QDialog):
         btn.setStyleSheet(f"background: {base}; color: #fff; border: 0;")
         self._refresh_theme_preview()
 
+    def _restyle_accent_swatches(self):
+        """Highlight whichever swatch (if any) matches the current accent."""
+        for hexcolor, btn in getattr(self, "_accent_swatches", []):
+            selected = hexcolor.lower() == self.accent.lower()
+            btn.setStyleSheet(
+                f"background:{hexcolor}; border-radius:14px; "
+                f"border:2px solid {'#ffffff' if selected else hexcolor};")
+
+    def _set_accent(self, hexcolor):
+        """Single entry point for changing the accent — used by swatch
+        clicks, the custom color picker, and theme import, so the swatch
+        highlight/preview never drift out of sync with self.accent."""
+        self.accent = hexcolor
+        self.accent_btn.setText(f"Custom…  {self.accent}")
+        self._restyle_accent_swatches()
+        self._refresh_theme_preview()
+
+    def _reset_theme_all(self):
+        """One button to get back to the app's defaults — preset, accent,
+        and every advanced token override at once."""
+        self._theme_tokens = {}
+        self.tok_table.setRowCount(0)
+        for name in self.TOKEN_ORDER:
+            self._add_token_row(name)
+        idx = self.theme_preset.findData("amoled_black")
+        if idx >= 0:
+            self.theme_preset.setCurrentIndex(idx)
+        self._set_accent("#26c6da")
+
     def _refresh_theme_preview(self):
-        from gui_style import build_qss
-        merged = dict(load_settings())
-        merged["theme_tokens"] = dict(self._theme_tokens)
-        self.theme_preview.setPlainText(build_qss(merged))
+        """Live preview: restyle a small mock UI (title, buttons, progress
+        bar) with the palette the current preset+accent+overrides would
+        resolve to — not a raw QSS text dump, so it's actually readable at
+        a glance."""
+        from palette import resolve_palette
+        tokens = resolve_palette({
+            "theme_preset": self.theme_preset.currentData() or "amoled_black",
+            "accent": self.accent,
+            "theme_tokens": dict(self._theme_tokens),
+        })
+        self.theme_preview_frame.setStyleSheet(f"""
+        #ThemePreviewFrame {{
+            background: {tokens['bg_panel']}; border: 1px solid {tokens['border']};
+            border-radius: {tokens['radius']};
+        }}
+        #ThemePreviewFrame QLabel {{ background: transparent; }}
+        #ThemePreviewFrame QLabel#PreviewTitle {{
+            color: {tokens['text']}; font-weight: 600; font-size: 14px;
+        }}
+        #ThemePreviewFrame QLabel#PreviewMuted {{
+            color: {tokens['text_muted']}; font-size: 11px;
+        }}
+        #ThemePreviewFrame QPushButton#PreviewPrimary {{
+            background: {tokens['accent']}; color: {tokens['bg_base']};
+            border: none; border-radius: {tokens['radius']}; padding: 8px 16px;
+            font-weight: 600;
+        }}
+        #ThemePreviewFrame QPushButton#PreviewSecondary {{
+            background: {tokens['bg_elevated']}; color: {tokens['text']};
+            border: 1px solid {tokens['border']}; border-radius: {tokens['radius']};
+            padding: 8px 16px;
+        }}
+        #ThemePreviewFrame QProgressBar {{
+            background: {tokens['bg_elevated']}; border: 1px solid {tokens['border']};
+            border-radius: {tokens['radius_pill']}; text-align: center;
+            color: {tokens['text_muted']};
+        }}
+        #ThemePreviewFrame QProgressBar::chunk {{
+            background: {tokens['accent']}; border-radius: {tokens['radius_pill']};
+        }}
+        """)
 
     def _export_theme(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export theme", "theme.json",
                                               "JSON (*.json)")
         if not path:
             return
-        theme = {"theme_preset": self.theme_preset.currentText(),
+        theme = {"theme_preset": self.theme_preset.currentData() or "amoled_black",
                  "accent": self.accent,
                  "theme_tokens": dict(self._theme_tokens)}
         Path(path).write_text(json.dumps(theme, indent=2, sort_keys=True),
@@ -1042,39 +1235,35 @@ class SettingsDialog(QDialog):
             data = json.loads(Path(path).read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("not an object")
-            if data.get("accent"):
-                self.accent = str(data["accent"])
-                self.accent_btn.setText(f"Accent: {self.accent}")
-                self.accent_btn.setStyleSheet(
-                    f"background: {self.accent}; color: #0a0a0f;")
             if data.get("theme_preset"):
-                i = self.theme_preset.findText(str(data["theme_preset"]))
+                i = self.theme_preset.findData(str(data["theme_preset"]))
                 if i >= 0:
                     self.theme_preset.setCurrentIndex(i)
             toks = data.get("theme_tokens")
             self._theme_tokens = dict(toks) if isinstance(toks, dict) else {}
             self.tok_table.setRowCount(0)
-            for name in ("bg_base", "bg_panel", "bg_elevated", "border", "border_hi",
-                         "text", "text_muted", "text_dim", "accent", "accent_dim",
-                         "success", "warning", "error", "info"):
+            for name in self.TOKEN_ORDER:
                 self._add_token_row(name)
-            self._refresh_theme_preview()
+            # accent last: _set_accent() also calls _refresh_theme_preview(),
+            # which needs the just-rebuilt token table / new preset in place.
+            if data.get("accent"):
+                self._set_accent(str(data["accent"]))
+            else:
+                self._refresh_theme_preview()
         except Exception as e:
             QMessageBox.warning(self, "Import failed", str(e))
 
     def _pick_accent(self):
-        c = QColorDialog.getColor()
+        c = QColorDialog.getColor(QColor(self.accent), self, "Custom accent color")
         if c.isValid():
-            self.accent = c.name()
-            self.accent_btn.setText(f"Accent: {self.accent}")
-            self.accent_btn.setStyleSheet(f"background: {self.accent}; color: #0a0a0f;")
+            self._set_accent(c.name())
 
     def _add_rule_row(self, domain, category, engine):
         row = self.rules_table.rowCount()
         self.rules_table.insertRow(row)
         self.rules_table.setItem(row, 0, QTableWidgetItem(domain))
-        cat = QComboBox(); cat.addItems(self.CATEGORIES)
-        cat.setCurrentText(category if category in self.CATEGORIES else "Other")
+        cat = QComboBox(); cat.addItems(CATEGORIES)
+        cat.setCurrentText(category if category in CATEGORIES else "Other")
         self.rules_table.setCellWidget(row, 1, cat)
         eng = QComboBox(); eng.addItems(self.ENGINES)
         eng.setCurrentText(engine if engine in self.ENGINES else "auto")
@@ -1128,7 +1317,7 @@ class SettingsDialog(QDialog):
                                    for ext, cb in self.ft_checks.items()})
             # --- v4 (Session 6) ---
             self.api.save_setting("accent", self.accent)
-            self.api.save_setting("theme_preset", self.theme_preset.currentText())
+            self.api.save_setting("theme_preset", self.theme_preset.currentData() or "amoled_black")
             self.api.save_setting("theme_tokens", self._theme_tokens)
             # 13.2: rebuild QSS from the freshly saved settings and reapply
             # app-wide so theme changes land without a restart.
@@ -1385,6 +1574,7 @@ class MainWindow(QMainWindow):
         self._sort_column = None
         self._refresh_worker = None
         self._logs_worker = None
+        self._diskspace_worker = None
         # Settings snapshot fetched on the worker thread each refresh —
         # the GUI thread never reads settings.json on the hot path (11.2).
         self._gui_settings = {}
@@ -1396,7 +1586,7 @@ class MainWindow(QMainWindow):
         self._anim_timer.timeout.connect(self._tick_animations)
         self._anim_timer.start()
         self._sort_ascending = True
-        self.setWindowTitle("Video Grabber")
+        self.setWindowTitle(f"Video Grabber v{APP_VERSION}")
         self.resize(1200, 760)
         self.setMinimumSize(880, 560)
         self._build_ui()
@@ -1411,10 +1601,14 @@ class MainWindow(QMainWindow):
         self.log_timer = QTimer(self)
         self.log_timer.timeout.connect(self.refresh_logs)
         self.log_timer.start(1500)
+        self.diskspace_timer = QTimer(self)
+        self.diskspace_timer.timeout.connect(self.refresh_diskspace)
+        self.diskspace_timer.start(15000)  # disk space changes slowly — no need to poll every second
         self.fade_timer = QTimer(self)
         self.fade_timer.timeout.connect(self._tick_fade)
         self.fade_timer.start(50)
         self.refresh()
+        self.refresh_diskspace()
 
     def new_job_hook(self):
         return self._new_job_signal.emit
@@ -1426,6 +1620,15 @@ class MainWindow(QMainWindow):
         """Open AddDownloadDialog pre-filled with the pill's payload. Runs
         on the GUI thread via the queued signal connection."""
         try:
+            # Task 3: raise the main window first — an AddDownloadDialog
+            # parented to a hidden/backgrounded window can still end up
+            # behind other apps even with its own StaysOnTop flag. This is
+            # unconditional (unlike _on_new_job's force_on_top check) since
+            # the user explicitly needs to interact with this dialog.
+            if self.isMinimized():
+                self.showNormal()
+            self.raise_()
+            self.activateWindow()
             d = AddDownloadDialog(self, api=self.api,
                                   prefill_url=payload.get("url", ""),
                                   prefill_format_id=payload.get("format_id"),
@@ -1499,6 +1702,12 @@ class MainWindow(QMainWindow):
         if sys.platform == "win32":
             os.startfile(str(path))
 
+    def _open_logs_folder(self):
+        path = HOME / "logs"
+        path.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(str(path))
+
     def _pause_all(self):
         try:
             for j in self.api.jobs():
@@ -1549,7 +1758,7 @@ class MainWindow(QMainWindow):
         self._quitting = True
         # 11.1: stop in-flight fetch workers — a running QThread at exit
         # hangs the app.
-        for w in (self._refresh_worker, self._logs_worker):
+        for w in (self._refresh_worker, self._logs_worker, self._diskspace_worker):
             if w is not None:
                 w.wait(2000)
         if self._tray:
@@ -1639,7 +1848,11 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("● Connecting…")
         self.status_label.setObjectName("StatusLabel")
         status.addWidget(self.status_label)
-        status.addPermanentWidget(QLabel("PySide6 · Flask API"))
+        self.diskspace_label = QLabel("")
+        self.diskspace_label.setObjectName("DiskSpaceLabel")
+        self.diskspace_label.setToolTip("Free space on the downloads drive")
+        status.addPermanentWidget(self.diskspace_label)
+        status.addPermanentWidget(QLabel(f"v{APP_VERSION} · PySide6 · Flask API"))
         self.setStatusBar(status)
         menu = self.menuBar()
         menu.setNativeMenuBar(False)
@@ -1654,6 +1867,11 @@ class MainWindow(QMainWindow):
         a = QAction("Copy pairing token", self); a.triggered.connect(self.copy_token); t.addAction(a)
         a = QAction("Reload token", self); a.triggered.connect(self.reload_token); t.addAction(a)
         a = QAction("Bandwidth profiles…", self); a.triggered.connect(self.open_bandwidth_profiles); t.addAction(a)
+        t.addSeparator()
+        a = QAction("Retry all failed", self); a.triggered.connect(self.retry_all_failed); t.addAction(a)
+        a = QAction("Open logs folder", self); a.triggered.connect(self._open_logs_folder); t.addAction(a)
+        t.addSeparator()
+        a = QAction("About Video Grabber…", self); a.triggered.connect(self.show_about); t.addAction(a)
 
     def _apply_styles(self):
         self.setStyleSheet(f"""
@@ -1811,6 +2029,36 @@ class MainWindow(QMainWindow):
                 self.log.setText(lines[-1])
         except Exception:
             pass
+
+    def refresh_diskspace(self):
+        if self._diskspace_worker is not None:
+            return
+        self._diskspace_worker = _ApiFetchWorker(self.api.disk_space, self)
+        self._diskspace_worker.result.connect(self._on_diskspace_refreshed, Qt.QueuedConnection)
+        self._diskspace_worker.finished.connect(lambda: setattr(self, "_diskspace_worker", None))
+        self._diskspace_worker.start()
+
+    def _on_diskspace_refreshed(self, data):
+        try:
+            free = (data or {}).get("free")
+            total = (data or {}).get("total")
+            if not free or not total:
+                self.diskspace_label.setText("")
+                return
+            pct_used = 100 * (1 - free / total) if total else 0
+            text = f"💾 {fmt_bytes(free)} free"
+            self.diskspace_label.setText(text)
+            # Low-space warning: red once free space drops under 2 GB or 95%
+            # of the drive is used — either one usually means "about to fail".
+            low = free < 2 * 1024**3 or pct_used > 95
+            self.diskspace_label.setStyleSheet(
+                f"color: {DANGER};" if low else f"color: {MUTED};")
+            self.diskspace_label.setToolTip(
+                f"{fmt_bytes(free)} free of {fmt_bytes(total)} on the downloads drive"
+                + ("  —  running low!" if low else ""))
+        except Exception:
+            pass
+
     def _on_new_job(self, job):
         if not self._gui_settings.get("force_on_top", True):
             return
@@ -1829,6 +2077,31 @@ class MainWindow(QMainWindow):
             dlg.exec()
         except Exception as e:
             QMessageBox.critical(self, "Bandwidth profiles error", str(e))
+
+    def show_about(self):
+        QMessageBox.about(
+            self, "About Video Grabber",
+            f"<h3 style='margin-bottom:2px;'>Video Grabber</h3>"
+            f"<p style='color:{MUTED};margin-top:0;'>Version {APP_VERSION}</p>"
+            f"<p>A personal video downloader — a Chrome/Vivaldi extension "
+            f"paired with this desktop app, built on yt-dlp and Streamlink.</p>"
+            f"<p style='color:{MUTED};font-size:11px;'>PySide6 · Flask · {BACKEND_BASE}</p>")
+
+    def retry_all_failed(self):
+        failed = [j["id"] for j in self.all_items if j.get("status") == "error"]
+        if not failed:
+            QMessageBox.information(self, "Retry all failed",
+                                    "No failed downloads to retry.")
+            return
+
+        def _do():
+            for jid in failed:
+                try:
+                    self.api.redownload(jid)
+                except Exception:
+                    pass
+        threading.Thread(target=_do, daemon=True).start()
+        self.log.setText(f"Retrying {len(failed)} failed download(s)…")
 
     def open_settings(self):
         try:
@@ -2033,6 +2306,7 @@ class MainWindow(QMainWindow):
         conv_actions = {conv_menu.addAction(f): f for f in ["mp4", "mkv", "mp3", "wav", "m4a", "flac", "opus"]}
         m.addSeparator()
         a_remove = m.addAction("Remove")
+        a_copy_url = m.addAction("Copy URL")
         a_props = m.addAction("Properties")
         a_open.setEnabled(j["status"] == "done")
         a_open_folder.setEnabled(j["status"] == "done")
@@ -2066,6 +2340,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Convert", str(e))
         elif chosen == a_remove:
             self._ctx_remove()
+        elif chosen == a_copy_url:
+            QApplication.clipboard().setText(j.get("url", ""))
         elif chosen == a_props:
             # Re-fetch at click time — the row object captured when the menu
             # opened can be stale if a refresh fired while the menu was up.

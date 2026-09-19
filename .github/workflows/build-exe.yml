@@ -10,6 +10,12 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Pinned instead of tracking releases/latest, for reproducible builds
+      # (QUESTIONS.md #3 / BUGS.md #6). Bump this deliberately when you want
+      # a newer Deno — e.g. for a YouTube signature-challenge fix — rather
+      # than getting whatever's newest on an unrelated push.
+      DENO_VERSION: "2.9.6"
     defaults:
       run:
         working-directory: backend
@@ -39,7 +45,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip" -OutFile "deno.zip"
+          Invoke-WebRequest -Uri "https://github.com/denoland/deno/releases/download/v${env:DENO_VERSION}/deno-x86_64-pc-windows-msvc.zip" -OutFile "deno.zip"
           Expand-Archive "deno.zip" -DestinationPath "_deno" -Force
           Copy-Item "_deno\deno.exe" "deno.exe"
 
