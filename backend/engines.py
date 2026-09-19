@@ -28,6 +28,10 @@ from logging_setup import log
 # first assignment — without the init the first call raises NameError.
 _YTDLP_JS_RUNTIME_CACHE = None
 
+# Cache for ffmpeg-location resolution: same reasoning (avoids re-stat-ing
+# on every download). Sentinel "_unresolved" means "not yet resolved".
+_FFMPEG_DIR_CACHE = "_unresolved"
+
 
 class DownloadCancelled(Exception):
     """Raised inside yt-dlp progress hooks when the user pauses/stops."""
@@ -46,6 +50,62 @@ class FormatInfo:
 
     def to_dict(self):
         return asdict(self)
+
+
+def find_ffmpeg_dir():
+    """Return the directory containing ffmpeg(.exe), or None if not found.
+
+    yt-dlp needs an external ffmpeg to merge the separate best-video and
+    best-audio streams that YouTube serves over DASH. Without it, `bv*+ba/b`
+    silently produces video-only files (no audio). Frozen builds bundle
+    ffmpeg next to the exe; source runs need it dropped into backend/bin/
+    or on PATH. Resolved once and cached.
+
+    Search order:
+      1. _MEIPASS  (PyInstaller --onedir's _internal/ folder, frozen)
+      2. Next to sys.executable (frozen)
+      3. <repo>/bin/  (source runs — drop ffmpeg.exe there)
+      4. backend/  (source runs, sibling of this file)
+      5. backend/bin/  (source runs)
+      6. System PATH via shutil.which
+    """
+    global _FFMPEG_DIR_CACHE
+    if _FFMPEG_DIR_CACHE != "_unresolved":
+        return _FFMPEG_DIR_CACHE
+
+    candidates = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass))
+        candidates.append(Path(sys.executable).parent)
+    else:
+        # engines.py lives in backend/; repo root is one up.
+        here = Path(__file__).resolve().parent
+        candidates.append(here.parent / "bin")
+        candidates.append(here)
+        candidates.append(here / "bin")
+
+    for d in candidates:
+        try:
+            if (d / "ffmpeg.exe").is_file() or (d / "ffmpeg").is_file():
+                _FFMPEG_DIR_CACHE = str(d)
+                log(f"ffmpeg_location resolved: {d}")
+                return _FFMPEG_DIR_CACHE
+        except OSError:
+            continue
+
+    which = shutil.which("ffmpeg")
+    if which:
+        _FFMPEG_DIR_CACHE = str(Path(which).parent)
+        log(f"ffmpeg_location resolved via PATH: {_FFMPEG_DIR_CACHE}")
+        return _FFMPEG_DIR_CACHE
+
+    _FFMPEG_DIR_CACHE = None
+    log("ffmpeg not found — audio/video merge will fail. Install ffmpeg "
+        "on PATH or drop ffmpeg.exe into backend/bin/ (source) or the "
+        "app folder (frozen).")
+    return None
 
 
 def find_js_runtime():
@@ -223,8 +283,26 @@ class YtDlpEngine:
         if js_rt:
             ydl_opts["js_runtimes"] = js_rt
 
+        # ffmpeg_location: required for the bv*+ba merge on every platform.
+        # Before this was only set when frozen — source runs got silent,
+        # audio-less mp4s because the merge silently failed.
+        ffdir = find_ffmpeg_dir()
+        if ffdir:
+            ydl_opts["ffmpeg_location"] = ffdir
+
         if format_id:
-            ydl_opts["format"] = format_id
+            # If the user picked a specific video-only format (e.g. YouTube
+            # 137 = 1080p video, no audio), pair it with the best audio so
+            # the download actually has sound. When the format_id already
+            # specifies audio (or is an audio-only pick), leave it alone.
+            fid = str(format_id)
+            if "+" in fid or fid.startswith("audio:"):
+                ydl_opts["format"] = fid
+            else:
+                # "137+bestaudio" — yt-dlp merges the two, needs ffmpeg.
+                # "/137" fallback: if audio pairing fails, still give the
+                # user their video rather than erroring out.
+                ydl_opts["format"] = f"{fid}+bestaudio/{fid}"
         else:
             # Playlist mode gets a generic per-item selector; single-video
             # mode keeps the lean best-video+best-audio default.
@@ -259,8 +337,6 @@ class YtDlpEngine:
         lim = opts.get("speed_limit_kbps")
         if lim and lim > 0:
             ydl_opts["ratelimit"] = lim * 1024
-        if getattr(sys, "frozen", False):
-            ydl_opts["ffmpeg_location"] = sys._MEIPASS
 
         # v4.0.5 diagnostics: freeze the environment + full traceback so a
         # [WinError 2] reports exactly which line/subprocess raised it.
