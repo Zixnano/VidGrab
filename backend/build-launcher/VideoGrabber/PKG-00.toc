@@ -1,0 +1,60 @@
+('C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+ 'New\\backend\\build-launcher\\VideoGrabber\\VideoGrabber.pkg',
+ {'BINARY': True,
+  'DATA': True,
+  'EXECUTABLE': True,
+  'EXTENSION': True,
+  'PYMODULE': True,
+  'PYSOURCE': True,
+  'PYZ': False,
+  'SPLASH': True,
+  'SYMLINK': False},
+ [('pyi-contents-directory VideoGrabber_internal', '', 'OPTION'),
+  ('PYZ-00.pyz',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\build-launcher\\VideoGrabber\\PYZ-00.pyz',
+   'PYZ'),
+  ('struct',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\build-launcher\\VideoGrabber\\localpycs\\struct.pyc',
+   'PYMODULE'),
+  ('pyimod01_archive',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\build-launcher\\VideoGrabber\\localpycs\\pyimod01_archive.pyc',
+   'PYMODULE'),
+  ('pyimod02_importers',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\build-launcher\\VideoGrabber\\localpycs\\pyimod02_importers.pyc',
+   'PYMODULE'),
+  ('pyimod03_ctypes',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\build-launcher\\VideoGrabber\\localpycs\\pyimod03_ctypes.pyc',
+   'PYMODULE'),
+  ('pyimod04_pywin32',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\build-launcher\\VideoGrabber\\localpycs\\pyimod04_pywin32.pyc',
+   'PYMODULE'),
+  ('pyiboot01_bootstrap',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\.venv\\Lib\\site-packages\\PyInstaller\\loader\\pyiboot01_bootstrap.py',
+   'PYSOURCE'),
+  ('pyi_rth_inspect',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_inspect.py',
+   'PYSOURCE'),
+  ('pyi_rth_pkgutil',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_pkgutil.py',
+   'PYSOURCE'),
+  ('launcher',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\launcher.py',
+   'PYSOURCE')],
+ 'python314.dll',
+ True,
+ False,
+ False,
+ [],
+ None,
+ None,
+ None)

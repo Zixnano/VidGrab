@@ -62,6 +62,8 @@ def find_ffmpeg_dir():
     or on PATH. Resolved once and cached.
 
     Search order:
+      0. Split layout (restructure): runtime\ via VG_RUNTIME, exe-parent,
+         or app-sibling fallback
       1. _MEIPASS  (PyInstaller --onedir's _internal/ folder, frozen)
       2. Next to sys.executable (frozen)
       3. <repo>/bin/  (source runs — drop ffmpeg.exe there)
@@ -72,6 +74,25 @@ def find_ffmpeg_dir():
     global _FFMPEG_DIR_CACHE
     if _FFMPEG_DIR_CACHE != "_unresolved":
         return _FFMPEG_DIR_CACHE
+
+    # Split-layout search first: the launcher exports VG_RUNTIME pointing
+    # at runtime\ before app code imports; the exe-parent and app-sibling
+    # entries are fallbacks for frozen/source runs where that export is
+    # missing. ffmpeg.exe/deno.exe live there in the new layout.
+    runtime_candidates = []
+    vg_runtime = os.environ.get("VG_RUNTIME")
+    if vg_runtime:
+        runtime_candidates.append(Path(vg_runtime))
+    runtime_candidates.append(Path(sys.executable).parent / "runtime")
+    runtime_candidates.append(Path(__file__).resolve().parent.parent / "runtime")
+    for d in runtime_candidates:
+        try:
+            if (d / "ffmpeg.exe").is_file() or (d / "ffmpeg").is_file():
+                _FFMPEG_DIR_CACHE = str(d)
+                log(f"ffmpeg_location resolved: {d}")
+                return _FFMPEG_DIR_CACHE
+        except OSError:
+            continue
 
     candidates = []
     if getattr(sys, "frozen", False):
@@ -116,6 +137,8 @@ def find_js_runtime():
     binary); Node 22+ works if Deno is absent.
 
     Search order:
+      0. Split layout (restructure): runtime\ via VG_RUNTIME, exe-parent,
+         or app-sibling fallback
       1. Next to the exe (frozen) or the project dir (dev) — a bundled copy
       2. _MEIPASS (PyInstaller --onedir's _internal/ folder), if frozen
       3. System PATH
@@ -123,6 +146,28 @@ def find_js_runtime():
     global _YTDLP_JS_RUNTIME_CACHE
     if _YTDLP_JS_RUNTIME_CACHE is not None:
         return _YTDLP_JS_RUNTIME_CACHE
+
+    # Split-layout search first: the launcher exports VG_RUNTIME pointing
+    # at runtime\ before app code imports; the exe-parent and app-sibling
+    # entries are fallbacks for frozen/source runs where that export is
+    # missing. deno.exe/node.exe live there in the new layout.
+    runtime_dirs = []
+    vg_runtime = os.environ.get("VG_RUNTIME")
+    if vg_runtime:
+        runtime_dirs.append(Path(vg_runtime))
+    runtime_dirs.append(Path(sys.executable).parent / "runtime")
+    runtime_dirs.append(Path(__file__).resolve().parent.parent / "runtime")
+    for d in runtime_dirs:
+        for fname, key in (("deno.exe", "deno"), ("deno", "deno"),
+                           ("node.exe", "node"), ("node", "node")):
+            p = d / fname
+            try:
+                if p.is_file():
+                    _YTDLP_JS_RUNTIME_CACHE = {key: {"path": str(p)}}
+                    log(f"yt-dlp JS runtime: {key} at {p}")
+                    return _YTDLP_JS_RUNTIME_CACHE
+            except OSError:
+                continue
 
     candidates = []
     if getattr(sys, "frozen", False):

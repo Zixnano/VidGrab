@@ -53,25 +53,63 @@ jobs:
           Expand-Archive "deno.zip" -DestinationPath "_deno" -Force
           Copy-Item "_deno\deno.exe" "deno.exe"
 
-      - name: Build exe
-        run: |
-          # --onedir instead of --onefile: onefile re-extracts the entire bundle
-          # (PySide6 DLLs, ffmpeg, yt-dlp, Tcl libs) to a temp folder on EVERY
-          # launch, costing 30s-minutes. onedir starts instantly.
-          pyinstaller --onedir --noconsole --name VideoGrabber --icon=VideoGrabber.ico --collect-all yt_dlp --collect-all PySide6 --collect-all streamlink --collect-all watchdog --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --add-binary "deno.exe;." server.py
+      # Thin launcher: built from VideoGrabber.spec (onedir, console=False,
+      # no PySide6 / yt-dlp / streamlink / watchdog / ffmpeg / Deno / app
+      # code — those all live in runtime\). Output: dist-launcher\
+      # VideoGrabber\ containing VideoGrabber.exe + VideoGrabber_internal\.
+      - name: Build thin launcher exe
+        run: pyinstaller VideoGrabber.spec --noconfirm --distpath dist-launcher --workpath build-launcher
 
-      # onedir output is a FOLDER: dist/VideoGrabber/VideoGrabber.exe plus
-      # all its DLLs/assets alongside it. Zip the whole folder so the release
-      # download is a single file the user extracts.
-      - name: Package as zip
+      # runtime\site-packages: the full dependency set as importable source.
+      # --upgrade because a plain --target skips requirements already
+      # satisfied in the CI python's own site-packages. PySide6 STAYS in
+      # site-packages (it's a package, not a loose folder) — the launcher's
+      # add_dll_directory points at runtime\site-packages\PySide6.
+      - name: Install runtime dependencies
+        run: pip install --upgrade -r requirements.txt --target "staging\video 3 grabber\runtime\site-packages"
+
+      - name: Assemble split layout (launcher + app + runtime)
         shell: pwsh
         run: |
-          Compress-Archive -Path "dist/VideoGrabber/*" -DestinationPath "VideoGrabber-windows.zip" -Force
+          $root = 'staging/video 3 grabber'
+          # app\ = my Python code only (every backend .py, launcher.py included)
+          New-Item -ItemType Directory -Force "$root/app" | Out-Null
+          Copy-Item -Path *.py -Destination "$root/app/"
+          Copy-Item -Path updater.bat, restore.bat -Destination "$root/"
+          # Stamp the setup with its own build tag so a fresh install
+          # compares updates against THIS build, not APP_VERSION.
+          Set-Content "$root/install-version.txt" "v${env:GITHUB_RUN_NUMBER}" -NoNewline
+          # launcher = exe + its internal folder, both at the install root
+          Copy-Item -Path 'dist-launcher/VideoGrabber/VideoGrabber.exe' -Destination "$root/VideoGrabber.exe"
+          Copy-Item -Path 'dist-launcher/VideoGrabber/VideoGrabber_internal' -Destination "$root/" -Recurse
+          # PySide6 is NOT hoisted — it remains runtime\site-packages\PySide6
+          Copy-Item -Path ffmpeg.exe, ffprobe.exe, deno.exe -Destination "$root/runtime/"
 
-      # Releases don't count against the Actions artifact storage quota
-      # (which was the source of the "Artifact storage quota has been hit"
-      # failures). Each build becomes a permanent release tagged vN, and the
-      # exe is attached to it — downloadable forever from the Releases page.
+      - name: "Package setup zip (full install: launcher + app + runtime)"
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'staging/video 3 grabber' `
+            -DestinationPath "VideoGrabber-setup-v${env:GITHUB_RUN_NUMBER}.zip" -Force
+
+      # Thin update zip: launcher (exe + internal) + app ONLY. Must NOT
+      # contain runtime\ — if it does, the split is pointless and updates
+      # stay ~148 MB.
+      - name: Package app-only update zip
+        shell: pwsh
+        run: |
+          $appRoot = 'staging-app/video 3 grabber'
+          New-Item -ItemType Directory -Force "$appRoot/app" | Out-Null
+          Copy-Item -Path *.py -Destination "$appRoot/app/"
+          Copy-Item -Path 'dist-launcher/VideoGrabber/VideoGrabber.exe' -Destination "$appRoot/VideoGrabber.exe"
+          Copy-Item -Path 'dist-launcher/VideoGrabber/VideoGrabber_internal' -Destination "$appRoot/" -Recurse
+          Compress-Archive -Path "$appRoot" `
+            -DestinationPath "VideoGrabber-app-v${env:GITHUB_RUN_NUMBER}.zip" -Force
+
+      # softprops/action-gh-release: files: paths are relative to the
+      # WORKSPACE ROOT, not the backend working-directory — hence the
+      # backend/ prefix on both zips. Releases don't count against the
+      # Actions artifact storage quota; each build becomes a permanent
+      # release tagged vN with both zips attached.
       - name: Create or update release
         uses: softprops/action-gh-release@v2
         with:
@@ -81,7 +119,12 @@ jobs:
             Automatic build from commit ${{ github.sha }}.
 
             ${{ github.event.head_commit.message }}
-          files: backend/VideoGrabber-windows.zip
+
+            - `VideoGrabber-setup-v${{ github.run_number }}.zip` — full install (launcher + app + runtime)
+            - `VideoGrabber-app-v${{ github.run_number }}.zip` — thin update (launcher + app only, no runtime)
+          files: |
+            backend/VideoGrabber-setup-v${{ github.run_number }}.zip
+            backend/VideoGrabber-app-v${{ github.run_number }}.zip
           draft: false
           prerelease: false
         env:
