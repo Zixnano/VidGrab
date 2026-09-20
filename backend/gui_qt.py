@@ -1608,6 +1608,9 @@ class MainWindow(QMainWindow):
     # Carries the pill payload from /show-add-dialog to the GUI thread.
     _show_dialog_signal = Signal(object)
     _new_job_signal = Signal(object)
+    # Update-check result back from the worker thread (updater runs off
+    # the UI thread so the app doesn't freeze while it hits GitHub).
+    _update_result_signal = Signal(object)
 
     def __init__(self, api=None):
         super().__init__()
@@ -1644,6 +1647,7 @@ class MainWindow(QMainWindow):
         self._apply_styles()
         self._build_tray()
         self._new_job_signal.connect(self._on_new_job, Qt.QueuedConnection)
+        self._update_result_signal.connect(self._on_update_result, Qt.QueuedConnection)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1000)
@@ -1853,6 +1857,7 @@ class MainWindow(QMainWindow):
             ("Stop", "■", lambda: self._selected("stop")),
             ("Delete", "⌫", self.remove_selected),
             ("Queue", "⏯", self.toggle_queue),
+            ("Theme", "☯", self.toggle_theme),
             ("Settings", "⚙", self.open_settings),
         ]:
             b = QPushButton(f"{icon}  {label}")
@@ -1929,6 +1934,8 @@ class MainWindow(QMainWindow):
         f.addSeparator()
         a = QAction("Exit", self); a.triggered.connect(self._real_quit); f.addAction(a)
         t = menu.addMenu("Tools")
+        a = QAction("Check for updates…", self); a.triggered.connect(self.check_for_updates); t.addAction(a)
+        t.addSeparator()
         a = QAction("Copy pairing token", self); a.triggered.connect(self.copy_token); t.addAction(a)
         a = QAction("Reload token", self); a.triggered.connect(self.reload_token); t.addAction(a)
         a = QAction("Bandwidth profiles…", self); a.triggered.connect(self.open_bandwidth_profiles); t.addAction(a)
@@ -2167,6 +2174,88 @@ class MainWindow(QMainWindow):
                     pass
         threading.Thread(target=_do, daemon=True).start()
         self.log.setText(f"Retrying {len(failed)} failed download(s)…")
+
+    def toggle_theme(self):
+        """Flip between the dark_gray and amoled_black theme presets and
+        apply immediately (no restart needed). Visible confirmation that
+        an app update went through."""
+        try:
+            current = load_settings().get("theme_preset", "amoled_black")
+            new_preset = "dark_gray" if current != "dark_gray" else "amoled_black"
+            self.api.save_setting("theme_preset", new_preset)
+            # Rebuild the QSS from the freshly saved settings and reapply
+            # app-wide — same pattern the Settings dialog uses on Save.
+            from gui_style import build_qss
+            QApplication.instance().setStyleSheet(build_qss(load_settings()))
+            self.log.setText(f"Theme: {new_preset}")
+        except Exception as e:
+            QMessageBox.warning(self, "Theme", str(e))
+
+    def check_for_updates(self):
+        """Run the updater on a background thread. On success it stages the
+        new app zip and hands off to updater.bat, which finishes the swap
+        after this process exits. Only works in the frozen (installed)
+        build; the source run just tells the user to use git."""
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self, "Check for updates",
+                "Updates only apply to the installed (exe) build.\n"
+                "Source runs should pull from git instead.")
+            return
+        try:
+            from updater import apply_update
+        except Exception as e:
+            QMessageBox.warning(self, "Check for updates",
+                                f"Updater module not available:\n{e}")
+            return
+
+        self.status_label.setText("● Checking for updates…")
+        self.status_label.setStyleSheet(f"color: {MUTED}; padding-left: 10px;")
+
+        def _do():
+            try:
+                staged = apply_update()
+                self._update_result_signal.emit({"ok": True, "staged": bool(staged)})
+            except Exception as e:
+                self._update_result_signal.emit({"ok": False, "error": str(e)})
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_update_result(self, payload):
+        """GUI-thread slot for the update check result."""
+        # Restore the status label to whatever refresh() would have set.
+        try:
+            self.refresh()
+        except Exception:
+            pass
+        if not payload.get("ok"):
+            QMessageBox.warning(self, "Update check failed",
+                                payload.get("error") or "Unknown error")
+            return
+        if not payload.get("staged"):
+            QMessageBox.information(
+                self, "Check for updates",
+                f"You're already on the latest version.\n\nCurrent: v{APP_VERSION}")
+            return
+        # Update staged — the bat is already waiting for us to exit.
+        answer = QMessageBox.question(
+            self, "Update ready",
+            "An update has been downloaded and is ready to install.\n\n"
+            "The app needs to close briefly while the files are swapped, "
+            "then it will reopen automatically.\n\n"
+            "Restart now?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            # Bypass closeEvent's tray-intercept so the process actually
+            # exits — updater.bat is polling for exactly that.
+            self._quitting = True
+            if self._tray:
+                self._tray.hide()
+            QApplication.instance().quit()
+        else:
+            QMessageBox.information(
+                self, "Update ready",
+                "The update will apply the next time you close the app.")
 
     def open_settings(self):
         try:
