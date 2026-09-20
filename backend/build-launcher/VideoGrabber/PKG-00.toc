@@ -38,13 +38,21 @@
    'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
    'New\\backend\\.venv\\Lib\\site-packages\\PyInstaller\\loader\\pyiboot01_bootstrap.py',
    'PYSOURCE'),
-  ('pyi_rth_inspect',
+  ('pyi_rth_setuptools',
    'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
-   'New\\backend\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_inspect.py',
+   'New\\backend\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_setuptools.py',
    'PYSOURCE'),
   ('pyi_rth_pkgutil',
    'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
    'New\\backend\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_pkgutil.py',
+   'PYSOURCE'),
+  ('pyi_rth_multiprocessing',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_multiprocessing.py',
+   'PYSOURCE'),
+  ('pyi_rth_inspect',
+   'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '
+   'New\\backend\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks\\pyi_rth_inspect.py',
    'PYSOURCE'),
   ('launcher',
    'C:\\Users\\Zix Nano\\Downloads\\Compressed\\Video grabber\\Video grabber '

@@ -6,6 +6,7 @@
 # with the thin zip. Build: pyinstaller VideoGrabber.spec
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules
 
 # python3.dll: PySide6's extension modules link the stable-ABI DLL. The
 # launcher's own interpreter doesn't need it, but PySide6 loaded from
@@ -14,25 +15,40 @@ from pathlib import Path
 _py3_dll = Path(sys.base_prefix) / "python3.dll"
 _binaries = [(str(_py3_dll), ".")] if _py3_dll.is_file() else []
 
+# Bundle the entire stdlib via collect_submodules. sys.stdlib_module_names
+# only lists top-level names ("http") and misses submodules
+# ("http.cookies"); collect_submodules walks each package and returns the
+# full dotted paths, which is what PyInstaller needs to actually include
+# them. This is the "bundle it all once, never chase a missing module
+# again" approach — costs ~15 MB on the exe, saves a lot of future pain.
+_SKIP_STDLIB = {
+    'antigravity', 'this', '__main__', '__hello__', '__phello__',
+    'idlelib', 'turtledemo', 'turtle', 'tkinter', '_tkinter',
+    'test', 'pydoc_data', 'ensurepip', 'venv', 'site', 'sitecustomize',
+    'usercustomize', 'distutils', 'lib2to3',
+}
+_hidden_stdlib = []
+for _name in sorted(sys.stdlib_module_names):
+    if _name in _SKIP_STDLIB or _name.startswith(('_test', 'xx', '_xx')):
+        continue
+    _hidden_stdlib.append(_name)
+    try:
+        _hidden_stdlib += collect_submodules(_name)
+    except Exception:
+        # Some stdlib entries aren't real importable packages on every
+        # build platform; skip silently rather than failing the build.
+        pass
+
+_hidden_stdlib += [
+    'requests', 'urllib3', 'idna', 'certifi', 'charset_normalizer',
+]
+
 a = Analysis(
     ['launcher.py'],
     pathex=[],
     binaries=_binaries,
     datas=[],
-    hiddenimports=[
-        # stdlib modules the app imports at runtime — frozen into the
-        # launcher PYZ so they're guaranteed present when server.py runs
-        'json', 'os', 're', 'sys', 'time', 'threading', 'queue', 'shutil',
-        'subprocess', 'secrets', 'glob', 'socket', 'ssl', 'io', 'base64',
-        'hashlib', 'uuid', 'urllib', 'urllib.parse', 'urllib.request',
-        'urllib.error', 'http', 'http.server', 'http.client', 'zipfile',
-        'tempfile', 'pathlib', 'datetime', 'ctypes', 'ctypes.wintypes',
-        'contextlib', 'functools', 'itertools', 'collections', 'dataclasses',
-        'enum', 'typing', 'traceback', 'warnings', 'logging',
-        'logging.handlers', 'email', 'email.message', 'email.mime',
-        'email.mime.text', 'argparse', 'csv', 'sqlite3', 'xml',
-        'xml.etree', 'xml.etree.ElementTree',
-    ],
+    hiddenimports=_hidden_stdlib,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
