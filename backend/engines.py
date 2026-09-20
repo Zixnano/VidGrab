@@ -254,7 +254,17 @@ class YtDlpEngine:
     def download(self, url, format_id, dest: Path, opts, progress_cb):
         opts = opts or {}
         headers = opts.get("headers") or {}
-        outtmpl = str(dest.parent / (dest.stem + ".%(ext)s"))
+        is_playlist = bool(opts.get("download_playlist"))
+
+        # FIX: playlist mode needs a per-item template, otherwise every
+        # playlist entry overwrites the same "watch (N).mp4" file. Use the
+        # playlist index + video title so each item lands in its own file.
+        # %(playlist_index)03d zero-pads to 3 digits so files sort correctly
+        # in Explorer (1, 2, ..., 10 instead of 1, 10, 2, ...).
+        if is_playlist:
+            outtmpl = str(dest.parent / "%(playlist_index)03d - %(title)s.%(ext)s")
+        else:
+            outtmpl = str(dest.parent / (dest.stem + ".%(ext)s"))
 
         # Session Q: validate subtitle_languages is a list of strings
         sub_langs = STATE.get("subtitle_languages", ["en"])
@@ -269,7 +279,7 @@ class YtDlpEngine:
             "progress_hooks": [progress_cb],
             "quiet": True, "no_warnings": True,
             "continuedl": True,
-            "noplaylist": not opts.get("download_playlist", False),
+            "noplaylist": not is_playlist,
             "retries": 10,
             "fragment_retries": 10,
             "writesubtitles": True,
@@ -278,6 +288,13 @@ class YtDlpEngine:
             "embedsubs": True,
             "socket_timeout": 30,
         }
+
+        # FIX: playlist mode gets per-item progress output so you can watch
+        # "Downloading item 7 of 50" in the CMD. Single-video stays silent.
+        if is_playlist:
+            ydl_opts["quiet"] = False
+            ydl_opts["no_warnings"] = False
+            ydl_opts["noprogress"] = False
 
         js_rt = find_js_runtime()
         if js_rt:
@@ -306,7 +323,7 @@ class YtDlpEngine:
         else:
             # Playlist mode gets a generic per-item selector; single-video
             # mode keeps the lean best-video+best-audio default.
-            if opts.get("download_playlist"):
+            if is_playlist:
                 ydl_opts["format"] = "bestvideo+bestaudio/best"
             else:
                 ydl_opts["format"] = "bv*+ba/b"
@@ -363,6 +380,13 @@ class YtDlpEngine:
             log(f"job {opts.get('job_id') or dest.name}: FULL TRACEBACK:\n"
                 f"{traceback.format_exc()}")
             raise
+
+        # Playlist mode: yt-dlp already wrote one file per item using the
+        # %(playlist_index)s-%(title)s template; dest.stem glob won't match
+        # anything useful here. Return dest unchanged — the caller uses this
+        # only as a sanity path; the actual files are on disk already.
+        if is_playlist:
+            return Path(dest)
 
         # glob.escape(): "[" / "]" are legal in Windows filenames but wildcards
         # to glob() — titles like "Song [Official Video]" would never match.

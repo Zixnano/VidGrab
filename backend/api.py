@@ -14,13 +14,13 @@ import time
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from downloader import maybe_convert_to_mp4, _repair_recording, _probe_recording, _CREATE_NO_WINDOW
+from downloader import maybe_convert_to_mp4, _repair_recording, _probe_recording, _CREATE_NO_WINDOW, _WORKERS
 from settings import MAX_UPLOAD_BYTES
 import queue
 import html
 from yt_dlp import YoutubeDL
 from settings import APP_PORT, APP_VERSION, STATE, save_settings, safe_filename, guess_filename, _unique_path, _dest_for, stat_for, disk_usage_for
-from jobs import transition, JobEvent, JobPhase, set_phase, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks, _fire_show_dialog_hooks
+from jobs import transition, repair_status, JobEvent, JobPhase, set_phase, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks, _fire_show_dialog_hooks
 
 from logging_setup import log, LOG_QUEUE
 
@@ -225,9 +225,26 @@ def _job_action(job_id, action):
         job["pause_evt"].clear()
         job["stop_evt"].clear()
         job["error"] = None
-        transition(job, JobEvent.RESUME)
+        w = _WORKERS.get(job_id)
+        if (job["status"] == "paused" and job.get("type") != "generic"
+                and w is not None and w.is_alive()):
+            # yt-dlp keeps its worker thread parked in progress_cb while a
+            # job is paused and simply carries on once pause_evt clears.
+            # Routing that through "queued" let the dispatcher start a
+            # second yt-dlp on the same .part files about one resume in
+            # four. Hand the job straight back to the parked worker.
+            transition(job, JobEvent.START)
+        else:
+            transition(job, JobEvent.RESUME)
     elif action == "stop":
-        job["stop_evt"].set()
+        if job["status"] == "queued":
+            # No worker thread exists yet to observe stop_evt, and the
+            # dispatcher clears it when it starts the job — so the old
+            # set() was a silent no-op and the job started anyway. Flip the
+            # status instead (transition() also sets stop_evt).
+            transition(job, JobEvent.STOP)
+        else:
+            job["stop_evt"].set()
         job["pause_evt"].clear()
     elif action == "delete":
         job["stop_evt"].set()
@@ -259,6 +276,11 @@ def redownload(job_id):
         # window to observe the signal, so the old thread can keep writing
         # to the same .part file the freshly-dispatched job also writes to.
         return jsonify({"error": "job is actively downloading — stop it first"}), 400
+    if job["status"] == "done":
+        # RESUME isn't a legal transition from DONE: this route used to zero
+        # size_done/size_total below and THEN raise (HTTP 500), leaving a
+        # finished job showing 0 bytes. Reopen it so RESUME -> QUEUED works.
+        repair_status(job, "stopped")
     job["stop_evt"].set()
     cleanup_partial_files(job)
     job["pause_evt"].clear()

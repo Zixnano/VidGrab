@@ -635,6 +635,13 @@ def run_ytdlp(job_id):
         save_jobs_snapshot()
 
 
+# job_id -> worker Thread. Private to this module and never serialized (job
+# dicts go straight to JSON, so the Thread can't live on the job itself).
+# api.py's resume route uses it to tell a paused job whose yt-dlp thread is
+# still parked in progress_cb from one whose thread has already exited.
+_WORKERS = {}
+
+
 def start_job_thread(job_id):
     job = JOBS[job_id]
     job["pause_evt"].clear()
@@ -642,25 +649,39 @@ def start_job_thread(job_id):
     job["error"] = None
     transition(job, JobEvent.START)
     target = run_generic if job["type"] == "generic" else run_ytdlp
-    threading.Thread(target=target, args=(job_id,), daemon=True).start()
+    t = threading.Thread(target=target, args=(job_id,), daemon=True)
+    _WORKERS[job_id] = t
+    t.start()
 
 
 def dispatcher_loop():
     while True:
         time.sleep(1)
-        if not STATE["queue_running"]:
-            continue
-        active = sum(1 for j in list(JOBS.values()) if j["status"] == "downloading")
-        slots = STATE["max_concurrent"] - active
-        if slots <= 0:
-            continue
-        started = 0
-        for jid, j in list(JOBS.items()):
-            if started >= slots:
-                break
-            if j["status"] == "queued":
-                start_job_thread(jid)
-                started += 1
+        # An uncaught exception here used to end this thread silently and
+        # the queue never started another job until the app was restarted
+        # (e.g. a job deleted or stopped between the status check and
+        # start_job_thread).
+        try:
+            for jid in [k for k, t in list(_WORKERS.items()) if not t.is_alive()]:
+                _WORKERS.pop(jid, None)
+            if not STATE["queue_running"]:
+                continue
+            active = sum(1 for j in list(JOBS.values()) if j["status"] == "downloading")
+            slots = STATE["max_concurrent"] - active
+            if slots <= 0:
+                continue
+            started = 0
+            for jid, j in list(JOBS.items()):
+                if started >= slots:
+                    break
+                if j["status"] == "queued":
+                    try:
+                        start_job_thread(jid)
+                        started += 1
+                    except Exception as e:
+                        log(f"dispatcher: couldn't start job {jid}: {e}")
+        except Exception as e:
+            log(f"dispatcher loop error (continuing): {e}")
 
 
 

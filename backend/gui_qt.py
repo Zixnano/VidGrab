@@ -38,7 +38,7 @@ CONFIG_PATH = HOME / "settings.json"
 
 # Palette-derived (single source of truth: palette.py).
 from palette import resolve_palette
-from settings import CATEGORIES, APP_VERSION  # single source of truth: settings.py
+from settings import CATEGORIES, APP_VERSION, detect_type  # single source of truth: settings.py
 
 _PAL = resolve_palette()
 ACCENT = _PAL["accent"]
@@ -190,10 +190,16 @@ class ApiClient:
 
     def add(self, url, filename=None, category=None, description=None,
             format_id=None, target_format=None, resolution=None, multi=False,
-            download_playlist=False):
+            download_playlist=False, referer=None, cookie=None, user_agent=None):
         body = {"url": url}
         if filename:
             body["filename"] = filename
+        if referer:
+            body["referer"] = referer
+        if cookie:
+            body["cookie"] = cookie
+        if user_agent:
+            body["user_agent"] = user_agent
         if category:
             body["category"] = category
         if description:
@@ -510,7 +516,9 @@ class AddDownloadDialog(QDialog):
         self._update_playlist_visibility()
         # Pill-initiated "Download entire playlist" pre-checks the box so
         # the user's pill choice survives into the dialog.
-        if self._prefill_download_playlist and self.playlist_checkbox.isVisible():
+        # FIX: isVisibleTo(self) works during __init__; isVisible() does not
+        # (isVisible() returns False until the dialog is actually shown).
+        if self._prefill_download_playlist and self.playlist_checkbox.isVisibleTo(self):
             self.playlist_checkbox.setChecked(True)
 
         self._formats_ready.connect(self._on_formats)
@@ -772,8 +780,11 @@ class AddDownloadDialog(QDialog):
                 "format_id": fid,
                 "target_format": tfmt,
                 "resolution": res,
-                "download_playlist": (self.playlist_checkbox.isVisible()
-                                      and self.playlist_checkbox.isChecked()),
+                # FIX: isChecked() alone is sufficient — the checkbox can only
+                # be checked if the user could see it. The isVisible() guard
+                # made the flag depend on Qt's rendering state, which is
+                # unreliable during modal exec() loops.
+                "download_playlist": self.playlist_checkbox.isChecked(),
                 "skip_dialog": self.skip_dialog.isChecked(),
             })
         return out
@@ -1687,14 +1698,28 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             total = len(v)
+            src_url = (payload.get("url") or "").strip()
             for item in v:
+                # The payload's filename/referer/cookie/UA describe the URL
+                # the browser handed over — they used to be dropped here, so
+                # every download that went through this dialog lost its name
+                # and its login (403s / HTML-login-page "downloads"). Only
+                # forwarded when the URL is unchanged, so a cookie is never
+                # sent to a different site than it came from. Direct files
+                # only: yt-dlp jobs keep today's behaviour (see findings).
+                extra = {}
+                if item["url"] == src_url and detect_type(item["url"]) == "generic":
+                    extra = {"filename": payload.get("filename"),
+                             "referer": payload.get("referer"),
+                             "cookie": payload.get("cookie"),
+                             "user_agent": payload.get("user_agent")}
                 self.api.add(item["url"], category=item["category"],
                              description=item["description"],
                              format_id=item.get("format_id"),
                              target_format=item.get("target_format"),
                              resolution=item.get("resolution"),
                              download_playlist=item.get("download_playlist", False),
-                             multi=total > 1)
+                             multi=total > 1, **extra)
             if common.get("skip_dialog"):
                 try:
                     self.api.save_setting("skip_add_dialog", True)
