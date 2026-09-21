@@ -1857,7 +1857,6 @@ class MainWindow(QMainWindow):
             ("Stop", "■", lambda: self._selected("stop")),
             ("Delete", "⌫", self.remove_selected),
             ("Queue", "⏯", self.toggle_queue),
-            ("Theme", "☯", self.toggle_theme),
             ("Settings", "⚙", self.open_settings),
         ]:
             b = QPushButton(f"{icon}  {label}")
@@ -2174,22 +2173,6 @@ class MainWindow(QMainWindow):
                     pass
         threading.Thread(target=_do, daemon=True).start()
         self.log.setText(f"Retrying {len(failed)} failed download(s)…")
-
-    def toggle_theme(self):
-        """Flip between the dark_gray and amoled_black theme presets and
-        apply immediately (no restart needed). Visible confirmation that
-        an app update went through."""
-        try:
-            current = load_settings().get("theme_preset", "amoled_black")
-            new_preset = "dark_gray" if current != "dark_gray" else "amoled_black"
-            self.api.save_setting("theme_preset", new_preset)
-            # Rebuild the QSS from the freshly saved settings and reapply
-            # app-wide — same pattern the Settings dialog uses on Save.
-            from gui_style import build_qss
-            QApplication.instance().setStyleSheet(build_qss(load_settings()))
-            self.log.setText(f"Theme: {new_preset}")
-        except Exception as e:
-            QMessageBox.warning(self, "Theme", str(e))
 
     def check_for_updates(self):
         """Run the updater on a background thread. On success it stages the
