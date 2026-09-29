@@ -19,8 +19,6 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import Callable, Optional, Protocol
 
-from yt_dlp import YoutubeDL
-
 from logging_setup import log
 
 
@@ -62,7 +60,7 @@ def find_ffmpeg_dir():
     or on PATH. Resolved once and cached.
 
     Search order:
-      0. Split layout (restructure): runtime\ via VG_RUNTIME, exe-parent,
+      0. Split layout (restructure): runtime/ via VG_RUNTIME, exe-parent,
          or app-sibling fallback
       1. _MEIPASS  (PyInstaller --onedir's _internal/ folder, frozen)
       2. Next to sys.executable (frozen)
@@ -137,7 +135,7 @@ def find_js_runtime():
     binary); Node 22+ works if Deno is absent.
 
     Search order:
-      0. Split layout (restructure): runtime\ via VG_RUNTIME, exe-parent,
+      0. Split layout (restructure): runtime/ via VG_RUNTIME, exe-parent,
          or app-sibling fallback
       1. Next to the exe (frozen) or the project dir (dev) — a bundled copy
       2. _MEIPASS (PyInstaller --onedir's _internal/ folder), if frozen
@@ -247,15 +245,22 @@ class YtDlpEngine:
 
     # --- probe (moved from api.probe_formats) ---
     def probe(self, url, opts=None):
+        opts = opts or {}
         ydl_opts = {
             "quiet": True,
             "skip_download": True,
             "noplaylist": True,
             "socket_timeout": 20,
         }
+        # Cookie/Referer/User-Agent forwarded by the extension so restricted
+        # tweets probe the same way they download.
+        hdrs = opts.get("headers")
+        if hdrs:
+            ydl_opts["http_headers"] = dict(hdrs)
         js_rt = find_js_runtime()
         if js_rt:
             ydl_opts["js_runtimes"] = js_rt
+        from yt_dlp import YoutubeDL  # lazy: keeps ~100 MB out of idle RAM
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         formats = []
@@ -284,7 +289,10 @@ class YtDlpEngine:
         def _sort_key(fi):
             m = re.match(r"(\d+)x(\d+)", fi.resolution or "")
             height = int(m.group(2)) if m else 0
-            is_audio_only = not fi.vcodec or fi.vcodec == "none"
+            # yt-dlp says vcodec "none" for real audio-only streams. An
+            # unknown vcodec (e.g. silent/progressive Twitter MP4s) with a
+            # WxH resolution is still video.
+            is_audio_only = fi.vcodec == "none" or (not fi.vcodec and not m)
             has_audio = bool(fi.acodec) and fi.acodec != "none"
             muxed = (not is_audio_only) and has_audio
             prefer_mp4_h264 = 0 if (fi.ext == "mp4" and fi.vcodec.startswith("avc1")) else 1
@@ -307,16 +315,12 @@ class YtDlpEngine:
         # %(playlist_index)03d zero-pads to 3 digits so files sort correctly
         # in Explorer (1, 2, ..., 10 instead of 1, 10, 2, ...).
         if is_playlist:
-            outtmpl = str(dest.parent / "%(playlist_index)03d - %(title)s.%(ext)s")
+            # Each playlist gets its own subfolder named after the playlist
+            # (falls back to "Playlist" when yt-dlp has no title for it).
+            outtmpl = str(dest.parent / "%(playlist_title|Playlist)s"
+                          / "%(playlist_index)03d - %(title)s.%(ext)s")
         else:
             outtmpl = str(dest.parent / (dest.stem + ".%(ext)s"))
-
-        # Session Q: validate subtitle_languages is a list of strings
-        sub_langs = STATE.get("subtitle_languages", ["en"])
-        if isinstance(sub_langs, str):
-            sub_langs = [s.strip() for s in sub_langs.split(",") if s.strip()]
-        if not isinstance(sub_langs, list) or not all(isinstance(s, str) for s in sub_langs):
-            sub_langs = ["en"]
 
         ydl_opts = {
             "outtmpl": outtmpl,
@@ -327,10 +331,14 @@ class YtDlpEngine:
             "noplaylist": not is_playlist,
             "retries": 10,
             "fragment_retries": 10,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitleslangs": sub_langs,
-            "embedsubs": True,
+            # Subtitles are disabled on purpose: yt-dlp fetches them after
+            # the video completes, and YouTube's timedtext endpoint returns
+            # HTTP 429 aggressively even at low volume. A 429 there aborts
+            # the whole job (and the whole playlist) even though the video
+            # itself downloaded fine. We don't use subtitles, so skip the
+            # fetch entirely.
+            "writesubtitles": False,
+            "writeautomaticsub": False,
             "socket_timeout": 30,
         }
 
@@ -387,14 +395,19 @@ class YtDlpEngine:
             if pp_args:
                 ydl_opts.setdefault("postprocessor_args", {})
                 ydl_opts["postprocessor_args"]["ExtractAudio"] = pp_args
-            for k in ("writesubtitles", "writeautomaticsub", "subtitleslangs", "embedsubs"):
-                ydl_opts.pop(k, None)
         elif tf == "webm":
             ydl_opts["merge_output_format"] = "webm"
             if not format_id:
                 ydl_opts["format"] = ("bestvideo[vcodec^=vp9]+bestaudio[acodec=opus]/"
                                       "bestvideo[ext=webm]+bestaudio[ext=webm]/best")
         elif tf == "mp4":
+            ydl_opts["merge_output_format"] = "mp4"
+        if is_playlist and not format_id and tf not in ("mp3", "flac", "opus", "m4a", "webm"):
+            # Playlist polish: keep the format string as-is, but rank ties
+            # toward avc1/m4a (resolution still wins) and always merge to
+            # mp4 so playlist output plays everywhere. Playlist mode only;
+            # single-video selection is untouched.
+            ydl_opts["format_sort"] = ["res", "vcodec:avc1", "acodec:m4a"]
             ydl_opts["merge_output_format"] = "mp4"
         lim = opts.get("speed_limit_kbps")
         if lim and lim > 0:
@@ -418,6 +431,7 @@ class YtDlpEngine:
             f"executable={sys.executable} "
             f"PATH={os.environ.get('PATH', '')[:500]} "
             f"opts={json.dumps(diag_opts, default=str)[:1500]}")
+        from yt_dlp import YoutubeDL  # lazy: keeps ~100 MB out of idle RAM
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])

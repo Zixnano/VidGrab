@@ -16,6 +16,40 @@ from logging_setup import log, LOG_QUEUE
 
 
 APP_VERSION = "4.0.9"  # single source of truth; keep in sync with extension/manifest.json
+
+
+def _read_install_version():
+    """Real installed version from install-version.txt (written by the
+    updater/installer). Returns "" if the file can't be found or looks wrong.
+    Display only: APP_VERSION above stays untouched for anything that
+    compares against it."""
+    bases = []
+    try:
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).parent
+            bases += [exe_dir, exe_dir.parent]
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                bases.append(Path(meipass))
+        here = Path(__file__).resolve().parent
+        bases += [here, here.parent]
+    except Exception:
+        return ""
+    for base in bases:
+        try:
+            p = base / "install-version.txt"
+            if p.is_file():
+                text = p.read_text(encoding="utf-8", errors="ignore").strip()
+                line = text.splitlines()[0].strip() if text else ""
+                line = line.lstrip("vV")
+                if re.fullmatch(r"[0-9A-Za-z._+-]{1,32}", line):
+                    return line
+        except Exception:
+            continue
+    return ""
+
+
+DISPLAY_VERSION = _read_install_version() or APP_VERSION
 APP_PORT = int(os.environ.get("VIDEOGRABBER_PORT", "5757"))
 # Recording upload size cap (nonce-gated /upload endpoint).
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB

@@ -338,11 +338,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "Video Grabber app isn't running." });
         return;
       }
+      // Forward the site's own cookies (url's origin first, page as
+      // fallback), plus referer and UA, so restricted tweets probe the
+      // same way they download.
+      const cookie = await cookieHeaderFor(msg.url).catch(() => "");
+      const pageCookie = cookie ? "" : await cookieHeaderFor(msg.pageUrl).catch(() => "");
       try {
         const { res, unpaired } = await authedFetch("/probe-formats", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: msg.url }),
+          body: JSON.stringify({
+            url: msg.url,
+            referer: msg.pageUrl || msg.url,
+            cookie: cookie || pageCookie,
+            user_agent: navigator.userAgent,
+          }),
         });
         const data = await res.json().catch(() => ({}));
         sendResponse({ ok: res.ok && !unpaired, formats: data.formats || [],

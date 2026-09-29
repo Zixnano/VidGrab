@@ -18,7 +18,6 @@ from downloader import maybe_convert_to_mp4, _repair_recording, _probe_recording
 from settings import MAX_UPLOAD_BYTES
 import queue
 import html
-from yt_dlp import YoutubeDL
 from settings import APP_PORT, APP_VERSION, STATE, save_settings, safe_filename, guess_filename, _unique_path, _dest_for, stat_for, disk_usage_for
 from jobs import transition, repair_status, JobEvent, JobPhase, set_phase, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks, _fire_show_dialog_hooks
 
@@ -298,7 +297,10 @@ def delete(job_id):
 
 @app.route("/jobs", methods=["GET"])
 def jobs():
-    return jsonify({jid: {k: v for k, v in j.items() if k not in ("pause_evt", "stop_evt")}
+    # cookie is dropped: the GUI never reads it, and shipping every job's
+    # cookie string on each 1 Hz poll bloats the payload and leaks it.
+    return jsonify({jid: {k: v for k, v in j.items()
+                          if k not in ("pause_evt", "stop_evt", "cookie")}
                      for jid, j in list(JOBS.items())})
 
 @app.route("/probe", methods=["POST"])
@@ -309,6 +311,7 @@ def probe():
         return jsonify({"error": "missing url"}), 400
     opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "skip_download": True}
     try:
+        from yt_dlp import YoutubeDL  # lazy: keeps yt-dlp out of idle RAM
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         entries = info.get("entries") or [info]
@@ -325,6 +328,22 @@ def probe():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def _probe_headers(data):
+    """Cookie/Referer/User-Agent from the extension for the format probe.
+    Strings only, CR/LF stripped (no header injection), length-capped."""
+    out = {}
+    for key, name, limit in (("cookie", "Cookie", 32768),
+                             ("referer", "Referer", 2048),
+                             ("user_agent", "User-Agent", 512)):
+        v = data.get(key)
+        if not isinstance(v, str):
+            continue
+        v = v.replace("\r", "").replace("\n", "").strip()[:limit]
+        if v:
+            out[name] = v
+    return out
+
+
 @app.route("/probe-formats", methods=["POST"])
 def probe_formats():
     """Thin wrapper over the engine probe (Session 7)."""
@@ -333,16 +352,26 @@ def probe_formats():
     if not url:
         return jsonify({"error": "no url"}), 400
     from engines import route_for
+    headers = _probe_headers(data)
+    if headers:
+        # Names + shape only: never log full cookie values.
+        parts = []
+        for name, value in sorted(headers.items()):
+            if name == "Cookie":
+                parts.append(f"Cookie(len={len(value)},prefix={value[:8]})")
+            else:
+                parts.append(f"{name}(len={len(value)})")
+        log(f"probe-formats: forwarding headers {', '.join(parts)}")
     formats, last_err = None, None
     for engine in route_for(url):          # probe falls through; download doesn't
         try:
-            formats = engine.probe(url, {})
+            formats = engine.probe(url, {"headers": headers})
             if formats:
                 break
         except Exception as e:
             last_err = e
     if not formats:
-        return jsonify({"error": str(last_err) or "probe failed"}), 500
+        return jsonify({"error": str(last_err) if last_err else "probe failed"}), 500
     # Task 2: formats are already sorted (best-first) by the engine; the
     # cap here is just a sanity ceiling against pathological format lists,
     # not the thing limiting what the user normally sees.

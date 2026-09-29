@@ -217,18 +217,20 @@
     const res = f.resolution || "";
     const ext = f.ext || "";
     const size = f.filesize ? fmtBytes(f.filesize) : "";
-    const kind = !f.vcodec || f.vcodec === "none" ? "audio only" : "";
+    // "none" is yt-dlp's explicit audio-only marker. An unknown vcodec with
+    // a WxH resolution (silent Twitter MP4s) is video, not audio.
+    const kind = (f.vcodec === "none" || (!f.vcodec && !/\d+x\d+/.test(res))) ? "audio only" : "";
     return [res, ext, kind, size].filter(Boolean).join(" · ");
   }
 
   // Probe results cached per URL so reopening the menu doesn't re-hit the app.
   const FORMAT_CACHE = new Map();
-  function probeFormatsCached(url) {
+  function probeFormatsCached(url, pageUrl) {
     if (!url) return Promise.resolve(null);
     if (!FORMAT_CACHE.has(url)) {
       FORMAT_CACHE.set(url, new Promise((resolve) => {
         try {
-          chrome.runtime.sendMessage({ type: "PROBE_FORMATS", url }, (resp) => {
+          chrome.runtime.sendMessage({ type: "PROBE_FORMATS", url, pageUrl: pageUrl || location.href }, (resp) => {
             // Don't cache failures — the app may just be starting up.
             if (chrome.runtime.lastError || !resp || resp.ok === false) {
               FORMAT_CACHE.delete(url);
@@ -267,15 +269,51 @@
     menu.appendChild(el);
   }
 
+  // On X/Twitter feeds location.href is x.com/home, not the tweet. Find the
+  // permalink of the tweet that actually contains this <video>. Other sites:
+  // location.href. On X with no tweet found: "" (callers show an error
+  // instead of silently sending the feed URL).
+  function pageUrlFor(video) {
+    if (!/(^|\.)(x|twitter)\.com$/i.test(location.hostname)) return location.href;
+    const norm = (href) => {
+      try {
+        const p = new URL(href, location.origin).pathname;
+        const m = /^\/([^\/?#]+)\/status\/(\d+)/.exec(p);
+        return m ? `${location.origin}/${m[1]}/status/${m[2]}` : "";
+      } catch (e) { return ""; }
+    };
+    try {
+      const article = video.closest("article");
+      if (article) {
+        // The last timestamp permalink BEFORE the video in document order:
+        // for a quoted tweet's video that is the quoted tweet's own link.
+        let best = "";
+        for (const a of article.querySelectorAll('a[href*="/status/"]')) {
+          if (!a.querySelector("time")) continue;
+          if (!(a.compareDocumentPosition(video) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+          const u = norm(a.getAttribute("href") || "");
+          if (u) best = u;
+        }
+        if (best) return best;
+      }
+    } catch (e) {}
+    return norm(location.pathname); // tweet detail page
+  }
+
   async function handleSendPageUrl(video, overlay, closeMenu, download_playlist = false) {
     if (closeMenu) closeMenu();
+    const pu = pageUrlFor(video);
+    if (!pu) {
+      setLabel(overlay, "Couldn't find tweet link", "#e53935");
+      return;
+    }
     setLabel(overlay, "Sending…");
     const guessName = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
     chrome.runtime.sendMessage(
       {
         type: "RELAY_DOWNLOAD",
-        url: location.href,
-        pageUrl: location.href,
+        url: pu,
+        pageUrl: pu,
         filename: guessName,
         download_playlist: download_playlist,
       },
@@ -585,6 +623,11 @@
                          bypass_dialog = false, download_playlist = false,
                          force_page_url = false } = {}) {
       closeMenu();
+      const pu = pageUrlFor(video);
+      if (force_page_url && !pu) {
+        setLabel(overlay, "Couldn't find tweet link", "#e53935");
+        return;
+      }
       setLabel(overlay, "Sending…");
       let base = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
       // Strip an extension the page title already carries so we never
@@ -600,8 +643,8 @@
         // Normal picks open the app's confirmation dialog (IDM-style);
         // bypass_dialog queues directly.
         type: bypass_dialog ? "RELAY_DOWNLOAD" : "SHOW_ADD_DIALOG",
-        url: force_page_url ? location.href : video.currentSrc,
-        pageUrl: location.href,
+        url: force_page_url ? pu : video.currentSrc,
+        pageUrl: pu || location.href,
         filename: ext ? base + ext : undefined,
         format_id: format_id,
         target_format: target_format,
@@ -660,12 +703,13 @@
           menu.style.display = "flex";
           placeMenu();
           document.addEventListener("click", onDocClick, true);
-          probeFormatsCached(location.href).then((data) => {
+          const pu = pageUrlFor(video);
+          probeFormatsCached(pu, pu).then((data) => {
             if (seq !== menuSeq || !menuOpen) return;
             loadingEl.remove();
             const formats = (data && data.formats) || [];
             if (!formats.length) {
-              const msg = (data && data.error)
+              const msg = !pu ? "Couldn't find tweet link" : (data && data.error)
                 ? `No formats (${data.error})`
                 : "No format list available";
               addMenuItem(fmtBox, msg, { dim: true, header: true });
@@ -680,8 +724,8 @@
                     setLabel(overlay, "Sending…");
                     chrome.runtime.sendMessage({
                       type: "SHOW_ADD_DIALOG",
-                      url: location.href,
-                      pageUrl: location.href,
+                      url: pu,
+                      pageUrl: pu,
                       filename: (document.title || "video")
                         .replace(/[\\/:*?"<>|]/g, "_").slice(0, 80),
                       format_id: f.format_id,

@@ -38,7 +38,7 @@ CONFIG_PATH = HOME / "settings.json"
 
 # Palette-derived (single source of truth: palette.py).
 from palette import resolve_palette
-from settings import CATEGORIES, APP_VERSION, detect_type  # single source of truth: settings.py
+from settings import CATEGORIES, DISPLAY_VERSION, detect_type  # single source of truth: settings.py
 
 _PAL = resolve_palette()
 ACCENT = _PAL["accent"]
@@ -99,11 +99,28 @@ def _status_icon(status):
     return pm
 
 
+_settings_cache = {"mtime": 0, "data": {}}
+
+
 def load_settings():
+    """settings.json, re-parsed only when the file's mtime changes. Returns
+    the cached dict itself: callers must treat it as read-only."""
     try:
-        return json.loads(CONFIG_PATH.read_text())
-    except Exception:
+        mtime = CONFIG_PATH.stat().st_mtime_ns  # ns: quick Windows saves still invalidate
+    except OSError:
         return {}
+    if mtime == _settings_cache["mtime"]:
+        return _settings_cache["data"]
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except Exception:
+        data = {}
+    # data first, mtime second: a reader on another thread that sees the
+    # new data with the old mtime just re-reads once; the reverse order
+    # could hand it stale data under a fresh mtime.
+    _settings_cache["data"] = data
+    _settings_cache["mtime"] = mtime
+    return data
 
 
 def load_token():
@@ -260,6 +277,26 @@ class ApiClient:
         self._req("POST", "/settings", json={key: value})
 
 
+# Which table columns each job field feeds (see DownloadModel.data). Used by
+# update_items() so a progress tick repaints only the columns that changed.
+_FIELD_COLS = {
+    "filename": (0,), "status": (0, 2, 4, 6), "size_total": (1, 2),
+    "size_done": (2,), "phase": (2, 4), "conversion_progress": (2,),
+    "converting_fmt": (4,), "speed": (3,), "category": (5,),
+    "completed_ts": (6,), "created_ts": (6,),
+}
+
+
+def _changed_cols(a, b):
+    """(first, last) column span touched by differences between two job
+    dicts, or None when no displayed field differs."""
+    cols = set()
+    for k, mapped in _FIELD_COLS.items():
+        if a.get(k) != b.get(k):
+            cols.update(mapped)
+    return (min(cols), max(cols)) if cols else None
+
+
 class DownloadModel(QAbstractTableModel):
     HEADERS = ["Name", "Size", "Progress", "Speed", "Status", "Category", "Completed"]
 
@@ -272,6 +309,27 @@ class DownloadModel(QAbstractTableModel):
         self.beginResetModel()
         self.items = items
         self.endResetModel()
+
+    def update_items(self, items):
+        """Incremental refresh. Same rows in the same order -> swap the data
+        and emit dataChanged for only the rows whose values changed (keeps
+        scroll position, selection and hover; no full repaint). Anything
+        else (filter, sort, add/remove) falls back to a full reset."""
+        old = self.items
+        if (len(old) != len(items)
+                or any(a.get("id") != b.get("id") for a, b in zip(old, items))):
+            self.set_items(items)
+            return
+        self.items = items
+        last_col = self.columnCount() - 1
+        for r, (a, b) in enumerate(zip(old, items)):
+            if a is b or a == b:
+                continue
+            span = _changed_cols(a, b)
+            if span:
+                self.dataChanged.emit(self.index(r, span[0]), self.index(r, span[1]))
+        if items:
+            self.headerDataChanged.emit(Qt.Horizontal, 0, last_col)
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.items)
@@ -353,7 +411,11 @@ class DownloadModel(QAbstractTableModel):
 
     def flags(self, index):
         base = super().flags(index)
-        if index.isValid():
+        # Only finished jobs can be dragged out (to Discord/Explorer). Qt
+        # skips non-draggable rows in a mixed selection, so dragging a mix
+        # of done and pending rows carries just the done ones.
+        if (index.isValid() and index.row() < len(self.items)
+                and self.items[index.row()].get("status") == "done"):
             return base | Qt.ItemIsDragEnabled
         return base
 
@@ -389,6 +451,29 @@ def _path_for(job):
     return cat_dir / name
 
 
+def _copy_files_to_clipboard(jobs):
+    """Put finished files on the clipboard so Ctrl+V pastes the actual file
+    into Explorer/Discord/Slack. Qt maps text/uri-list to CF_HDROP on
+    Windows itself. Returns the number of files copied."""
+    urls = []
+    for j in jobs:
+        if j.get("status") != "done":
+            continue
+        try:
+            p = _path_for(j)
+            if p.exists():
+                urls.append(QUrl.fromLocalFile(str(p)))
+        except Exception:
+            continue
+    if not urls:
+        return 0
+    mime = QMimeData()
+    mime.setUrls(urls)
+    mime.setText("\n".join(u.toLocalFile() for u in urls))
+    QApplication.clipboard().setMimeData(mime)
+    return len(urls)
+
+
 def _progress_pct(job):
     """Numeric progress straight from the job dict (no string parsing):
     conversion progress while converting, otherwise size_done/size_total
@@ -403,12 +488,14 @@ class ProgressDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
         # 12.2: per-row interpolation toward the newest value over 100 ms.
-        self._shown = {}  # row -> [from_value, to_value, QElapsedTimer]
+        self._shown = {}  # job id -> [from_value, to_value, QElapsedTimer]
         self.animations_enabled = True  # 12.5: refreshed by MainWindow
 
     def _animated_pct(self, row, target):
         entry = self._shown.get(row)
         if entry is None:
+            if len(self._shown) > 2000:
+                self._shown.clear()  # long sessions: bound the cache
             timer = QElapsedTimer()
             timer.start()
             self._shown[row] = [target, target, timer]
@@ -430,7 +517,9 @@ class ProgressDelegate(QStyledItemDelegate):
             return
         job = index.model().items[index.row()]
         converting = job.get("phase") == "converting"
-        pct = self._animated_pct(index.row(), _progress_pct(job))
+        # Keyed by job id, not row index: rows shift when jobs are added or
+        # filtered, and a row-keyed cache animated the wrong job's bar.
+        pct = self._animated_pct(job.get("id", index.row()), _progress_pct(job))
         painter.save()
         rect = option.rect.adjusted(6, 14, -6, -14)
         if rect.height() < 4:
@@ -1571,11 +1660,19 @@ def _fade_widget(widget, enabled, duration=150):
     anim.start(QAbstractAnimation.DeleteWhenStopped)
 
 
+_DIALOG_FADE_DONE = False
+
+
 def _fade_dialog(dialog, enabled, duration=120):
     """Opacity fade for dialogs (Session 12.3). The dialog's own event loop
-    (exec) keeps the animation running; no-op when animations are off."""
-    if not enabled:
+    (exec) keeps the animation running; no-op when animations are off.
+    Dialogs are built fresh on every open, so a per-instance flag would never
+    skip anything: only the first dialog of the session fades, the rest
+    appear instantly."""
+    global _DIALOG_FADE_DONE
+    if not enabled or _DIALOG_FADE_DONE:
         return
+    _DIALOG_FADE_DONE = True
     dialog.setWindowOpacity(0.0)
     anim = QPropertyAnimation(dialog, b"windowOpacity", dialog)
     anim.setDuration(duration)
@@ -1638,7 +1735,7 @@ class MainWindow(QMainWindow):
         self._anim_timer.timeout.connect(self._tick_animations)
         self._anim_timer.start()
         self._sort_ascending = True
-        self.setWindowTitle(f"Video Grabber v{APP_VERSION}")
+        self.setWindowTitle(f"Video Grabber v{DISPLAY_VERSION}")
         self.resize(1200, 760)
         self.setMinimumSize(880, 560)
         self._build_ui()
@@ -1921,7 +2018,7 @@ class MainWindow(QMainWindow):
         self.diskspace_label.setObjectName("DiskSpaceLabel")
         self.diskspace_label.setToolTip("Free space on the downloads drive")
         status.addPermanentWidget(self.diskspace_label)
-        status.addPermanentWidget(QLabel(f"v{APP_VERSION} · PySide6 · Flask API"))
+        status.addPermanentWidget(QLabel(f"v{DISPLAY_VERSION} · PySide6 · Flask API"))
         self.setStatusBar(status)
         menu = self.menuBar()
         menu.setNativeMenuBar(False)
@@ -2153,7 +2250,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "About Video Grabber",
             f"<h3 style='margin-bottom:2px;'>Video Grabber</h3>"
-            f"<p style='color:{MUTED};margin-top:0;'>Version {APP_VERSION}</p>"
+            f"<p style='color:{MUTED};margin-top:0;'>Version {DISPLAY_VERSION}</p>"
             f"<p>A personal video downloader — a Chrome/Vivaldi extension "
             f"paired with this desktop app, built on yt-dlp and Streamlink.</p>"
             f"<p style='color:{MUTED};font-size:11px;'>PySide6 · Flask · {BACKEND_BASE}</p>")
@@ -2218,7 +2315,7 @@ class MainWindow(QMainWindow):
         if not payload.get("staged"):
             QMessageBox.information(
                 self, "Check for updates",
-                f"You're already on the latest version.\n\nCurrent: v{APP_VERSION}")
+                f"You're already on the latest version.\n\nCurrent: v{DISPLAY_VERSION}")
             return
         # Update staged — the bat is already waiting for us to exit.
         answer = QMessageBox.question(
@@ -2323,7 +2420,7 @@ class MainWindow(QMainWindow):
             src = sorted(src, key=sort_key, reverse=not self._sort_ascending)
         else:
             src = sorted(src, key=lambda x: -x.get("created_ts", 0))
-        self.model.set_items(src)
+        self.model.update_items(src)
 
     def select_category(self, name):
         self.current_filter = name
@@ -2444,15 +2541,21 @@ class MainWindow(QMainWindow):
         conv_actions = {conv_menu.addAction(f): f for f in ["mp4", "mkv", "mp3", "wav", "m4a", "flac", "opus"]}
         m.addSeparator()
         a_remove = m.addAction("Remove")
+        a_copy_file = m.addAction("Copy file")
         a_copy_url = m.addAction("Copy URL")
         a_props = m.addAction("Properties")
         a_open.setEnabled(j["status"] == "done")
         a_open_folder.setEnabled(j["status"] == "done")
         a_open_location.setEnabled(j["status"] == "done")
+        a_copy_file.setEnabled(j["status"] == "done")
         a_resume.setEnabled(j["status"] in ("paused", "stopped"))
         a_stop.setEnabled(j["status"] in ("downloading", "queued"))
         a_redl.setEnabled(j["status"] in ("done", "error", "stopped"))
         chosen = m.exec(self.table.viewport().mapToGlobal(pos))
+        # Re-look-up the row now: a refresh may have replaced it while the
+        # menu was open, so every handler below reads the fresh dict.
+        j = next((x for x in self.model.items
+                  if x["id"] == self._current_ctx), j)
         if chosen == a_open:
             self._ctx_open()
         elif chosen == a_open_folder:
@@ -2478,6 +2581,15 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Convert", str(e))
         elif chosen == a_remove:
             self._ctx_remove()
+        elif chosen == a_copy_file:
+            # Right-clicked row is part of a multi-selection -> copy all the
+            # selected finished files; otherwise just this one.
+            picked = self._selected_rows()
+            if not any(x["id"] == self._current_ctx for x in picked):
+                picked = [j]
+            if not _copy_files_to_clipboard(picked):
+                QMessageBox.information(self, "Copy file",
+                                        "The file no longer exists on disk.")
         elif chosen == a_copy_url:
             QApplication.clipboard().setText(j.get("url", ""))
         elif chosen == a_props:
