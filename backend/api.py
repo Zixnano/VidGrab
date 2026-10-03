@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -166,7 +167,14 @@ def show_add_dialog():
     url = data.get("url")
     if not url:
         return jsonify({"error": "missing url"}), 400
-    if STATE.get("skip_add_dialog"):
+    # Session D: a playlist request goes to the picker. The auto-queue branch
+    # is skipped for it - there is nothing to queue until items are picked,
+    # and queueing the URL would recreate the one-row-for-many-files job. An
+    # older extension still sending download_playlist lands here too.
+    pick = bool(data.get("pick_playlist") or data.get("download_playlist"))
+    if pick:
+        log("show-add-dialog: playlist picker requested")
+    if STATE.get("skip_add_dialog") and not pick:
         jid = new_job(
             url, filename=data.get("filename"),
             category=data.get("category"),
@@ -187,6 +195,7 @@ def show_add_dialog():
         "format_id": data.get("format_id"),
         "target_format": data.get("target_format"),
         "download_playlist": data.get("download_playlist", False),
+        "pick_playlist": pick,
     })
     return jsonify({"ok": True, "auto_queued": False})
 
@@ -195,19 +204,41 @@ def batch():
     data = request.get_json(force=True, silent=True) or {}
     items = data.get("items", [])
     ids = []
+    deferred_save = False
+    batch_ts = time.time()  # one timestamp for a whole playlist batch
     for it in items:
         if not it.get("url"):
             continue
+        # Session D: playlist-picker items carry playlist_* fields. Those
+        # batches skip the per-job snapshot (one save after the loop) and
+        # share created_ts so the table can show them in playlist order.
+        pid = it.get("playlist_id")
+        pl = {}
+        if pid:
+            idx = it.get("playlist_index")
+            pl = {
+                "playlist_id": str(pid)[:200],
+                "playlist_title": str(it.get("playlist_title") or "")[:300] or None,
+                "playlist_index": idx if isinstance(idx, int) and not isinstance(idx, bool) else None,
+                "playlist_url": str(it.get("playlist_url") or "")[:2000] or None,
+                "snapshot": False,
+                "created_ts": batch_ts,
+            }
+            deferred_save = True
         ids.append(new_job(
             it["url"], filename=it.get("filename"),
             category=it.get("category"),
             referer=data.get("referer"), cookie=data.get("cookie"),
             user_agent=data.get("user_agent"),
+            job_type=it.get("type"),
             format_id=it.get("format_id"),
             target_format=it.get("target_format"),
             resolution=it.get("resolution"), multi=bool(it.get("multi")),
             download_playlist=it.get("download_playlist", data.get("download_playlist", False)),
+            **pl,
         ))
+    if deferred_save:
+        save_jobs_snapshot()
     return jsonify({"job_ids": ids})
 
 def _job_action(job_id, action):
@@ -303,31 +334,6 @@ def jobs():
                           if k not in ("pause_evt", "stop_evt", "cookie")}
                      for jid, j in list(JOBS.items())})
 
-@app.route("/probe", methods=["POST"])
-def probe():
-    data = request.get_json(force=True, silent=True) or {}
-    url = data.get("url")
-    if not url:
-        return jsonify({"error": "missing url"}), 400
-    opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "skip_download": True}
-    try:
-        from yt_dlp import YoutubeDL  # lazy: keeps yt-dlp out of idle RAM
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        entries = info.get("entries") or [info]
-        out = []
-        for e in entries[:200]:
-            if not e:
-                continue
-            out.append({
-                "url": e.get("url") or e.get("webpage_url") or url,
-                "title": e.get("title") or "untitled",
-                "duration": e.get("duration"),
-            })
-        return jsonify({"items": out})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 def _probe_headers(data):
     """Cookie/Referer/User-Agent from the extension for the format probe.
     Strings only, CR/LF stripped (no header injection), length-capped."""
@@ -344,6 +350,76 @@ def _probe_headers(data):
     return out
 
 
+def _log_probe_headers(tag, headers):
+    """Names + shape only: never log full cookie values."""
+    if not headers:
+        return
+    parts = []
+    for name, value in sorted(headers.items()):
+        if name == "Cookie":
+            parts.append(f"Cookie(len={len(value)},prefix={value[:8]})")
+        else:
+            parts.append(f"{name}(len={len(value)})")
+    log(f"{tag}: forwarding headers {', '.join(parts)}")
+
+
+def _probe_int(data, key, default):
+    """Optional integer request field. Returns (value, ok); bool, float and
+    string values are rejected rather than coerced."""
+    v = data.get(key)
+    if v is None:
+        return default, True
+    if isinstance(v, bool) or not isinstance(v, int):
+        return default, False
+    return v, True
+
+
+def _probe_error(message, code, status):
+    return jsonify({"error": message, "code": code}), status
+
+
+@app.route("/probe", methods=["POST"])
+def probe():
+    """Playlist/single-video item list (Session D). Request: url, optional
+    start/limit and cookie/referer/user_agent. See engines.probe_playlist."""
+    data = request.get_json(force=True, silent=True) or {}
+    url = data.get("url")
+    if not url or not isinstance(url, str):
+        return _probe_error("missing url", "missing_url", 400)
+    url = url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return _probe_error("not an http(s) URL", "bad_url", 400)
+    start, ok_start = _probe_int(data, "start", 0)
+    limit, ok_limit = _probe_int(data, "limit", 200)
+    if not (ok_start and ok_limit):
+        return _probe_error("start and limit must be integers", "bad_params", 400)
+    start = max(0, start)
+    limit = max(1, min(1000, limit))
+    if "yt-dlp" in (STATE.get("engines_disabled") or []):
+        return _probe_error("yt-dlp engine is disabled in settings",
+                            "engine_disabled", 503)
+    from engines import probe_playlist, PlaylistProbeError
+    headers = _probe_headers(data)
+    _log_probe_headers("probe", headers)
+    try:
+        result = probe_playlist(url, headers, start, limit)
+    except PlaylistProbeError as e:
+        log(f"probe: failed ({e.code}): {e}")
+        return _probe_error(str(e), e.code, e.status)
+    except Exception as e:
+        log(f"probe: failed (extractor_error): {e}")
+        return _probe_error(str(e), "extractor_error", 500)
+    if result["is_playlist"]:
+        pl = result["playlist"]
+        log(f"probe: {url} -> playlist '{pl['title']}', "
+            f"{len(result['items'])} item(s)"
+            + (", truncated" if result["truncated"] else ""))
+    else:
+        log(f"probe: {url} -> single video")
+    return jsonify(result)
+
+
 @app.route("/probe-formats", methods=["POST"])
 def probe_formats():
     """Thin wrapper over the engine probe (Session 7)."""
@@ -353,15 +429,7 @@ def probe_formats():
         return jsonify({"error": "no url"}), 400
     from engines import route_for
     headers = _probe_headers(data)
-    if headers:
-        # Names + shape only: never log full cookie values.
-        parts = []
-        for name, value in sorted(headers.items()):
-            if name == "Cookie":
-                parts.append(f"Cookie(len={len(value)},prefix={value[:8]})")
-            else:
-                parts.append(f"{name}(len={len(value)})")
-        log(f"probe-formats: forwarding headers {', '.join(parts)}")
+    _log_probe_headers("probe-formats", headers)
     formats, last_err = None, None
     for engine in route_for(url):          # probe falls through; download doesn't
         try:

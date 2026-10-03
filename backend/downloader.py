@@ -18,7 +18,7 @@ from settings import (STATE, load_settings, save_settings, safe_filename, _uniqu
                       effective_speed_limit_kbps, LIMITER, get_shutdown_pending,
                       set_shutdown_pending)
 from jobs import (JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks,
-                  transition, JobEvent, JobPhase, set_phase)
+                  transition, JobEvent, JobPhase, set_phase, resolve_playlist_dir)
 from logging_setup import log, LOG_QUEUE
 
 
@@ -79,6 +79,23 @@ def maybe_extract_archive(job, dest):
         log(f"extracted {dest.name} → {out.name}/")
     except Exception as e:
         log(f"auto-extract failed for {dest.name}: {e}")
+
+
+def _playlist_group_pending(job):
+    """True while another job from the same playlist batch is still waiting
+    or running. Open-folder and the completion sound fire once per batch (on
+    the last item), not once per item. Jobs without a playlist_id are never
+    grouped."""
+    pid = job.get("playlist_id")
+    if not pid:
+        return False
+    for other in list(JOBS.values()):
+        if other is job:
+            continue
+        if (other.get("playlist_id") == pid
+                and other.get("status") in ("queued", "downloading", "paused", "held")):
+            return True
+    return False
 
 
 def maybe_open_folder(dest):
@@ -597,6 +614,7 @@ def run_ytdlp(job_id):
     opts = {"headers": headers,
             "job_id": job_id,
             "download_playlist": job.get("download_playlist", False),
+            "playlist_item": bool(job.get("playlist_id")),
             "target_format": (job.get("target_format") or "").lower(),
             "speed_limit_kbps": effective_speed_limit_kbps()}
     transition(job, JobEvent.START)
@@ -614,13 +632,19 @@ def run_ytdlp(job_id):
         transition(job, JobEvent.COMPLETE)
         job["completed_ts"] = time.time()
         log(f"job {job_id}: complete ✓ ({job['filename']})")
+        if job.get("download_playlist"):
+            # Legacy whole-playlist job: remember which folder it wrote into
+            # so the GUI's Open can find it.
+            job["playlist_dir"] = resolve_playlist_dir(job)
         try:
             d = stat_for(job)
             if d.exists():
                 record_stat(job["size_done"])
                 scan_file(d)
-                maybe_open_folder(d)
-                maybe_play_sound()
+                # D3: once per playlist batch, on the last item.
+                if not _playlist_group_pending(job):
+                    maybe_open_folder(d)
+                    maybe_play_sound()
         except Exception:
             pass
         maybe_shutdown_if_idle()

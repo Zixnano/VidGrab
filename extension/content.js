@@ -16,8 +16,9 @@
   const RECORDERS = new WeakMap();
 
   // Playlist support: a YouTube watch URL carrying &list=... can be sent
-  // as a single video or as the whole playlist (the backend decides via
-  // the download_playlist flag; list= stays in the URL on purpose).
+  // as a single video, or to the app's playlist picker (pick_playlist) where
+  // the user chooses items; each becomes its own job. list= stays in the
+  // URL on purpose.
   function isPlaylistUrl(url) {
     try {
       const u = new URL(url);
@@ -621,7 +622,7 @@
 
     function sendChoice({ format_id = null, target_format = null,
                          bypass_dialog = false, download_playlist = false,
-                         force_page_url = false } = {}) {
+                         force_page_url = false, pick_playlist = false } = {}) {
       closeMenu();
       const pu = pageUrlFor(video);
       if (force_page_url && !pu) {
@@ -649,6 +650,7 @@
         format_id: format_id,
         target_format: target_format,
         download_playlist: download_playlist,
+        pick_playlist: pick_playlist,
       };
       chrome.runtime.sendMessage(payload, (resp) => {
         if (chrome.runtime.lastError) {
@@ -678,11 +680,11 @@
     if (isPlaylistUrl(location.href)) {
       // On YouTube (and any extractor site), video.currentSrc is a blob:
       // URL that yt-dlp can't fetch. The playlist entries are always the
-      // PAGE URL — yt-dlp walks the &list= param itself.
+      // PAGE URL. The picker lists the playlist and queues one job per item.
       addMenuItem(menu, "Download this video only", {},
         () => sendChoice({ download_playlist: false, force_page_url: true }));
-      addMenuItem(menu, "Download entire playlist", {},
-        () => sendChoice({ download_playlist: true, force_page_url: true }));
+      addMenuItem(menu, "Pick playlist items\u2026", {},
+        () => sendChoice({ pick_playlist: true, force_page_url: true }));
       addDivider(menu);
     }
 

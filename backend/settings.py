@@ -390,9 +390,15 @@ def disk_usage_for(path=None):
 
 
 def _dest_for(job):
+    # NOTE: gui_qt._path_for mirrors this logic - keep the two in sync.
     override = STATE.get("per_category_dirs", {}).get(job["category"])
     base = Path(override) if override else Path(STATE["output_dir"])
     cat_dir = base if override else base / job["category"]
+    # Session D: per-item playlist jobs land in <category>/<subdir>/. subdir
+    # is a real path component (not the legacy playlist_dir display hint).
+    sub = job.get("subdir")
+    if sub:
+        cat_dir = cat_dir / safe_filename(sub)
     return cat_dir / safe_filename(job["filename"])
 
 

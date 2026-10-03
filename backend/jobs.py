@@ -132,16 +132,89 @@ def _migrate_job(j):
         "size_total": 0, "size_done": 0, "speed": "", "error": None,
         "referer": None, "cookie": None, "user_agent": None,
         "created_ts": time.time(),
+        # Session D. Deliberately NOT defaulted: "subdir" and "playlist_dir"
+        # (playlist_dir's absence is what marks "not probed yet").
+        "download_playlist": False,
+        "playlist_id": None, "playlist_title": None,
+        "playlist_index": None, "playlist_url": None,
     }
     for k, v in defaults.items():
         j.setdefault(k, v)
     return j
 
 
+_PLAYLIST_FILE_RE = re.compile(r"^\d{3,} - ")
+
+
+def resolve_playlist_dir(job):
+    """Find the playlist folder a legacy whole-playlist job wrote into.
+
+    Returns the folder name, or "" when there is not exactly one candidate
+    (ambiguity resolves to "open the category folder", never to a guess).
+    Candidate = immediate subfolder of the job's category dir holding a file
+    named like "NNN - ..." modified inside this job's time window."""
+    try:
+        cat_dir = settings._dest_for(job).parent
+        if not cat_dir.is_dir():
+            return ""
+        lo = (job.get("created_ts") or 0) - 60
+        done_ts = job.get("completed_ts")
+        hi = (done_ts + 300) if done_ts else None
+        found = []
+        for sub in cat_dir.iterdir():
+            if not sub.is_dir():
+                continue
+            hit = False
+            for i, f in enumerate(sub.iterdir()):
+                if i > 5000:
+                    break
+                if not _PLAYLIST_FILE_RE.match(f.name):
+                    continue
+                try:
+                    m = f.stat().st_mtime
+                except OSError:
+                    continue
+                if m >= lo and (hi is None or m <= hi):
+                    hit = True
+                    break
+            if hit:
+                found.append(sub.name)
+        return found[0] if len(found) == 1 else ""
+    except Exception as e:
+        log(f"playlist folder lookup failed for job {job.get('id')}: {e}")
+        return ""
+
+
+def _is_legacy_playlist_job(j):
+    # Before Session D, download_playlist=True meant one job that walks a whole
+    # playlist. Session D queues playlists as one job per item
+    # (download_playlist=False, playlist_id set). download_playlist=True now
+    # appears only on pre-Session-D jobs and on jobs made with "Legacy
+    # whole-playlist mode" or by API callers - all share the batch-1 layout.
+    return bool(j.get("download_playlist")) and not j.get("playlist_id")
+
+
+def _migrate_playlist_dir(job):
+    """One-shot: resolve the playlist folder for a legacy playlist job so the
+    GUI can open it. Returns True when the job changed (caller saves once)."""
+    if not _is_legacy_playlist_job(job) or "playlist_dir" in job:
+        return False
+    if job.get("status") not in ("done", "stopped", "error"):
+        return False
+    name = resolve_playlist_dir(job)
+    job["playlist_dir"] = name
+    if name:
+        log(f"migrated playlist folder: job {job.get('id')} -> {name!r}")
+    else:
+        log(f"playlist folder not resolved for job {job.get('id')}")
+    return True
+
+
 def load_jobs_snapshot():
     if settings.JOBS_PATH.exists():
         try:
             snap = json.loads(settings.JOBS_PATH.read_text())
+            migrated = False
             for jid, j in snap.items():
                 j["pause_evt"] = threading.Event()
                 j["stop_evt"] = threading.Event()
@@ -150,6 +223,10 @@ def load_jobs_snapshot():
                     repair_status(j, "stopped")
                 JOBS[jid] = j
                 _migrate_extensionless(j)
+                if _migrate_playlist_dir(j):
+                    migrated = True
+            if migrated:
+                save_jobs_snapshot()
             global JOB_COUNTER
             JOB_COUNTER = max([int(k) for k in JOBS.keys()] + [0])
         except Exception as e:
@@ -174,9 +251,20 @@ def _resolution_suffix(resolution):
     return re.sub(r"[^0-9A-Za-z]+", "", res)
 
 
+def _playlist_subdir(title):
+    """Folder name for a playlist's items: filesystem-safe, <= 60 chars,
+    no trailing dots/spaces, "Playlist" when nothing usable is left."""
+    if not str(title or "").strip():
+        return "Playlist"
+    name = safe_filename(str(title))[:60].rstrip(". ")
+    return name or "Playlist"
+
+
 def new_job(url, filename=None, category=None, referer=None, cookie=None,
             user_agent=None, job_type=None, format_id=None, target_format=None,
-            resolution=None, multi=False, download_playlist=False, defer=False):
+            resolution=None, multi=False, download_playlist=False, defer=False,
+            playlist_id=None, playlist_title=None, playlist_index=None,
+            playlist_url=None, snapshot=True, created_ts=None):
     log(f"new_job: filename={filename!r} url_basename={guess_filename(url)!r}")
     jid = next_job_id()
     jtype = job_type or detect_type(url)
@@ -222,30 +310,42 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
                 job_cat = rule["category"]
             break
 
+    # Session D: per-item playlist jobs get their own folder under the
+    # category dir (consumed only by settings._dest_for).
+    subdir = _playlist_subdir(playlist_title) if playlist_title else None
     JOBS[jid] = {
         "id": jid, "url": url, "filename": fname,
         "category": job_cat,
         "type": jtype, "status": "held" if defer else "queued", "phase": "idle",
         "format_id": format_id, "target_format": target_format,
         "download_playlist": download_playlist,
+        "playlist_id": playlist_id, "playlist_title": playlist_title,
+        "playlist_index": playlist_index, "playlist_url": playlist_url,
         "completed_ts": None,
         "size_total": 0, "size_done": 0, "speed": "", "error": None,
         "referer": referer, "cookie": cookie, "user_agent": user_agent,
-        "created_ts": time.time(),
+        "created_ts": created_ts if created_ts is not None else time.time(),
         "pause_evt": threading.Event(), "stop_evt": threading.Event(),
     }
+    if subdir:
+        JOBS[jid]["subdir"] = subdir
+    if playlist_id:
+        log(f"new_job: playlist item {playlist_index} of {playlist_id!r} "
+            f"-> subdir {subdir!r}")
     ext = os.path.splitext(fname)[1].lstrip(".").lower()
     if ext and STATE.get("file_types_overrides", {}).get(ext) is False:
         JOBS[jid]["status"] = "skipped"
         log(f"job {jid}: skipped — '.{ext}' is disabled in Options → File Types")
-        save_jobs_snapshot()
+        if snapshot:
+            save_jobs_snapshot()
         return jid
     if settings.get_shutdown_pending():
         os.system("shutdown /a")
         settings.set_shutdown_pending(False)
         log("Scheduled shutdown cancelled — new job queued")
     log(f"job {jid} {'held (deferred)' if defer else 'queued'}: {fname}")
-    save_jobs_snapshot()
+    if snapshot:
+        save_jobs_snapshot()
     _fire_new_job_hooks(JOBS[jid])
     return jid
 

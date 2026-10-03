@@ -387,6 +387,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             format_id: msg.format_id || null,
             target_format: msg.target_format || null,
             download_playlist: msg.download_playlist || false,
+            pick_playlist: msg.pick_playlist || false,
           }),
         });
         if (unpaired) {

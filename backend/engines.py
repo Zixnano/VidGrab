@@ -5,6 +5,7 @@ logic that lived in downloader.run_ytdlp and api.probe_formats — behavior
 must be identical. StreamlinkEngine arrives in Session 8.
 """
 import glob
+import hashlib
 import os
 import json
 import re
@@ -16,7 +17,7 @@ import traceback
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 from typing import Callable, Optional, Protocol
 
 from logging_setup import log
@@ -314,13 +315,18 @@ class YtDlpEngine:
         # playlist index + video title so each item lands in its own file.
         # %(playlist_index)03d zero-pads to 3 digits so files sort correctly
         # in Explorer (1, 2, ..., 10 instead of 1, 10, 2, ...).
+        # yt-dlp treats "%" in outtmpl as a format spec, so a literal "%" in
+        # the folder or file stem ("100% Real") must be doubled. Applies to
+        # dest.parent too: per-item playlist jobs put the playlist title in
+        # the folder name. The post-download glob below keeps the raw stem.
+        parent_t = str(dest.parent).replace("%", "%%")
         if is_playlist:
             # Each playlist gets its own subfolder named after the playlist
             # (falls back to "Playlist" when yt-dlp has no title for it).
-            outtmpl = str(dest.parent / "%(playlist_title|Playlist)s"
-                          / "%(playlist_index)03d - %(title)s.%(ext)s")
+            outtmpl = (parent_t + os.sep + "%(playlist_title|Playlist)s"
+                       + os.sep + "%(playlist_index)03d - %(title)s.%(ext)s")
         else:
-            outtmpl = str(dest.parent / (dest.stem + ".%(ext)s"))
+            outtmpl = parent_t + os.sep + dest.stem.replace("%", "%%") + ".%(ext)s"
 
         ydl_opts = {
             "outtmpl": outtmpl,
@@ -402,7 +408,9 @@ class YtDlpEngine:
                                       "bestvideo[ext=webm]+bestaudio[ext=webm]/best")
         elif tf == "mp4":
             ydl_opts["merge_output_format"] = "mp4"
-        if is_playlist and not format_id and tf not in ("mp3", "flac", "opus", "m4a", "webm"):
+        # Session D (O1): per-item playlist jobs queued by the picker rank
+        # formats the same way whole-playlist downloads did.
+        if (is_playlist or opts.get("playlist_item")) and not format_id and tf not in ("mp3", "flac", "opus", "m4a", "webm"):
             # Playlist polish: keep the format string as-is, but rank ties
             # toward avc1/m4a (resolution still wins) and always merge to
             # mp4 so playlist output plays everywhere. Playlist mode only;
@@ -453,6 +461,183 @@ class YtDlpEngine:
                    if m.is_file() and not m.name.endswith(".part")]
         real = max(matches, key=lambda p: p.stat().st_size) if matches else dest
         return Path(real)
+
+
+# ---------------------------------------------------------------------------
+# Playlist probe (Session D). Module-level, NOT on the Engine Protocol: the
+# Protocol returns format lists and Streamlink has no playlist notion.
+# Headers are forwarded through http_headers only; nothing is written to
+# disk for authentication.
+# ---------------------------------------------------------------------------
+class PlaylistProbeError(Exception):
+    """probe_playlist failure carrying the HTTP status and code /probe returns."""
+
+    def __init__(self, message, status=500, code="extractor_error"):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_UNAVAILABLE_TITLES = ("[private video]", "[deleted video]")
+_AUTH_HINTS = ("private video", "private playlist", "this playlist is private",
+               "sign in", "log in", "login required", "requires authentication",
+               "members-only", "members only")
+_MISSING_HINTS = ("does not exist", "not found", "unavailable", "404",
+                  "has been removed", "no longer available")
+
+
+def _classify_probe_error(msg):
+    """Best-effort (status, code) from a yt-dlp error message."""
+    low = (msg or "").lower()
+    if "timed out" in low or "timeout" in low:
+        return 504, "timeout"
+    if any(h in low for h in _AUTH_HINTS):
+        return 403, "auth_required"
+    if any(h in low for h in _MISSING_HINTS):
+        return 404, "playlist_unavailable"
+    return 500, "extractor_error"
+
+
+def _is_youtube_host(host):
+    host = (host or "").lower()
+    return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+
+
+def _canonical_probe_url(url):
+    """YouTube URLs carrying list= become playlist?list=<id> so a
+    watch?v=X&list=Y URL probes as the playlist. Mix playlists (RD...) are
+    generated per video and only resolve through their watch URL, so those
+    keep the original URL."""
+    try:
+        u = urlparse(url)
+        if _is_youtube_host(u.hostname) and u.hostname != "youtu.be":
+            lid = (parse_qs(u.query).get("list") or [""])[0]
+            if lid and not lid.startswith("RD"):
+                return "https://www.youtube.com/playlist?list=" + lid
+    except Exception:
+        pass
+    return url
+
+
+def _as_int_or_none(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    return None
+
+
+def probe_playlist(url, headers=None, start=0, limit=200):
+    """List the items of a playlist (or the single item of a video URL)
+    without downloading anything. Flat extraction: one request per ~100
+    entries instead of one extractor run per entry. Returns the /probe
+    response dict; raises PlaylistProbeError on failure."""
+    start = max(0, int(start))
+    limit = max(1, min(1000, int(limit)))
+    probe_url = _canonical_probe_url(url)
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "socket_timeout": 20,
+        # Ask for one entry past the page: seeing it is how we know the
+        # list was truncated, without walking the whole playlist.
+        "playlist_items": f"{start + 1}:{start + limit + 1}",
+    }
+    if headers:
+        ydl_opts["http_headers"] = dict(headers)
+    js_rt = find_js_runtime()
+    if js_rt:
+        ydl_opts["js_runtimes"] = js_rt
+    from yt_dlp import YoutubeDL  # lazy: keeps ~100 MB out of idle RAM
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(probe_url, download=False)
+            raw = None
+            if info and (info.get("_type") == "playlist" or "entries" in info):
+                # list() inside the try: entries can be lazy and raise here.
+                raw = list(info.get("entries") or [])
+    except Exception as e:
+        msg = _ANSI_RE.sub("", str(e)).strip() or e.__class__.__name__
+        status, code = _classify_probe_error(msg)
+        raise PlaylistProbeError(msg, status, code) from e
+    if not info:
+        raise PlaylistProbeError("no information returned", 500, "extractor_error")
+
+    page_host = urlparse(probe_url).hostname
+    is_yt = _is_youtube_host(page_host)
+
+    if raw is None:
+        # Single video: one item, no playlist object.
+        return {
+            "is_playlist": False,
+            "playlist": None,
+            "start": start,
+            "limit": limit,
+            "truncated": False,
+            "items": [{
+                "index": 1,
+                "id": info.get("id"),
+                "url": info.get("webpage_url") or url,
+                "title": info.get("title") or "untitled",
+                "duration": _as_int_or_none(info.get("duration")),
+                "uploader": info.get("uploader") or None,
+                "available": True,
+            }],
+        }
+
+    truncated = len(raw) > limit
+    items = []
+    for pos, e in enumerate(raw[:limit]):
+        if not e:
+            continue  # position still counted: a gap must not shift later numbers
+        idx = e.get("playlist_index")
+        if not isinstance(idx, int) or isinstance(idx, bool) or idx < 1:
+            idx = start + pos + 1
+        vid = e.get("id") if isinstance(e.get("id"), str) else None
+        title = e.get("title") or "untitled"
+        if is_yt and vid and re.fullmatch(r"[\w-]{11}", vid):
+            item_url = "https://www.youtube.com/watch?v=" + vid
+        else:
+            raw_url = e.get("url") or e.get("webpage_url") or ""
+            item_url = urljoin(probe_url, raw_url) if raw_url else ""
+        available = bool(item_url)
+        if str(title).strip().lower() in _UNAVAILABLE_TITLES:
+            available = False
+        if e.get("availability") == "private":
+            available = False
+        items.append({
+            "index": idx,
+            "id": vid,
+            "url": item_url,
+            "title": title,
+            "duration": _as_int_or_none(e.get("duration")),
+            "uploader": e.get("uploader") or e.get("channel") or None,
+            "available": available,
+        })
+
+    ext = str(info.get("extractor") or "").split(":")[0].lower()
+    src_id = info.get("id")
+    if ext and src_id:
+        pid = f"{ext}:{src_id}"
+    else:
+        pid = "url:" + hashlib.sha1(probe_url.encode("utf-8")).hexdigest()[:12]
+    return {
+        "is_playlist": True,
+        "playlist": {
+            "id": pid,
+            "title": info.get("title") or "Playlist",
+            "url": probe_url,
+            "uploader": info.get("uploader") or info.get("channel") or None,
+            "total": _as_int_or_none(info.get("playlist_count")),
+        },
+        "start": start,
+        "limit": limit,
+        "truncated": truncated,
+        "items": items,
+    }
 
 
 class StreamlinkEngine:
