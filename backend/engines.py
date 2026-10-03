@@ -346,13 +346,14 @@ class YtDlpEngine:
             "writesubtitles": False,
             "writeautomaticsub": False,
             "socket_timeout": 30,
-            # Session D / PO token: the bgutil plugin only fires for
-            # clients that request a token. "default" first so yt-dlp's
-            # normal path is unchanged; mweb/tv are fallbacks the plugin
-            # can supply tokens for. Do NOT put mweb first — that changes
-            # which client YouTube sees for every download.
+            # Session D / PO token: bgutil only fires for clients that
+            # request a token. "default" is a yt-dlp alias whose target
+            # varies by version and currently resolves to clients that
+            # never need a PO token, so the plugin was sitting idle.
+            # "web" and "web_safari" reliably request a token; mweb/tv
+            # are fallbacks if web/web_safari fail.
             "extractor_args": {
-                "youtube": {"player_client": ["default", "mweb", "tv"]},
+                "youtube": {"player_client": ["web", "web_safari", "mweb", "tv"]},
             },
         }
 
