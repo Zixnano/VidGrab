@@ -346,6 +346,14 @@ class YtDlpEngine:
             "writesubtitles": False,
             "writeautomaticsub": False,
             "socket_timeout": 30,
+            # Session D / PO token: the bgutil plugin only fires for
+            # clients that request a token. "default" first so yt-dlp's
+            # normal path is unchanged; mweb/tv are fallbacks the plugin
+            # can supply tokens for. Do NOT put mweb first — that changes
+            # which client YouTube sees for every download.
+            "extractor_args": {
+                "youtube": {"player_client": ["default", "mweb", "tv"]},
+            },
         }
 
         # FIX: playlist mode gets per-item progress output so you can watch
