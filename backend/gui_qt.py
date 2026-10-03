@@ -2338,14 +2338,14 @@ class MainWindow(QMainWindow):
             total = len(v)
             for item in v:
                 # The payload's filename/referer/cookie/UA describe the URL
-                # the browser handed over — they used to be dropped here, so
-                # every download that went through this dialog lost its name
-                # and its login (403s / HTML-login-page "downloads"). Only
-                # forwarded when the URL is unchanged, so a cookie is never
-                # sent to a different site than it came from. Direct files
-                # only: yt-dlp jobs keep today's behaviour (see findings).
+                # the browser handed over. Forward them whenever the URL is
+                # unchanged (so a cookie is never sent to a different site
+                # than it came from). This used to be gated on
+                # detect_type()=="generic" — which dropped cookies for every
+                # yt-dlp job and produced "Sign in to confirm you're not a
+                # bot" on YouTube once the user's IP hit the rate limit.
                 extra = {}
-                if item["url"] == src_url and detect_type(item["url"]) == "generic":
+                if item["url"] == src_url:
                     extra = {"filename": payload.get("filename"),
                              "referer": payload.get("referer"),
                              "cookie": payload.get("cookie"),
