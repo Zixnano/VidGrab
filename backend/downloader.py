@@ -12,7 +12,8 @@ from yt_dlp import YoutubeDL
 from engines import (route_for, DownloadCancelled,
                      _ytdlp_version_check, find_js_runtime,
                      classify_ytdlp_error, set_youtube_cooldown,
-                     youtube_cooldown_remaining, _is_youtube_url)
+                     youtube_cooldown_remaining, _is_youtube_url,
+                     find_ffmpeg_dir)
 import shutil
 import subprocess
 import sys
@@ -148,9 +149,8 @@ def maybe_convert_target(job, dest):
     except ValueError:
         log(f"target-format convert: invalid target '{target}', skipping")
         return dest
-    ffmpeg = "ffmpeg"
-    if getattr(sys, "frozen", False):
-        ffmpeg = str(Path(sys._MEIPASS) / "ffmpeg.exe")
+    _ffdir = find_ffmpeg_dir()
+    ffmpeg = str(Path(_ffdir) / "ffmpeg.exe") if _ffdir else "ffmpeg"
     cmd = [ffmpeg, "-y", "-i", str(dest)]
     if target in AUDIO_ONLY_TARGETS:
         cmd += ["-vn"]
@@ -197,9 +197,8 @@ def _ffprobe_video_stream(path):
     regardless of the file's extension. Non-media files (.py, .zip, .pdf,
     .json, ...) return False and are left untouched. Returns False on any
     error (probe failed, file missing, ffprobe not found)."""
-    ffprobe = "ffprobe"
-    if getattr(sys, "frozen", False):
-        ffprobe = str(Path(sys._MEIPASS) / "ffprobe.exe")
+    _ffdir = find_ffmpeg_dir()
+    ffprobe = str(Path(_ffdir) / "ffprobe.exe") if _ffdir else "ffprobe"
     try:
         r = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "v:0",
@@ -231,9 +230,8 @@ def maybe_convert_to_mp4(job, dest):
     if not _ffprobe_video_stream(dest):
         log(f"auto-mp4: {dest.name} has no video stream, leaving as-is")
         return dest
-    ffmpeg = "ffmpeg"
-    if getattr(sys, "frozen", False):
-        ffmpeg = str(Path(sys._MEIPASS) / "ffmpeg.exe")
+    _ffdir = find_ffmpeg_dir()
+    ffmpeg = str(Path(_ffdir) / "ffmpeg.exe") if _ffdir else "ffmpeg"
     log(f"auto-mp4: ffmpeg={ffmpeg} exists={os.path.exists(ffmpeg)} "
         f"input={dest.name}")
     target = dest.with_suffix(".mp4")
@@ -871,9 +869,8 @@ def _repair_recording(path):
     """MediaRecorder produces fragmented WebM that Windows Media Player
     rejects. Remux with ffmpeg, forcing it to synthesize missing timestamps.
     Returns the path to the repaired file (equals `path` on failure)."""
-    ffmpeg = "ffmpeg"
-    if getattr(sys, "frozen", False):
-        ffmpeg = str(Path(sys._MEIPASS) / "ffmpeg.exe")
+    _ffdir = find_ffmpeg_dir()
+    ffmpeg = str(Path(_ffdir) / "ffmpeg.exe") if _ffdir else "ffmpeg"
     fixed = path.with_name(path.stem + ".fixed" + path.suffix)
     cmd = [ffmpeg, "-y", "-fflags", "+genpts", "-i", str(path),
            "-c", "copy", str(fixed)]
@@ -898,9 +895,8 @@ def _repair_recording(path):
 
 def _probe_recording(path):
     """Run ffprobe on an uploaded recording. Returns (ok, reason)."""
-    ffprobe = "ffprobe"
-    if getattr(sys, "frozen", False):
-        ffprobe = str(Path(sys._MEIPASS) / "ffprobe.exe")
+    _ffdir = find_ffmpeg_dir()
+    ffprobe = str(Path(_ffdir) / "ffprobe.exe") if _ffdir else "ffprobe"
     try:
         r = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration",

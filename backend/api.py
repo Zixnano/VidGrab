@@ -16,6 +16,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from downloader import maybe_convert_to_mp4, _repair_recording, _probe_recording, _CREATE_NO_WINDOW, _WORKERS, queue_status
+from engines import find_ffmpeg_dir
 from engines import clear_youtube_cooldown
 from settings import MAX_UPLOAD_BYTES
 import queue
@@ -689,9 +690,8 @@ def convert(job_id):
     src = stat_for(job)
     if not src.exists():
         return jsonify({"error": "source missing"}), 404
-    ffmpeg = "ffmpeg"
-    if getattr(sys, "frozen", False):
-        ffmpeg = str(Path(sys._MEIPASS) / "ffmpeg.exe")
+    _ffdir = find_ffmpeg_dir()
+    ffmpeg = str(Path(_ffdir) / "ffmpeg.exe") if _ffdir else "ffmpeg"
     dst = src.with_suffix("." + fmt)
     cmd = [ffmpeg, "-y", "-i", str(src)]
     if fmt in ("mp3", "wav", "m4a", "flac", "opus"):
