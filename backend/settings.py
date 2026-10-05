@@ -152,6 +152,11 @@ _V5_DEFAULTS = {
     "hide_old_errors_hours": 24,
     # GUI: one tray notification when a batch of 2+ downloads finishes.
     "notify_queue_done": True,
+    # YouTube player-client override (v5.1). Empty list = yt-dlp default.
+    # Set to ["mweb", "tv", "web_safari"] to force the bgutil PO token
+    # provider to fire (see bgutil-ytdlp-pot-provider issue #253).
+    # Only applied to YouTube URLs. Non-YouTube jobs are unaffected.
+    "ytdlp_player_clients": [],
 }
 STATE.update(_V5_DEFAULTS)
 
@@ -309,10 +314,24 @@ def category_for(filename):
     return CATEGORY_MAP.get(ext, "Other")
 
 
+# Any URL whose path ends in one of these extensions is a plain file
+# fetch, not something yt-dlp should extract. Covers media files the
+# user might want, AND arbitrary files (scripts, archives, docs) that
+# shouldn't be pushed through yt-dlp's extractor pipeline at all.
+_PLAIN_FILE_EXT_RE = re.compile(
+    r"\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpg|mpeg|ts|"
+    r"mp3|wav|flac|m4a|aac|ogg|opus|"
+    r"zip|rar|7z|tar|gz|bz2|xz|"
+    r"pdf|docx?|xlsx?|pptx?|txt|md|csv|json|xml|yaml|yml|"
+    r"py|js|ts|java|c|cpp|h|hpp|rs|go|rb|php|sh|bat|ps1|"
+    r"exe|msi|dmg|deb|rpm|apk|"
+    r"jpg|jpeg|png|gif|webp|avif|svg|bmp|ico)(\?|#|$)", re.I)
+
+
 def detect_type(url):
     if ".m3u8" in url.lower() or ".mpd" in url.lower():
         return "ytdlp"
-    if DIRECT_EXT_RE.search(url):
+    if _PLAIN_FILE_EXT_RE.search(url):
         return "generic"
     return "ytdlp"
 

@@ -578,6 +578,17 @@ class YtDlpEngine:
         _px = proxy_for(url)
         if _px:
             ydl_opts["proxy"] = _px
+        # Optional YouTube player-client override. Empty by default
+        # (yt-dlp picks). Set to ["mweb", "tv", "web_safari"] to force
+        # the bgutil PO token provider to fire — see issue #253 in
+        # Brainicism/bgutil-ytdlp-pot-provider. YouTube only, so other
+        # sites are unaffected.
+        if _is_youtube_url(url):
+            _clients = STATE.get("ytdlp_player_clients") or []
+            if _clients and isinstance(_clients, list):
+                ydl_opts["extractor_args"] = {
+                    "youtube": {"player_client": [str(c) for c in _clients]},
+                }
         # Legacy whole-playlist jobs skip videos already in the archive.
         # Redownload bypasses it (job["no_archive"]); per-item picker jobs
         # never use it, they are recorded for the picker's "already

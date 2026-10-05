@@ -190,32 +190,54 @@ def _job_dest(job):
     return dest
 
 
+def _ffprobe_video_stream(path):
+    """True when ffprobe reports a video stream in the file.
+
+    Content-based check: this is the ground truth for "is this a video",
+    regardless of the file's extension. Non-media files (.py, .zip, .pdf,
+    .json, ...) return False and are left untouched. Returns False on any
+    error (probe failed, file missing, ffprobe not found)."""
+    ffprobe = "ffprobe"
+    if getattr(sys, "frozen", False):
+        ffprobe = str(Path(sys._MEIPASS) / "ffprobe.exe")
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+             str(path)],
+            capture_output=True, timeout=30, text=True, errors="replace",
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        return r.returncode == 0 and "video" in (r.stdout or "").lower()
+    except Exception as e:
+        log(f"auto-mp4: ffprobe failed on {path.name}: {e}")
+        return False
+
+
 def maybe_convert_to_mp4(job, dest):
-    """If auto_mp4 is on and the file isn't already mp4, remux (fast) or
-    transcode (fallback) with ffmpeg. Returns the final path."""
+    """Convert a finished download to MP4 when it is actually a video.
+
+    Content-based decision: ffprobe is asked whether the file has a video
+    stream. Extensions are trusted only for the trivial "already .mp4"
+    short-circuit. Nothing else in this function depends on the filename,
+    so a .py script, a .zip archive, or a .pdf document passes through
+    untouched. Never deletes the source until the output is confirmed."""
     if not STATE.get("auto_mp4"):
         return dest
-    ext = dest.suffix.lower()
-    video_exts = {".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".flv"}
-    # Extensionless files are treated as unknown-video and probed, not skipped.
-    if ext == ".mp4" or (ext and ext not in video_exts):
+    if dest.suffix.lower() == ".mp4":
+        return dest
+    if not dest.exists() or dest.stat().st_size == 0:
+        return dest
+    if not _ffprobe_video_stream(dest):
+        log(f"auto-mp4: {dest.name} has no video stream, leaving as-is")
         return dest
     ffmpeg = "ffmpeg"
     if getattr(sys, "frozen", False):
         ffmpeg = str(Path(sys._MEIPASS) / "ffmpeg.exe")
     log(f"auto-mp4: ffmpeg={ffmpeg} exists={os.path.exists(ffmpeg)} "
-        f"input={dest.name} (ext={ext or '(none)'})")
+        f"input={dest.name}")
     target = dest.with_suffix(".mp4")
     log(f"auto-mp4: output → {target}")
-    # Confirm a video stream actually exists before running a full conversion.
-    try:
-        r = subprocess.run([ffmpeg, "-i", str(dest)], capture_output=True, timeout=60,
-                           creationflags=_CREATE_NO_WINDOW)
-        if b": Video:" not in r.stderr:
-            log(f"auto-mp4: {dest.name} has no video stream, skipping")
-            return dest
-    except Exception as e:
-        log(f"auto-mp4: stream probe failed for {dest.name}: {e}")
     for args in (
         ["-c", "copy", "-movflags", "+faststart"],
         ["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac"],
@@ -241,6 +263,8 @@ def maybe_convert_to_mp4(job, dest):
             log(f"auto-mp4: ffmpeg rc={r.returncode} for {dest.name} — stderr tail: {err_tail}")
         except Exception as e:
             log(f"ffmpeg pass failed for {dest.name}: {e}")
+    # Both passes failed: leave the original file alone. Do NOT delete it.
+    log(f"auto-mp4: all passes failed for {dest.name}, keeping original")
     return dest
 
 
