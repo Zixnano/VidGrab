@@ -53,6 +53,23 @@
     }
   });
 
+  // v5: show the connection state as soon as the page opens (read-only:
+  // /ping never pairs, so this can't use up the once-per-session pairing).
+  try {
+    const ping = await fetch("http://127.0.0.1:5757/ping");
+    if (ping.ok) {
+      const state = await ping.json().catch(() => ({}));
+      const paired = state.paired || !!tokenInput.value.trim();
+      statusEl.textContent = paired
+        ? "App running" + (state.version ? ` (v${state.version})` : "") + (tokenInput.value.trim() ? " ✓" : " but this extension has no token. Press Test connection.")
+        : "App running, not paired yet. Press Test connection.";
+      statusEl.className = paired && tokenInput.value.trim() ? "ok" : "bad";
+    }
+  } catch (e) {
+    statusEl.textContent = "App not running. Launch Video Grabber, then press Test connection.";
+    statusEl.className = "bad";
+  }
+
   document.getElementById("save").addEventListener("click", async () => {
     const value = tokenInput.value.trim();
     if (!value) {

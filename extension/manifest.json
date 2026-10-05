@@ -12,7 +12,9 @@
     "tabs",
     "cookies",
     "downloads",
-    "notifications"
+    "notifications",
+    "contextMenus",
+    "favicon"
   ],
   "host_permissions": [
     "<all_urls>",

@@ -5,12 +5,16 @@ Talks to the local Flask backend on 127.0.0.1:5757. Reads the pairing token
 from settings.json. Imported and launched by server.py's main().
 """
 
+import base64
+import html as _html
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +22,7 @@ import requests
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, Qt, QTimer, QThread, Signal, QMimeData, QUrl,
     QItemSelectionModel, QPropertyAnimation, QEasingCurve, QAbstractAnimation,
-    QElapsedTimer,
+    QElapsedTimer, QByteArray,
 )
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QTextEdit
@@ -30,6 +34,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QSizePolicy, QAbstractItemView, QStyledItemDelegate,
     QInputDialog, QFileDialog, QCheckBox, QSystemTrayIcon, QStyle,
     QSpinBox, QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
+    QStackedWidget, QScrollArea, QGroupBox,
 )
 
 BACKEND_BASE = "http://127.0.0.1:5757"
@@ -97,6 +102,164 @@ def _status_icon(status):
     p.end()
     _ICON_CACHE[key] = pm
     return pm
+
+
+_STATUS_COLORS = {
+    "downloading": "#4caf50", "done": "#4caf50", "paused": "#ffca28",
+    "stopped": "#ef5350", "error": "#ef5350", "queued": "#9e9e9e",
+    "skipped": "#607d8b",
+}
+
+
+def _bring_to_front(widget):
+    """Raise a window above other apps WITHOUT pinning it there.
+
+    The old code set WindowStaysOnTopHint on the Add/Playlist dialogs. A
+    topmost window ignores its owner being minimized, so it stayed on screen
+    after the main window went away and could not be dismissed except by
+    answering it. Here the window is flipped to topmost and straight back
+    (the standard Windows way to come to the front); afterwards it is an
+    ordinary owned window that minimizes with the main window."""
+    widget.raise_()
+    widget.activateWindow()
+    if sys.platform != "win32":
+        return
+    try:
+        hwnd = int(widget.winId())
+        user32 = ctypes.windll.user32
+        flags = 0x0001 | 0x0002  # SWP_NOSIZE | SWP_NOMOVE
+        user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, flags)  # HWND_TOPMOST
+        user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, flags)  # HWND_NOTOPMOST
+    except Exception:
+        pass
+
+
+def _icons_dir():
+    try:
+        from settings import icons_dir
+        return icons_dir()
+    except Exception:
+        return HOME / "icons"
+
+
+_SITE_ICONS = {}   # site -> (QPixmap, checked_at, has_favicon)
+
+
+def _site_icon(site):
+    """Favicon for a site (letter tile until the extension has sent one)."""
+    if not site:
+        return None
+    now = time.monotonic()
+    hit = _SITE_ICONS.get(site)
+    if hit and (hit[2] or now - hit[1] < 10):
+        return hit[0]
+    pm = QPixmap(18, 18)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+    fav = QPixmap()
+    has_fav = False
+    try:
+        path = _icons_dir() / (site + ".png")
+        has_fav = path.is_file() and fav.load(str(path)) and not fav.isNull()
+    except Exception:
+        has_fav = False
+    if has_fav:
+        p.drawPixmap(1, 1, fav.scaled(16, 16, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    else:
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#1b2a35"))
+        p.drawRoundedRect(1, 1, 16, 16, 4, 4)
+        f = QFont("Segoe UI", 8)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(ACCENT))
+        p.drawText(1, 1, 16, 16, Qt.AlignCenter, site[:1].upper())
+    p.end()
+    _SITE_ICONS[site] = (pm, now, bool(has_fav))
+    if len(_SITE_ICONS) > 300:
+        _SITE_ICONS.clear()
+    return pm
+
+
+def _parse_speed_kbps(text):
+    m = re.match(r"\s*([\d.]+)\s*(B|KB|MB|GB)/s", text or "", re.I)
+    if not m:
+        return 0.0
+    mult = {"b": 1 / 1024, "kb": 1, "mb": 1024, "gb": 1024 * 1024}[m.group(2).lower()]
+    try:
+        return float(m.group(1)) * mult
+    except ValueError:
+        return 0.0
+
+
+def _eta_seconds(j):
+    """Seconds left for an active download, or None when unknown."""
+    if j.get("status") != "downloading":
+        return None
+    total, done = j.get("size_total") or 0, j.get("size_done") or 0
+    kbps = _parse_speed_kbps(j.get("speed"))
+    if not total or done >= total or kbps <= 0:
+        return None
+    return (total - done) / (kbps * 1024)
+
+
+def _fmt_duration(sec):
+    sec = int(max(0, sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60:02d}s"
+    return f"{sec // 3600}h {(sec % 3600) // 60:02d}m"
+
+
+def _retry_text(j):
+    """'retrying in 45s (#2)' while an auto-retry delay is pending."""
+    ra = j.get("retry_after") or 0
+    if j.get("status") == "queued" and ra > time.time():
+        return f"retrying in {_fmt_duration(ra - time.time())} (#{j.get('retry_count') or 1})"
+    return ""
+
+
+def _is_active(j):
+    return j.get("status") == "downloading" or j.get("phase") == "converting"
+
+
+def _sidebar_counts(items):
+    c = {
+        "All": len(items),
+        "Active": sum(1 for j in items if _is_active(j)),
+        "Finished": sum(1 for j in items if j.get("status") == "done"),
+        "Unfinished": sum(1 for j in items if j.get("status") != "done"),
+        "Failed": sum(1 for j in items if j.get("status") == "error"),
+    }
+    for cat in CATEGORIES:
+        c[cat] = sum(1 for j in items if j.get("category") == cat)
+    return c
+
+
+def _gui_state_path():
+    return HOME / "gui_state.json"
+
+
+def _read_gui_state():
+    try:
+        return json.loads(_gui_state_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_gui_state(patch):
+    try:
+        st = _read_gui_state()
+        st.update(patch)
+        _gui_state_path().parent.mkdir(parents=True, exist_ok=True)
+        tmp = _gui_state_path().with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(st), encoding="utf-8")
+        os.replace(tmp, _gui_state_path())
+    except Exception:
+        pass
 
 
 _settings_cache = {"mtime": 0, "data": {}}
@@ -217,8 +380,11 @@ class ApiClient:
 
     def add(self, url, filename=None, category=None, description=None,
             format_id=None, target_format=None, resolution=None, multi=False,
-            download_playlist=False, referer=None, cookie=None, user_agent=None):
+            download_playlist=False, referer=None, cookie=None, user_agent=None,
+            page_url=None):
         body = {"url": url}
+        if page_url:
+            body["page_url"] = page_url
         if filename:
             body["filename"] = filename
         if referer:
@@ -314,6 +480,28 @@ class ApiClient:
     def disk_space(self):
         return self._req("GET", "/diskspace") or {}
 
+    def reorder(self, jid, action):
+        return self._req("POST", f"/reorder/{jid}", json={"action": action})
+
+    def dup_check(self, url):
+        return (self._req("POST", "/dup-check", json={"url": url}) or {}).get("duplicate")
+
+    def queue_status(self):
+        return self._req("GET", "/queue-status") or {}
+
+    def update_status(self):
+        return self._req("GET", "/update-status") or {}
+
+    def ytdlp_update(self):
+        return self._req("POST", "/ytdlp-update", timeout=10)
+
+    def ytdlp_rollback(self):
+        return self._req("POST", "/ytdlp-rollback")
+
+    def clear_failed(self, older_than_hours=0):
+        return self._req("POST", "/clear-failed",
+                         json={"older_than_hours": older_than_hours})
+
     def save_setting(self, key, value):
         # Errors propagate: callers (toggle_queue, SettingsDialog._save)
         # show them; swallowing here made those handlers dead code.
@@ -323,10 +511,12 @@ class ApiClient:
 # Which table columns each job field feeds (see DownloadModel.data). Used by
 # update_items() so a progress tick repaints only the columns that changed.
 _FIELD_COLS = {
-    "filename": (0,), "status": (0, 2, 4, 6), "size_total": (1, 2),
-    "size_done": (2,), "phase": (2, 4), "conversion_progress": (2,),
-    "converting_fmt": (4,), "speed": (3,), "category": (5,),
+    "filename": (0,), "status": (0, 2, 4, 6, 7), "size_total": (1, 2, 7),
+    "size_done": (2, 7), "phase": (2, 4), "conversion_progress": (2,),
+    "converting_fmt": (4,), "speed": (3, 7), "category": (5,),
     "completed_ts": (6,), "created_ts": (6,),
+    "source_site": (8,), "retry_after": (4,), "retry_count": (4,),
+    "error": (4,),
 }
 
 
@@ -341,7 +531,7 @@ def _changed_cols(a, b):
 
 
 class DownloadModel(QAbstractTableModel):
-    HEADERS = ["Name", "Size", "Progress", "Speed", "Status", "Category", "Completed"]
+    HEADERS = ["Name", "Size", "Progress", "Speed", "Status", "Category", "Completed", "ETA", "Source"]
 
     def __init__(self, parent_window=None):
         super().__init__()
@@ -387,6 +577,15 @@ class DownloadModel(QAbstractTableModel):
         col = index.column()
         if role == Qt.DecorationRole and col == 0:
             return _status_icon(j.get("status"))
+        if role == Qt.DecorationRole and col == 8:
+            return _site_icon(j.get("source_site"))
+        if role == Qt.ToolTipRole:
+            if col == 0:
+                return "\n".join(x for x in (j.get("filename"), j.get("source_site"),
+                                             j.get("url")) if x)
+            if col == 4 and j.get("error"):
+                return str(j["error"])[:600]
+            return None
         if role == Qt.BackgroundRole:
             pw = self.parent_window
             fade = getattr(pw, "_recently_done", {}).get(j.get("id"), 0) if pw else 0
@@ -408,6 +607,14 @@ class DownloadModel(QAbstractTableModel):
             elif j["status"] == "done":
                 pct = "100%"
             status = (f"converting → {j.get('converting_fmt', '')}" if j.get("phase") == "converting" else j["status"])
+            retry = _retry_text(j)
+            if retry:
+                status = retry
+            if col == 7:
+                eta = _eta_seconds(j)
+                return _fmt_duration(eta) if eta is not None else ""
+            if col == 8:
+                return j.get("source_site") or ""
             if col == 6:
                 # Pre-column jobs: fall back to created_ts when done so the
                 # column is still useful for sorting.
@@ -425,6 +632,8 @@ class DownloadModel(QAbstractTableModel):
             ][col]
         if role == Qt.ForegroundRole:
             if col == 4:
+                if _retry_text(j):
+                    return QColor(WARN)
                 if j.get("phase") == "converting":
                     return QColor(WARN)
                 s = j["status"]
@@ -436,7 +645,7 @@ class DownloadModel(QAbstractTableModel):
                     return QColor(WARN)
                 if s == "skipped":
                     return QColor("#607d8b")
-            if col in (1, 3, 6):
+            if col in (1, 3, 6, 7, 8):
                 return QColor("#b8c4cf")
             if col == 5:
                 return QColor("#a9b7c5")
@@ -639,16 +848,21 @@ class AddDownloadDialog(QDialog):
         self._prefill_target_format = prefill_target_format
         self._prefill_download_playlist = bool(prefill_download_playlist)
         self.setWindowTitle("Download File Info")
-        # Task 3: this dialog is triggered from the browser extension, often
-        # while some other window has focus — without this it can open
-        # behind everything and look like nothing happened.
-        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        # Opened from the browser while another app has focus, so it must
+        # come to the front: showEvent does that via _bring_to_front. It is
+        # deliberately NOT always-on-top; a topmost dialog refuses to
+        # minimize with the main window.
         self.setMinimumWidth(560)
         form = QFormLayout(self)
         self.url = QLineEdit(prefill_url)
         self.url.setPlaceholderText("https://example.com/file.mp4")
         self.url.editingFinished.connect(self._probe)
         form.addRow("URL", self.url)
+        self.dup_label = QLabel("")
+        self.dup_label.setWordWrap(True)
+        self.dup_label.setStyleSheet(f"color: {WARN};")
+        self.dup_label.setVisible(False)
+        form.addRow("", self.dup_label)
         quality_row = QHBoxLayout()
         self.quality = QListWidget()
         self.quality.setSelectionMode(QAbstractItemView.NoSelection)
@@ -714,8 +928,7 @@ class AddDownloadDialog(QDialog):
         """Task 3: exec()'s internal show() doesn't guarantee focus/front —
         force it explicitly every time the dialog actually becomes visible."""
         super().showEvent(event)
-        self.raise_()
-        self.activateWindow()
+        _bring_to_front(self)
 
     def _update_remember_label(self, text):
         self.remember.setText(f"Remember this path for “{text}”")
@@ -748,7 +961,11 @@ class AddDownloadDialog(QDialog):
                 free = self.api.disk_space().get("free", 0)
             except Exception:
                 free = 0
-            self._head_ready.emit((seq, {"size": size, "free": free}))
+            try:
+                dup = self.api.dup_check(url)
+            except Exception:
+                dup = None
+            self._head_ready.emit((seq, {"size": size, "free": free, "dup": dup}))
 
         threading.Thread(target=worker, daemon=True).start()
         self._probe_formats(url)
@@ -757,6 +974,16 @@ class AddDownloadDialog(QDialog):
         seq, data = payload
         if seq != self._head_seq:
             return  # stale response for an older URL
+        dup = data.get("dup")
+        if dup:
+            where = {"done": "already downloaded", "downloading": "downloading now",
+                     "queued": "already queued", "paused": "already in your list (paused)"
+                     }.get(dup.get("status"), "already in your list")
+            self.dup_label.setText(f"\u26a0 This URL is {where}: {dup.get('filename') or ''}. "
+                                   "Starting it again makes a second copy.")
+            self.dup_label.setVisible(True)
+        else:
+            self.dup_label.setVisible(False)
         size = data.get("size", 0)
         free = data.get("free", 0)
         if not size:
@@ -1060,9 +1287,8 @@ class PlaylistPickerDialog(QDialog):
         self._next_start = 0
         self._truncated = False
         self.setWindowTitle("Pick playlist items")
-        # Same as AddDownloadDialog: opened from the browser while another
-        # window has focus, so it must not appear behind everything.
-        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        # Same as AddDownloadDialog: brought to the front on show, but not
+        # pinned always-on-top (see _bring_to_front).
         self.setMinimumSize(720, 560)
         root = QVBoxLayout(self)
 
@@ -1143,8 +1369,7 @@ class PlaylistPickerDialog(QDialog):
     # --- window behavior (matches AddDownloadDialog) ---
     def showEvent(self, event):
         super().showEvent(event)
-        self.raise_()
-        self.activateWindow()
+        _bring_to_front(self)
 
     def keyPressEvent(self, event):
         # Enter in the URL field loads the playlist (returnPressed), but must
@@ -1270,14 +1495,17 @@ class PlaylistPickerDialog(QDialog):
                 chk = QTableWidgetItem("")
                 idx = QTableWidgetItem(str(it.get("index", "")))
                 idx.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                title = QTableWidgetItem(it.get("title") or "untitled")
+                archived = bool(it.get("archived"))
+                title = QTableWidgetItem((it.get("title") or "untitled")
+                                         + ("   \u2713 already downloaded" if archived else ""))
                 title.setToolTip(it.get("title") or "")
                 dur = QTableWidgetItem(_fmt_hms(it.get("duration")))
                 dur.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 chk.setData(Qt.UserRole, it)
                 if avail:
                     chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                    chk.setCheckState(Qt.Checked)   # all available pre-checked
+                    # all available pre-checked, except ones already downloaded
+                    chk.setCheckState(Qt.Unchecked if archived else Qt.Checked)
                     for c in (idx, title, dur):
                         c.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 else:
@@ -1390,6 +1618,75 @@ class PlaylistPickerDialog(QDialog):
         return (self._playlist or {}).get("title") or "playlist"
 
 
+class _SettingsNav(QWidget):
+    """Left-hand page list + stacked pages + search, in place of a QTabWidget
+    (ten tabs behind scroll arrows). Exposes addTab() so the page-building
+    code is unchanged."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(12)
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search settings\u2026")
+        self.search.setClearButtonEnabled(True)
+        self.list = QListWidget()
+        self.list.setObjectName("SettingsNav")
+        self.list.setFixedWidth(176)
+        left.addWidget(self.search)
+        left.addWidget(self.list, 1)
+        self.stack = QStackedWidget()
+        outer.addLayout(left)
+        outer.addWidget(self.stack, 1)
+        self._index = []
+        self.list.currentRowChanged.connect(self._on_row)
+        self.search.textChanged.connect(self._filter)
+
+    def addTab(self, widget, title):
+        lay = widget.layout()
+        if lay is not None:
+            lay.setContentsMargins(6, 6, 16, 6)   # keep controls off the scrollbar edge
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(widget)
+        self.stack.addWidget(scroll)
+        self.list.addItem(title)
+        if self.list.count() == 1:
+            self.list.setCurrentRow(0)
+
+    def _on_row(self, row):
+        if row >= 0:
+            self.stack.setCurrentIndex(row)
+
+    def build_index(self):
+        """Collect each page's visible text so search matches setting names,
+        not just page titles."""
+        self._index = []
+        for i in range(self.stack.count()):
+            w = self.stack.widget(i).widget()
+            texts = [self.list.item(i).text()]
+            for cls in (QLabel, QCheckBox, QPushButton):
+                texts += [c.text() for c in w.findChildren(cls)]
+            texts += [c.title() for c in w.findChildren(QGroupBox)]
+            self._index.append(" ".join(texts).lower())
+
+    def _filter(self, text):
+        q = (text or "").strip().lower()
+        first = -1
+        for i in range(self.list.count()):
+            hide = bool(q) and q not in (self._index[i] if i < len(self._index) else "")
+            self.list.item(i).setHidden(hide)
+            if not hide and first < 0:
+                first = i
+        cur = self.list.currentRow()
+        if first >= 0 and (cur < 0 or self.list.item(cur).isHidden()):
+            self.list.setCurrentRow(first)
+
+
 class SettingsDialog(QDialog):
     """Tabbed settings editor — POSTs each value to /settings on Save."""
 
@@ -1414,11 +1711,13 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.api = api
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(520)
+        self.setMinimumSize(780, 520)
+        self.resize(860, 620)
         s = load_settings()
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-        layout.addWidget(tabs)
+        tabs = _SettingsNav()
+        self.nav = tabs
+        layout.addWidget(tabs, 1)
 
         # ---- General ----
         g = QWidget()
@@ -1442,6 +1741,9 @@ class SettingsDialog(QDialog):
         # Theme tab below — one place for everything theme-related.
         self.accent = s.get("accent", "#26c6da")
         self._theme_tokens = dict(s.get("theme_tokens") or {})
+        self.notify_queue_done = QCheckBox("Show one notification when a batch of downloads finishes")
+        self.notify_queue_done.setChecked(bool(s.get("notify_queue_done", True)))
+        gl.addRow(self.notify_queue_done)
         self.animations_enabled = QCheckBox("Enable animations")
         self.animations_enabled.setChecked(bool(s.get("animations_enabled", True)))
         gl.addRow(self.animations_enabled)
@@ -1574,6 +1876,25 @@ class SettingsDialog(QDialog):
             ", ".join(s.get("subtitle_languages", ["en"])))
         self.subtitle_languages.setPlaceholderText("en, es, ...")
         dl.addRow("Subtitle languages", self.subtitle_languages)
+        self.min_free_space_mb = QSpinBox()
+        self.min_free_space_mb.setRange(0, 1_000_000)
+        self.min_free_space_mb.setSingleStep(100)
+        self.min_free_space_mb.setSuffix(" MB")
+        self.min_free_space_mb.setSpecialValueText("off")
+        self.min_free_space_mb.setValue(int(s.get("min_free_space_mb", 500) or 0))
+        dl.addRow("Pause new downloads below", self.min_free_space_mb)
+        self.hide_old_errors_hours = QSpinBox()
+        self.hide_old_errors_hours.setRange(0, 720)
+        self.hide_old_errors_hours.setSuffix(" h")
+        self.hide_old_errors_hours.setSpecialValueText("never")
+        self.hide_old_errors_hours.setValue(int(s.get("hide_old_errors_hours", 24) or 0))
+        self.hide_old_errors_hours.setToolTip("Failed downloads older than this are hidden from "
+                                              "All and Unfinished. The Failed view still lists them.")
+        dl.addRow("Hide failed downloads older than", self.hide_old_errors_hours)
+        self.ytdlp_use_archive = QCheckBox(
+            "Skip videos already downloaded when queueing whole playlists")
+        self.ytdlp_use_archive.setChecked(bool(s.get("ytdlp_use_archive", True)))
+        dl.addRow(self.ytdlp_use_archive)
         tabs.addTab(d, "Downloads")
 
         # ---- Post-Download ----
@@ -1616,7 +1937,75 @@ class SettingsDialog(QDialog):
         self.min_speed_kbps.setSpecialValueText("off")
         self.min_speed_kbps.setValue(int(s.get("min_speed_kbps") or 0))
         cl.addRow("Abort if slower than", self.min_speed_kbps)
+        self.yt_delay_min = QSpinBox()
+        self.yt_delay_min.setRange(0, 60)
+        self.yt_delay_min.setSuffix(" s")
+        self.yt_delay_min.setValue(int(s.get("ytdlp_sleep_interval", 5) or 0))
+        self.yt_delay_max = QSpinBox()
+        self.yt_delay_max.setRange(0, 120)
+        self.yt_delay_max.setSuffix(" s")
+        self.yt_delay_max.setValue(int(s.get("ytdlp_max_sleep_interval", 15) or 0))
+        delay_row = QHBoxLayout()
+        delay_row.addWidget(self.yt_delay_min)
+        delay_row.addWidget(QLabel("to"))
+        delay_row.addWidget(self.yt_delay_max)
+        delay_row.addStretch(1)
+        cl.addRow("YouTube request delay (seconds)", delay_row)
+        delay_hint = QLabel("A random wait between YouTube downloads keeps your IP from "
+                            "being flagged. Set both to 0 to turn it off.")
+        delay_hint.setWordWrap(True)
+        delay_hint.setStyleSheet(f"color: {MUTED};")
+        cl.addRow(delay_hint)
+        self.yt_cooldown = QSpinBox()
+        self.yt_cooldown.setRange(1, 240)
+        self.yt_cooldown.setSuffix(" min")
+        self.yt_cooldown.setValue(int(s.get("ytdlp_bot_cooldown_minutes", 30) or 30))
+        cl.addRow("Hold YouTube after a bot check", self.yt_cooldown)
+        self.proxy_url = QLineEdit(s.get("proxy_url", "") or "")
+        self.proxy_url.setPlaceholderText("http://host:port  or  socks5://host:port  (blank = none)")
+        cl.addRow("Proxy", self.proxy_url)
+        self.proxy_scope = QComboBox()
+        self.proxy_scope.addItem("YouTube only", userData="youtube")
+        self.proxy_scope.addItem("All downloads", userData="all")
+        _i = self.proxy_scope.findData(s.get("proxy_scope", "youtube"))
+        self.proxy_scope.setCurrentIndex(_i if _i >= 0 else 0)
+        cl.addRow("Use proxy for", self.proxy_scope)
         tabs.addTab(c, "Connection")
+
+        # ---- Updates ----
+        up = QWidget()
+        upl = QFormLayout(up)
+        self.auto_update_check = QCheckBox("Check for app updates automatically")
+        self.auto_update_check.setChecked(bool(s.get("auto_update_check", True)))
+        upl.addRow(self.auto_update_check)
+        self.update_check_hours = QSpinBox()
+        self.update_check_hours.setRange(1, 48)
+        self.update_check_hours.setSuffix(" h")
+        self.update_check_hours.setValue(int(s.get("update_check_hours", 6) or 6))
+        upl.addRow("Check every", self.update_check_hours)
+        self.ytdlp_auto_update = QCheckBox("Keep yt-dlp up to date automatically")
+        self.ytdlp_auto_update.setChecked(bool(s.get("ytdlp_auto_update", True)))
+        upl.addRow(self.ytdlp_auto_update)
+        self.update_info = QLabel("Press Refresh to see yt-dlp and app versions.")
+        self.update_info.setWordWrap(True)
+        self.update_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        upl.addRow(self.update_info)
+        ub = QHBoxLayout()
+        for text, fn in (("Refresh", self._update_refresh),
+                         ("Check yt-dlp now", self._update_ytdlp_now),
+                         ("Roll back yt-dlp", self._update_ytdlp_rollback)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            ub.addWidget(b)
+        ub.addStretch(1)
+        upl.addRow(ub)
+        upnote = QLabel("A new yt-dlp is downloaded in the background and applies the "
+                        "next time Video Grabber starts. The app itself is never "
+                        "installed without asking.")
+        upnote.setWordWrap(True)
+        upnote.setStyleSheet(f"color: {MUTED};")
+        upl.addRow(upnote)
+        tabs.addTab(up, "Updates")
 
         # ---- Save To ----
         st = QWidget()
@@ -1717,6 +2106,7 @@ class SettingsDialog(QDialog):
         prl.addRow(copy_btn)
         tabs.addTab(pr, "Pairing")
 
+        tabs.build_index()
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
@@ -1724,6 +2114,51 @@ class SettingsDialog(QDialog):
 
     def _copy_token(self):
         QApplication.clipboard().setText(self.token_edit.text())
+
+    # --- Updates page -----------------------------------------------------
+    @staticmethod
+    def _fmt_update_status(d):
+        yt = (d or {}).get("ytdlp") or {}
+        app = (d or {}).get("app") or {}
+        lines = [f"yt-dlp: running {yt.get('active') or 'unknown'}"
+                 f" (bundled {yt.get('bundled') or '?'}"
+                 + (f", override {yt['override']}" if yt.get("override") else "") + ")"]
+        if yt.get("staged"):
+            lines.append(f"yt-dlp {yt['staged']} is downloaded and applies on next start.")
+        elif yt.get("latest"):
+            lines.append(f"Latest yt-dlp on PyPI: {yt['latest']}")
+        if yt.get("error"):
+            lines.append(f"yt-dlp update error: {yt['error']}")
+        lines.append(f"App update available: {app['available']}" if app.get("available")
+                     else f"App: v{DISPLAY_VERSION} (no update found)")
+        return "\n".join(lines)
+
+    def _run_update_job(self, fn, on_done=None):
+        w = _ApiFetchWorker(fn, self)
+        w.result.connect(lambda d: (self.update_info.setText(
+            on_done(d) if on_done else self._fmt_update_status(d))), Qt.QueuedConnection)
+        w.failed.connect(lambda: self.update_info.setText(
+            "Couldn't reach the app backend."), Qt.QueuedConnection)
+        self._update_worker = w
+        w.start()
+
+    def _update_refresh(self):
+        self.update_info.setText("Checking\u2026")
+        self._run_update_job(self.api.update_status)
+
+    def _update_ytdlp_now(self):
+        self.update_info.setText("Checking PyPI for a newer yt-dlp\u2026 press Refresh in a few seconds.")
+        self._run_update_job(self.api.ytdlp_update, lambda d: "Started. Press Refresh in a few seconds to see the result.")
+
+    def _update_ytdlp_rollback(self):
+        if QMessageBox.question(self, "Roll back yt-dlp",
+                                "Go back to the yt-dlp version that shipped with the app? "
+                                "This applies the next time Video Grabber starts.",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._run_update_job(self.api.ytdlp_rollback, lambda d: (
+            "Override removed. The bundled yt-dlp is used after restart."
+            if (d or {}).get("removed") else "Nothing to roll back; already on the bundled version."))
 
     ENGINES = ("auto", "yt-dlp", "streamlink")
 
@@ -1933,6 +2368,10 @@ class SettingsDialog(QDialog):
 
 
     def _save_inner(self):
+        proxy = self.proxy_url.text().strip()
+        if proxy and not re.match(r"^(https?|socks4|socks5h?)://\S+$", proxy, re.I):
+            raise ValueError("Proxy must look like http://host:port, https://host:port, "
+                             "socks4://host:port, socks5://host:port or socks5h://host:port")
         if self.api:
             for key, widget in [
                 ("force_on_top", self.force_on_top),
@@ -1955,6 +2394,18 @@ class SettingsDialog(QDialog):
             self.api.save_setting("max_retries", int(self.max_retries.value()))
             self.api.save_setting("min_speed_kbps",
                                   int(self.min_speed_kbps.value()))
+            self.api.save_setting("ytdlp_sleep_interval", int(self.yt_delay_min.value()))
+            self.api.save_setting("ytdlp_max_sleep_interval", int(self.yt_delay_max.value()))
+            self.api.save_setting("ytdlp_bot_cooldown_minutes", int(self.yt_cooldown.value()))
+            self.api.save_setting("proxy_url", proxy)
+            self.api.save_setting("proxy_scope", self.proxy_scope.currentData() or "youtube")
+            self.api.save_setting("min_free_space_mb", int(self.min_free_space_mb.value()))
+            self.api.save_setting("ytdlp_use_archive", self.ytdlp_use_archive.isChecked())
+            self.api.save_setting("hide_old_errors_hours", int(self.hide_old_errors_hours.value()))
+            self.api.save_setting("notify_queue_done", self.notify_queue_done.isChecked())
+            self.api.save_setting("auto_update_check", self.auto_update_check.isChecked())
+            self.api.save_setting("update_check_hours", int(self.update_check_hours.value()))
+            self.api.save_setting("ytdlp_auto_update", self.ytdlp_auto_update.isChecked())
             self.api.save_setting("output_dir", self.output_dir.text().strip())
             self.api.save_setting("per_category_dirs",
                                   {cat: e.text().strip()
@@ -2130,7 +2581,7 @@ class Sidebar(QFrame):
         layout.addWidget(brand)
         layout.addSpacing(14)
         self.buttons = {}
-        for name in ["All", "Finished", "Unfinished"]:
+        for name in ["All", "Active", "Finished", "Unfinished", "Failed"]:
             self._add_nav(layout, name)
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -2153,6 +2604,14 @@ class Sidebar(QFrame):
         btn.clicked.connect(lambda _=False, n=name: self.category_selected.emit(n))
         layout.addWidget(btn)
         self.buttons[name] = btn
+
+    def set_counts(self, counts):
+        """Show a count next to each entry that has any rows."""
+        for name, btn in self.buttons.items():
+            n = counts.get(name, 0)
+            text = f"{name}  ({n})" if n else name
+            if btn.text() != text:
+                btn.setText(text)
 
 def _fade_widget(widget, enabled, duration=150):
     """Fade `widget` in over `duration` ms, OutCubic (Session 12.1). No-op
@@ -2219,6 +2678,8 @@ class MainWindow(QMainWindow):
     # Update-check result back from the worker thread (updater runs off
     # the UI thread so the app doesn't freeze while it hits GitHub).
     _update_result_signal = Signal(object)
+    # Background scheduler found a newer app release (tag string).
+    _update_available_signal = Signal(str)
 
     def __init__(self, api=None):
         super().__init__()
@@ -2235,6 +2696,11 @@ class MainWindow(QMainWindow):
         self._refresh_worker = None
         self._logs_worker = None
         self._diskspace_worker = None
+        self._queue_worker = None
+        self._update_tag = ""
+        self._batch = {"seeded": False, "busy": False, "done": 0, "failed": 0,
+                       "known_done": set(), "known_err": set()}
+        self._update_notified = ""
         # Settings snapshot fetched on the worker thread each refresh —
         # the GUI thread never reads settings.json on the hot path (11.2).
         self._gui_settings = {}
@@ -2256,6 +2722,15 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self._new_job_signal.connect(self._on_new_job, Qt.QueuedConnection)
         self._update_result_signal.connect(self._on_update_result, Qt.QueuedConnection)
+        self._update_available_signal.connect(self._on_update_available, Qt.QueuedConnection)
+        try:
+            import updater
+            updater.register_update_hook(self._update_available_signal.emit)
+            _st = updater.get_update_state()
+            if _st.get("available") and _st["available"] != _st.get("skipped"):
+                self._update_available_signal.emit(_st["available"])
+        except Exception:
+            pass
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1000)
@@ -2264,12 +2739,17 @@ class MainWindow(QMainWindow):
         self.log_timer.start(1500)
         self.diskspace_timer = QTimer(self)
         self.diskspace_timer.timeout.connect(self.refresh_diskspace)
+        self.queue_timer = QTimer(self)
+        self.queue_timer.timeout.connect(self.refresh_queue_status)
+        self.queue_timer.start(3000)
         self.diskspace_timer.start(15000)  # disk space changes slowly — no need to poll every second
         self.fade_timer = QTimer(self)
         self.fade_timer.timeout.connect(self._tick_fade)
         self.fade_timer.start(50)
+        self.select_category("All")
         self.refresh()
         self.refresh_diskspace()
+        self.refresh_queue_status()
 
     def new_job_hook(self):
         return self._new_job_signal.emit
@@ -2300,6 +2780,14 @@ class MainWindow(QMainWindow):
                     cookie=payload.get("cookie"),
                     user_agent=payload.get("user_agent"))
                 return
+            _rt = payload.get("_req_ts")
+            if _rt:
+                try:
+                    from settings import log as _log
+                    _log(f"add dialog: opening {int((time.time() - _rt) * 1000)} ms after "
+                         f"the extension's request reached the app")
+                except Exception:
+                    pass
             d = AddDownloadDialog(self, api=self.api,
                                   prefill_url=payload.get("url", ""),
                                   prefill_format_id=payload.get("format_id"),
@@ -2349,7 +2837,8 @@ class MainWindow(QMainWindow):
                     extra = {"filename": payload.get("filename"),
                              "referer": payload.get("referer"),
                              "cookie": payload.get("cookie"),
-                             "user_agent": payload.get("user_agent")}
+                             "user_agent": payload.get("user_agent"),
+                             "page_url": payload.get("page_url")}
                 self.api.add(item["url"], category=item["category"],
                              description=item["description"],
                              format_id=item.get("format_id"),
@@ -2460,7 +2949,9 @@ class MainWindow(QMainWindow):
         self._quitting = True
         # 11.1: stop in-flight fetch workers — a running QThread at exit
         # hangs the app.
-        for w in (self._refresh_worker, self._logs_worker, self._diskspace_worker):
+        self._save_header_state()
+        for w in (self._refresh_worker, self._logs_worker, self._diskspace_worker,
+                  self._queue_worker):
             if w is not None:
                 w.wait(2000)
         if self._tray:
@@ -2482,6 +2973,7 @@ class MainWindow(QMainWindow):
         title.setObjectName("ToolbarTitle")
         tl.addWidget(title)
         tl.addSpacing(16)
+        self._tb = []  # [button, icon, label]: compact mode swaps text for icon
         for label, icon, action in [
             ("Add URL", "+", self.add_download),
             ("Batch", "☰", self.add_batch),
@@ -2495,8 +2987,10 @@ class MainWindow(QMainWindow):
         ]:
             b = QPushButton(f"{icon}  {label}")
             b.setObjectName("ToolbarButton")
+            b.setToolTip(label)
             b.clicked.connect(action)
             tl.addWidget(b)
+            self._tb.append([b, icon, label])
             if label == "Queue":
                 self.queue_btn = b
         self._update_queue_btn()
@@ -2528,14 +3022,48 @@ class MainWindow(QMainWindow):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.context_menu)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        for c in range(1, 7):
-            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        # Every other column is user-resizable (drag the header edge).
+        for c, w in {1: 80, 2: 120, 3: 90, 4: 140, 5: 90, 6: 120, 7: 70, 8: 120}.items():
+            hh.setSectionResizeMode(c, QHeaderView.Interactive)
+            self.table.setColumnWidth(c, w)
+        hh.setMinimumSectionSize(60)
+        hh.setStretchLastSection(False)
+        hh.setSectionsMovable(True)
+        hh.moveSection(7, 4)   # ETA shows after Speed; logical order is unchanged
+        hh.moveSection(8, 1)   # Source sits right after Name
+        self._restore_header_state()
+        self._hdr_timer = QTimer(self)
+        self._hdr_timer.setSingleShot(True)
+        self._hdr_timer.timeout.connect(self._save_header_state)
+        hh.sectionResized.connect(lambda *_: self._hdr_timer.start(800))
+        hh.sectionMoved.connect(lambda *_: self._hdr_timer.start(800))
         self.table.setShowGrid(False)
         self.table.setDragEnabled(True)
         self.table.setDragDropMode(QAbstractItemView.DragOnly)
         self.table.doubleClicked.connect(self._on_double_click)
         cl.addWidget(self.table, 1)
+        self.empty_label = QLabel("", self.table.viewport())
+        self.empty_label.setObjectName("EmptyState")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.empty_label.setVisible(False)
+        self.table.viewport().installEventFilter(self)
+        self.details = QLabel()
+        self.details.setObjectName("Details")
+        self.details.setTextFormat(Qt.RichText)
+        self.details.setWordWrap(True)
+        self.details.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.details.setVisible(False)
+        cl.addWidget(self.details)
+        self.table.selectionModel().selectionChanged.connect(lambda *_: self._update_details())
+        from PySide6.QtGui import QShortcut, QKeySequence
+        for seq, act in (("Alt+Up", "up"), ("Alt+Down", "down")):
+            sc = QShortcut(QKeySequence(seq), self.table)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(lambda a=act: self._reorder_selected(a))
         log_label = QLabel("ACTIVITY LOG")
         log_label.setObjectName("SectionLabel")
         cl.addWidget(log_label)
@@ -2554,6 +3082,16 @@ class MainWindow(QMainWindow):
         self.diskspace_label = QLabel("")
         self.diskspace_label.setObjectName("DiskSpaceLabel")
         self.diskspace_label.setToolTip("Free space on the downloads drive")
+        self.hold_label = QLabel("")
+        self.hold_label.setObjectName("HoldLabel")
+        status.addPermanentWidget(self.hold_label)
+        self.update_btn = QPushButton("")
+        self.update_btn.setObjectName("UpdateBadge")
+        self.update_btn.setFlat(True)
+        self.update_btn.setCursor(Qt.PointingHandCursor)
+        self.update_btn.setVisible(False)
+        self.update_btn.clicked.connect(self._on_update_badge)
+        status.addPermanentWidget(self.update_btn)
         status.addPermanentWidget(self.diskspace_label)
         status.addPermanentWidget(QLabel(f"v{DISPLAY_VERSION} · PySide6 · Flask API"))
         self.setStatusBar(status)
@@ -2575,6 +3113,7 @@ class MainWindow(QMainWindow):
         a = QAction("Bandwidth profiles…", self); a.triggered.connect(self.open_bandwidth_profiles); t.addAction(a)
         t.addSeparator()
         a = QAction("Retry all failed", self); a.triggered.connect(self.retry_all_failed); t.addAction(a)
+        a = QAction("Clear failed downloads", self); a.triggered.connect(self.clear_failed); t.addAction(a)
         a = QAction("Open logs folder", self); a.triggered.connect(self._open_logs_folder); t.addAction(a)
         t.addSeparator()
         a = QAction("About Video Grabber…", self); a.triggered.connect(self.show_about); t.addAction(a)
@@ -2621,6 +3160,25 @@ class MainWindow(QMainWindow):
         }}
         QTableView::item {{ border: 0; padding: 7px 8px; }}
         QTableView::item:selected {{ background: #173c2a; }}
+        #Details {{
+            background: #0c141c; border: 1px solid {BORDER}; border-radius: 7px;
+            padding: 8px 12px; color: #b8c4cf; font-size: 12px;
+        }}
+        #EmptyState {{ color: #6f8191; font-size: 14px; background: transparent; }}
+        #HoldLabel {{ color: {WARN}; padding-right: 12px; }}
+        #UpdateBadge {{
+            color: {ACCENT}; border: 0; padding: 0 12px; font-weight: 600;
+            background: transparent;
+        }}
+        #UpdateBadge:hover {{ color: white; }}
+        QListWidget#SettingsNav {{
+            background: #0d151d; border: 1px solid {BORDER}; border-radius: 8px;
+            padding: 4px; outline: 0;
+        }}
+        QListWidget#SettingsNav::item {{ padding: 9px 12px; border-radius: 6px; color: #9caebb; }}
+        QListWidget#SettingsNav::item:hover {{ background: #15212b; color: #e9f0f5; }}
+        QListWidget#SettingsNav::item:selected {{ background: #173c2a; color: white; }}
+        QScrollArea {{ background: transparent; border: 0; }}
         #LogLine {{
             background: #0c141c; border: 1px solid {BORDER}; border-radius: 7px;
             padding: 8px 12px; color: #8fa1b0; font-family: "Consolas";
@@ -2638,11 +3196,213 @@ class MainWindow(QMainWindow):
         QPushButton:hover {{ background: #20313e; }}
         """)
 
+    # ---------------------------------------------------------------- v5 ---
+    _EMPTY_TEXT = {
+        "Active": "Nothing is downloading right now.",
+        "Failed": "No failed downloads.",
+        "Finished": "Nothing has finished yet.",
+        "Unfinished": "No unfinished downloads.",
+    }
+
+    def _track_batch(self, items):
+        """One tray notification when a run of 2+ downloads finishes, instead
+        of one per file. 'Busy' = something is downloading or ready to start
+        (jobs waiting out a retry delay don't count)."""
+        now = time.time()
+        done = {j.get("id") for j in items if j.get("status") == "done"}
+        errs = {j.get("id") for j in items if j.get("status") == "error"}
+        busy = any(j.get("status") == "downloading"
+                   or (j.get("status") == "queued" and not (j.get("retry_after") or 0) > now)
+                   for j in items)
+        b = self._batch
+        if not b["seeded"]:
+            b.update(seeded=True, busy=busy, known_done=done, known_err=errs)
+            return
+        b["done"] += len(done - b["known_done"])
+        b["failed"] += len(errs - b["known_err"])
+        b["known_done"], b["known_err"] = done, errs
+        if b["busy"] and not busy:
+            total = b["done"] + b["failed"]
+            if (total >= 2 and self._tray
+                    and self._gui_settings.get("notify_queue_done", True)):
+                msg = f"{b['done']} download(s) finished"
+                if b["failed"]:
+                    msg += f", {b['failed']} failed"
+                self._tray.showMessage("Video Grabber", msg + ".",
+                                       QSystemTrayIcon.Information, 4000)
+            b["done"] = b["failed"] = 0
+        elif not busy:
+            b["done"] = b["failed"] = 0   # drift while idle (removals)
+        b["busy"] = busy
+
+    def _update_empty_state(self):
+        if self.model.rowCount() > 0:
+            self.empty_label.setVisible(False)
+            return
+        if self.search.text().strip():
+            text = "No downloads match your search."
+        elif self.current_filter in self._EMPTY_TEXT:
+            text = self._EMPTY_TEXT[self.current_filter]
+        elif self.current_filter == "All":
+            text = ("No downloads yet.\nClick the pill on a video in your browser, "
+                    "or press Add URL.")
+        else:
+            text = f"No {self.current_filter.lower()} downloads."
+        self.empty_label.setText(text)
+        self._place_empty_label()
+        self.empty_label.setVisible(True)
+        self.empty_label.raise_()
+
+    def _place_empty_label(self):
+        vp = self.table.viewport()
+        self.empty_label.setGeometry(24, 40, max(60, vp.width() - 48), 90)
+
+    def eventFilter(self, obj, event):
+        try:
+            if obj is self.table.viewport() and event.type() == event.Type.Resize:
+                self._place_empty_label()
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def _apply_toolbar_text(self):
+        compact = self.width() < 1240
+        for btn, icon, label in getattr(self, "_tb", []):
+            btn.setText(icon if compact else f"{icon}  {label}")
+            btn.setToolTip(label)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_toolbar_text()
+
+    def _restore_header_state(self):
+        try:
+            raw = _read_gui_state().get("table_header")
+            if not raw:
+                return
+            hh = self.table.horizontalHeader()
+            if hh.restoreState(QByteArray(base64.b64decode(raw))):
+                hh.setSectionResizeMode(0, QHeaderView.Stretch)
+                for c in range(1, len(self.model.HEADERS)):
+                    hh.setSectionResizeMode(c, QHeaderView.Interactive)
+        except Exception:
+            pass
+
+    def _save_header_state(self):
+        try:
+            hh = self.table.horizontalHeader()
+            _write_gui_state({"table_header": base64.b64encode(
+                bytes(hh.saveState())).decode("ascii")})
+        except Exception:
+            pass
+
+    def _update_details(self):
+        """One-line-per-fact panel under the table for the selected row."""
+        try:
+            rows = self._selected_rows()
+        except Exception:
+            rows = []
+        if not rows:
+            self.details.setVisible(False)
+            return
+        if len(rows) > 1:
+            self.details.setText(f"{len(rows)} downloads selected")
+            self.details.setVisible(True)
+            return
+        j = rows[0]
+        e = _html.escape
+        site = j.get("source_site") or ""
+        lines = [f"<b>{e(str(j.get('filename') or ''))}</b>"
+                 + (f" &nbsp;\u00b7&nbsp; {e(site)}" if site else "")
+                 + f" &nbsp;\u00b7&nbsp; {e(str(j.get('status') or ''))}"]
+        retry = _retry_text(j)
+        if retry:
+            lines.append(f"<span style='color:{WARN}'>Auto-retry: {e(retry)}</span>")
+        if j.get("error"):
+            lines.append(f"<span style='color:{DANGER}'>{e(str(j['error'])[:600])}</span>")
+        lines.append(f"<span style='color:{MUTED}'>{e(str(j.get('url') or ''))}</span>")
+        try:
+            lines.append(f"<span style='color:{MUTED}'>{e(str(_path_for(j)))}</span>")
+        except Exception:
+            pass
+        self.details.setText("<br>".join(lines))
+        self.details.setVisible(True)
+
+    def refresh_queue_status(self):
+        if self._queue_worker is not None:
+            return
+        self._queue_worker = _ApiFetchWorker(self.api.queue_status, self)
+        self._queue_worker.result.connect(self._on_queue_status, Qt.QueuedConnection)
+        self._queue_worker.finished.connect(lambda: setattr(self, "_queue_worker", None))
+        self._queue_worker.start()
+
+    def _on_queue_status(self, data):
+        try:
+            parts = []
+            hold = int((data or {}).get("youtube_hold_s") or 0)
+            if hold > 0:
+                parts.append(f"\u23f3 YouTube held {max(1, math.ceil(hold / 60))} min")
+            if (data or {}).get("low_disk"):
+                parts.append("\u26a0 Low disk space: new downloads paused")
+            self.hold_label.setText("  \u00b7  ".join(parts))
+            self.hold_label.setToolTip(
+                "YouTube jobs are held after a bot check or rate limit. Press Resume "
+                "on a YouTube job (for example after switching VPN) to retry now."
+                if hold > 0 else "")
+        except Exception:
+            pass
+
+    def _on_update_available(self, tag):
+        self._update_tag = tag
+        self.update_btn.setText(f"\u2b06 Update {tag} available")
+        self.update_btn.setVisible(True)
+        if self._tray and self._update_notified != tag:
+            self._update_notified = tag
+            self._tray.showMessage(
+                "Video Grabber update",
+                f"{tag} is available. Click the badge in the status bar to install.",
+                QSystemTrayIcon.Information, 5000)
+
+    def _on_update_badge(self):
+        m = QMenu(self)
+        a_now = m.addAction("Install now (restarts the app)")
+        a_skip = m.addAction("Skip this version")
+        chosen = m.exec(self.update_btn.mapToGlobal(self.update_btn.rect().topLeft()))
+        if chosen == a_now:
+            self.check_for_updates()
+        elif chosen == a_skip:
+            try:
+                import updater
+                updater.skip_version(self._update_tag)
+            except Exception:
+                pass
+            self.update_btn.setVisible(False)
+
+    def clear_failed(self):
+        n = sum(1 for j in self.all_items if j.get("status") == "error")
+        if not n:
+            QMessageBox.information(self, "Clear failed", "No failed downloads to clear.")
+            return
+        if QMessageBox.question(self, "Clear failed",
+                                f"Remove {n} failed download(s) from the list?",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        def _do():
+            try:
+                self.api.clear_failed()
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+        self.log.setText(f"Clearing {n} failed download(s)\u2026")
+
     def _tick_animations(self):
         if not self.animations_enabled:
             return
         try:
-            if any(j.get("status") == "downloading" for j in self.all_items):
+            now = time.time()
+            if any(j.get("status") == "downloading"
+                   or (j.get("retry_after") or 0) > now for j in self.all_items):
                 self.table.viewport().update()
         except RuntimeError:
             self._anim_timer.stop()  # widgets torn down during exit
@@ -2672,6 +3432,9 @@ class MainWindow(QMainWindow):
     def _on_refreshed(self, payload):
         items, settings = payload
         self.all_items = items
+        self.sidebar.set_counts(_sidebar_counts(items))
+        self._gui_settings = settings
+        self._track_batch(items)
         # 11.3: re-read every tick — a Settings-dialog toggle propagates
         # within ~1s; nothing is cached from startup.
         self._gui_settings = settings
@@ -2707,6 +3470,8 @@ class MainWindow(QMainWindow):
         if visible_ids != getattr(self, "_last_visible_ids", None):
             self._last_visible_ids = visible_ids
             _fade_widget(self.table.viewport(), self.animations_enabled)
+        self._update_details()
+
     def _tick_fade(self):
         if not self._recently_done:
             return
@@ -2900,7 +3665,10 @@ class MainWindow(QMainWindow):
             return
         if running is None:
             running = bool(load_settings().get("queue_running", True))
-        self.queue_btn.setText("⏸  Pause Queue" if running else "⏵  Start Queue")
+        for entry in getattr(self, "_tb", []):
+            if entry[0] is self.queue_btn:
+                entry[1], entry[2] = ("⏸", "Pause Queue") if running else ("⏵", "Start Queue")
+        self._apply_toolbar_text()
         self.queue_btn.setToolTip(
             "Pause the whole download queue" if running
             else "Resume the whole download queue")
@@ -2918,7 +3686,21 @@ class MainWindow(QMainWindow):
         text = (text or "").lower().strip()
         src = self.all_items
         f = self.current_filter
-        if f == "Finished":
+        if f in ("All", "Unfinished") and not text:
+            try:
+                hrs = float(self._gui_settings.get("hide_old_errors_hours", 24) or 0)
+            except (TypeError, ValueError):
+                hrs = 0
+            if hrs > 0:
+                cutoff = time.time() - hrs * 3600
+                src = [x for x in src
+                       if not (x.get("status") == "error"
+                               and (x.get("failed_ts") or x.get("created_ts") or 0) < cutoff)]
+        if f == "Active":
+            src = [x for x in src if _is_active(x)]
+        elif f == "Failed":
+            src = [x for x in src if x["status"] == "error"]
+        elif f == "Finished":
             src = [x for x in src if x["status"] == "done"]
         elif f == "Unfinished":
             src = [x for x in src if x["status"] != "done"]
@@ -2955,6 +3737,11 @@ class MainWindow(QMainWindow):
                     return x.get("category", "").lower()
                 if c == 6:
                     return x.get("completed_ts", 0) or 0
+                if c == 7:
+                    eta = _eta_seconds(x)
+                    return eta if eta is not None else 1e12
+                if c == 8:
+                    return (x.get("source_site") or "").lower()
                 return 0
             src = sorted(src, key=sort_key, reverse=not self._sort_ascending)
         else:
@@ -2963,6 +3750,7 @@ class MainWindow(QMainWindow):
             src = sorted(src, key=lambda x: (-(x.get("created_ts") or 0),
                                              x.get("playlist_index") or 0))
         self.model.update_items(src)
+        self._update_empty_state()
 
     def select_category(self, name):
         self.current_filter = name
@@ -3109,6 +3897,13 @@ class MainWindow(QMainWindow):
         a_stop = m.addAction("Stop")
         a_redl = m.addAction("Redownload")
         m.addSeparator()
+        q_menu = m.addMenu("Queue position")
+        q_actions = {q_menu.addAction("Move to top"): "top",
+                     q_menu.addAction("Move up   (Alt+Up)"): "up",
+                     q_menu.addAction("Move down   (Alt+Down)"): "down",
+                     q_menu.addAction("Move to bottom"): "bottom"}
+        q_menu.setEnabled(j["status"] == "queued")
+        m.addSeparator()
         cat_menu = m.addMenu("Move to Category")
         cat_actions = {cat_menu.addAction(c): c for c in CATEGORIES}
         m.addSeparator()
@@ -3123,7 +3918,10 @@ class MainWindow(QMainWindow):
         a_open_folder.setEnabled(j["status"] == "done")
         a_open_location.setEnabled(j["status"] == "done")
         a_copy_file.setEnabled(j["status"] == "done")
-        a_resume.setEnabled(j["status"] in ("paused", "stopped"))
+        retrying = bool(_retry_text(j))
+        if retrying:
+            a_resume.setText("Retry now")
+        a_resume.setEnabled(j["status"] in ("paused", "stopped", "error") or retrying)
         a_stop.setEnabled(j["status"] in ("downloading", "queued"))
         a_redl.setEnabled(j["status"] in ("done", "error", "stopped"))
         chosen = m.exec(self.table.viewport().mapToGlobal(pos))
@@ -3143,6 +3941,8 @@ class MainWindow(QMainWindow):
             self._ctx_stop()
         elif chosen == a_redl:
             self._ctx_redownload()
+        elif chosen in q_actions:
+            self._reorder(self._current_ctx, q_actions[chosen])
         elif chosen in cat_actions:
             try:
                 self.api.set_category(self._current_ctx, cat_actions[chosen])
@@ -3173,6 +3973,21 @@ class MainWindow(QMainWindow):
             fresh = next((x for x in self.model.items
                           if x["id"] == self._current_ctx), j)
             self._show_props(fresh)
+
+    def _reorder(self, jid, action):
+        def _do():
+            try:
+                self.api.reorder(jid, action)
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+        QTimer.singleShot(400, self.refresh)
+
+    def _reorder_selected(self, action):
+        rows = self._selected_rows()
+        if len(rows) != 1 or rows[0].get("status") != "queued":
+            return
+        self._reorder(rows[0]["id"], action)
 
     def _ctx_open(self):
         jid = getattr(self, "_current_ctx", None)

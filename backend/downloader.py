@@ -3,9 +3,16 @@ from pathlib import Path
 import glob
 import os
 import requests
+
+# v5: must run before yt_dlp is imported so a staged/override yt-dlp wins.
+import ytdlp_update
+ytdlp_update.activate()
+
 from yt_dlp import YoutubeDL
 from engines import (route_for, DownloadCancelled,
-                     _ytdlp_version_check, find_js_runtime)
+                     _ytdlp_version_check, find_js_runtime,
+                     classify_ytdlp_error, set_youtube_cooldown,
+                     youtube_cooldown_remaining, _is_youtube_url)
 import shutil
 import subprocess
 import sys
@@ -17,7 +24,7 @@ from settings import (STATE, load_settings, save_settings, safe_filename, _uniqu
                       guess_ext_from_head, stat_for, _dest_for,
                       effective_speed_limit_kbps, LIMITER, get_shutdown_pending,
                       set_shutdown_pending)
-from jobs import (JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks,
+from jobs import (start_order_key, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks,
                   transition, JobEvent, JobPhase, set_phase, resolve_playlist_dir)
 from logging_setup import log, LOG_QUEUE
 
@@ -357,7 +364,8 @@ _segment_lock = threading.Lock()
 def _probe_ranges(url, headers):
     try:
         h = requests.head(url, headers=headers, allow_redirects=True,
-                          timeout=STATE["connection_timeout"])
+                          timeout=STATE["connection_timeout"],
+                          proxies=settings.proxies_for(url))
         size = int(h.headers.get("Content-Length", 0))
         ranges = "bytes" in h.headers.get("Accept-Ranges", "").lower()
         return size, ranges
@@ -370,7 +378,8 @@ def _download_segment(job, url, idx, start, end, headers, part_path):
     h["Range"] = f"bytes={start}-{end}"
     try:
         with requests.get(url, headers=h, stream=True,
-                           timeout=STATE["connection_timeout"]) as r:
+                           timeout=STATE["connection_timeout"],
+                           proxies=settings.proxies_for(url)) as r:
             if r.status_code != 206:
                 raise RuntimeError(f"segment {idx} got HTTP {r.status_code}, expected 206")
             with open(part_path, "wb") as f:
@@ -513,7 +522,8 @@ def _run_generic_single(job_id):
 
     try:
         with requests.get(job["url"], headers=headers, stream=True,
-                          timeout=STATE["connection_timeout"]) as r:
+                          timeout=STATE["connection_timeout"],
+                          proxies=settings.proxies_for(job["url"])) as r:
             if r.status_code not in (200, 206):
                 transition(job, JobEvent.FAIL)
                 job["error"] = f"HTTP {r.status_code}"
@@ -609,10 +619,18 @@ def run_ytdlp(job_id):
         elif d["status"] == "finished":
             job["speed"] = ""
 
+    def cancel_check():
+        # Lets a Stop/Delete abort the YouTube pacing wait.
+        if job["stop_evt"].is_set():
+            raise DownloadCancelled()
+
     from engines import route_for
     engine = route_for(job["url"])[0]
     opts = {"headers": headers,
             "job_id": job_id,
+            "cancel_check": cancel_check,
+            "use_title": bool(job.get("auto_name")) and not job.get("download_playlist"),
+            "no_archive": bool(job.get("no_archive")),
             "download_playlist": job.get("download_playlist", False),
             "playlist_item": bool(job.get("playlist_id")),
             "target_format": (job.get("target_format") or "").lower(),
@@ -631,6 +649,8 @@ def run_ytdlp(job_id):
             log(f"job {job_id}: post-download filename fixup failed: {e}")
         transition(job, JobEvent.COMPLETE)
         job["completed_ts"] = time.time()
+        job["retry_count"] = 0
+        job["retry_after"] = 0
         log(f"job {job_id}: complete ✓ ({job['filename']})")
         if job.get("download_playlist"):
             # Legacy whole-playlist job: remember which folder it wrote into
@@ -652,11 +672,60 @@ def run_ytdlp(job_id):
         transition(job, JobEvent.STOP)
         log(f"job {job_id}: stopped")
     except Exception as e:
-        transition(job, JobEvent.FAIL)
-        job["error"] = str(e)
-        log(f"job {job_id}: FAILED — {e}")
+        _handle_ytdlp_failure(job_id, job, e)
     finally:
         save_jobs_snapshot()
+
+
+# Auto-retry schedule (seconds), indexed by attempt number. rate_limit waits
+# long because the IP is being throttled; network blips retry quickly.
+_RETRY_BACKOFF = {"rate_limit": (120, 300, 600), "network": (15, 45, 135)}
+
+
+def _handle_ytdlp_failure(job_id, job, exc):
+    """Classify a yt-dlp failure and either auto-retry, hold YouTube, or fail."""
+    raw = str(exc)
+    kind = classify_ytdlp_error(raw)
+    job["error_kind"] = kind
+    youtube = _is_youtube_url(job["url"])
+
+    if kind == "bot_check":
+        # Never auto-retry: retrying a bot check digs the hole deeper.
+        mins = max(1, int(STATE.get("ytdlp_bot_cooldown_minutes", 30) or 30))
+        if youtube:
+            set_youtube_cooldown(mins * 60, "bot check")
+        transition(job, JobEvent.FAIL)
+        job["error"] = (f"YouTube flagged this connection (bot check). YouTube jobs "
+                        f"are held for {mins} min. Switch network/VPN, then press "
+                        f"Resume to try again now. [{raw[:200]}]")
+        log(f"job {job_id}: FAILED (bot check) — YouTube held {mins} min")
+        return
+
+    schedule = _RETRY_BACKOFF.get(kind)
+    attempt = int(job.get("retry_count") or 0)
+    max_retries = max(0, int(STATE.get("max_retries", 3) or 0))
+    if (schedule and attempt < max_retries and not job["stop_evt"].is_set()):
+        delay = schedule[min(attempt, len(schedule) - 1)]
+        try:
+            transition(job, JobEvent.RETRY)
+        except ValueError:
+            transition(job, JobEvent.FAIL)
+            job["error"] = raw
+            log(f"job {job_id}: FAILED — {raw}")
+            return
+        job["retry_count"] = attempt + 1
+        job["retry_after"] = time.time() + delay
+        job["speed"] = ""
+        job["error"] = None
+        if kind == "rate_limit" and youtube:
+            set_youtube_cooldown(delay, "rate limited (429)")
+        log(f"job {job_id}: {kind} error, auto-retry {attempt + 1}/{max_retries} "
+            f"in {delay}s — {raw[:160]}")
+        return
+
+    transition(job, JobEvent.FAIL)
+    job["error"] = raw
+    log(f"job {job_id}: FAILED ({kind}) — {raw}")
 
 
 # job_id -> worker Thread. Private to this module and never serialized (job
@@ -678,7 +747,61 @@ def start_job_thread(job_id):
     t.start()
 
 
+_V5_SERVICES_STARTED = False
+_DISK_STATE = {"checked": 0.0, "low": False, "free_mb": 0}
+
+
+def _start_v5_services():
+    """Background update scheduler; started once from the dispatcher thread."""
+    global _V5_SERVICES_STARTED
+    if _V5_SERVICES_STARTED:
+        return
+    _V5_SERVICES_STARTED = True
+    try:
+        import updater
+        updater.start_update_scheduler()
+    except Exception as e:
+        log(f"update scheduler not started: {e}")
+
+
+def low_disk():
+    """True when free space on the output drive is below min_free_space_mb.
+    Cached for 10 s so the 1 Hz dispatcher doesn't stat the disk each tick."""
+    now = time.time()
+    if now - _DISK_STATE["checked"] < 10:
+        return _DISK_STATE["low"]
+    _DISK_STATE["checked"] = now
+    try:
+        floor = int(STATE.get("min_free_space_mb", 500) or 0)
+    except (TypeError, ValueError):
+        floor = 0
+    free_mb = settings.disk_usage_for()["free"] // (1024 * 1024)
+    low = bool(floor) and free_mb < floor
+    if low != _DISK_STATE["low"]:
+        log(f"low disk space: {free_mb} MB free (limit {floor} MB), new downloads paused"
+            if low else f"disk space recovered: {free_mb} MB free, downloads resume")
+    _DISK_STATE.update(low=low, free_mb=free_mb)
+    return low
+
+
+def queue_status():
+    """Summary for /queue-status (extension badge, future GUI indicators)."""
+    jobs = list(JOBS.values())
+    now = time.time()
+    low_disk()  # refresh cache
+    return {
+        "active": sum(1 for j in jobs if j["status"] == "downloading"),
+        "queued": sum(1 for j in jobs if j["status"] == "queued"),
+        "retrying": sum(1 for j in jobs if j["status"] == "queued"
+                        and (j.get("retry_after") or 0) > now),
+        "youtube_hold_s": int(youtube_cooldown_remaining()),
+        "low_disk": _DISK_STATE["low"],
+        "free_mb": _DISK_STATE["free_mb"],
+    }
+
+
 def dispatcher_loop():
+    _start_v5_services()
     while True:
         time.sleep(1)
         # An uncaught exception here used to end this thread silently and
@@ -690,15 +813,25 @@ def dispatcher_loop():
                 _WORKERS.pop(jid, None)
             if not STATE["queue_running"]:
                 continue
+            if low_disk():
+                continue  # don't start new jobs on a nearly full drive
             active = sum(1 for j in list(JOBS.values()) if j["status"] == "downloading")
             slots = STATE["max_concurrent"] - active
             if slots <= 0:
                 continue
             started = 0
-            for jid, j in list(JOBS.items()):
+            yt_hold = youtube_cooldown_remaining() > 0
+            for jid, j in sorted(list(JOBS.items()), key=lambda kv: start_order_key(kv[1])):
                 if started >= slots:
                     break
                 if j["status"] == "queued":
+                    # v5: honor auto-retry delays and the YouTube hold.
+                    # Skipped jobs stay queued and don't use up a slot.
+                    if (j.get("retry_after") or 0) > time.time():
+                        continue
+                    if (yt_hold and j.get("type") != "generic"
+                            and _is_youtube_url(j.get("url"))):
+                        continue
                     try:
                         start_job_thread(jid)
                         started += 1

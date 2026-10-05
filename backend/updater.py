@@ -23,7 +23,9 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from logging_setup import log
-from settings import APP_VERSION
+from settings import APP_VERSION, STATE, save_settings
+import threading
+import time
 
 
 REPO = "Zixnano/VidGrab"
@@ -176,3 +178,84 @@ def apply_update() -> bool:
 
 if __name__ == "__main__":
     apply_update()
+
+
+
+# --------------------------------------------------------------------------
+# v5: background update scheduler. Checks the app release and yt-dlp every
+# `update_check_hours`; never installs the app on its own (it only records
+# that one is available), and stages yt-dlp for the next launch.
+# --------------------------------------------------------------------------
+_UPDATE_STATE = {"available": "", "url": "", "checked_ts": 0, "error": ""}
+_UPDATE_HOOKS = []          # callables(tag) a GUI can register for a toast
+_SCHED_STARTED = False
+
+
+def register_update_hook(fn):
+    _UPDATE_HOOKS.append(fn)
+
+
+def get_update_state():
+    st = dict(_UPDATE_STATE)
+    st["skipped"] = STATE.get("skipped_update_tag", "")
+    return st
+
+
+def skip_version(tag):
+    STATE["skipped_update_tag"] = tag
+    save_settings()
+    if _UPDATE_STATE["available"] == tag:
+        _UPDATE_STATE["available"] = ""
+
+
+def _check_once():
+    # App releases only apply to the installed exe.
+    if STATE.get("auto_update_check", True) and getattr(sys, "frozen", False):
+        try:
+            tag, url = check_for_update(_installed_tag(_install_root()))
+            _UPDATE_STATE.update(checked_ts=time.time(), error="")
+            if tag and tag != STATE.get("skipped_update_tag"):
+                new = tag != _UPDATE_STATE["available"]
+                _UPDATE_STATE.update(available=tag, url=url or "")
+                if new:
+                    log(f"updater: app update {tag} is available")
+                    for fn in list(_UPDATE_HOOKS):
+                        try:
+                            fn(tag)
+                        except Exception as e:
+                            log(f"updater: hook failed: {e}")
+            elif not tag:
+                _UPDATE_STATE["available"] = ""
+        except Exception as e:
+            _UPDATE_STATE["error"] = str(e)
+            log(f"updater: scheduled check failed: {e}")
+    if STATE.get("ytdlp_auto_update", True):
+        try:
+            import ytdlp_update
+            ytdlp_update.update_ytdlp()
+        except Exception as e:
+            log(f"updater: yt-dlp check failed: {e}")
+
+
+def start_update_scheduler():
+    """Start the background loop once. First check runs a minute after
+    launch so startup stays fast; later checks use update_check_hours."""
+    global _SCHED_STARTED
+    if _SCHED_STARTED:
+        return
+    _SCHED_STARTED = True
+
+    def loop():
+        time.sleep(60)
+        while True:
+            try:
+                _check_once()
+            except Exception as e:
+                log(f"updater: scheduler error: {e}")
+            try:
+                hours = max(1.0, float(STATE.get("update_check_hours", 6) or 6))
+            except (TypeError, ValueError):
+                hours = 6.0
+            time.sleep(hours * 3600)
+
+    threading.Thread(target=loop, daemon=True, name="update-scheduler").start()

@@ -1,0 +1,32 @@
+[debug] Command-line config: ['-v', 'https://www.youtube.com/watch?v=WJpEESS6gdI', '-s']
+[debug] Encodings: locale cp1252, fs utf-8, pref cp1252, out cp1252 (No ANSI), error cp1252 (No ANSI), screen cp1252 (No ANSI)
+[debug] yt-dlp version stable@2026.08.19 from yt-dlp/yt-dlp [594bd50c2] (pip)
+[debug] Python 3.14.7 (CPython AMD64 64bit) - Windows-10-10.0.19045-SP0 (OpenSSL 3.5.7 9 Jun 2026)
+[debug] exe versions: ffmpeg 9.0.1-essentials_build-www.gyan.dev (setts), ffprobe 9.0.1-essentials_build-www.gyan.dev
+[debug] Optional libraries: certifi-2026.07.22, pycrypto-3.23.0, requests-2.34.2, sqlite3-3.50.4, urllib3-2.8.0
+[debug] JS runtimes: none
+[debug] Proxy map: {}
+[debug] Request Handlers: urllib, requests
+[debug] Plugin directories: none
+[debug] Loaded 1744 extractors
+[debug] [youtube] [pot] PO Token Providers: none
+[debug] [youtube] [pot] PO Token Cache Providers: memory
+[debug] [youtube] [pot] PO Token Cache Spec Providers: webpo
+[debug] [youtube] [jsc] JS Challenge Providers: bun (unavailable), deno (unavailable), node (unavailable), quickjs (unavailable)
+[youtube] Extracting URL: https://www.youtube.com/watch?v=WJpEESS6gdI
+[youtube] WJpEESS6gdI: Downloading webpage
+WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+[debug] [youtube] Forcing "main" player JS variant for player 8ab5c328
+        original url = /s/player/8ab5c328/player_es6.vflset/en_US/base.js
+[youtube] WJpEESS6gdI: Downloading visionos player API JSON
+[debug] [youtube] WJpEESS6gdI: visionos player response playability status: LOGIN_REQUIRED
+WARNING: [youtube] No title found in player responses; falling back to title from initial data. Other metadata may also be missing
+ERROR: [youtube] WJpEESS6gdI: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+  File "C:\Users\Zix Nano\Downloads\Compressed\Video grabber\Video grabber New\backend\.venv\Lib\site-packages\yt_dlp\extractor\common.py", line 765, in extract
+    ie_result = self._real_extract(url)
+  File "C:\Users\Zix Nano\Downloads\Compressed\Video grabber\Video grabber New\backend\.venv\Lib\site-packages\yt_dlp\extractor\youtube\_video.py", line 4076, in _real_extract
+    self.raise_no_formats(reason, expected=True)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Zix Nano\Downloads\Compressed\Video grabber\Video grabber New\backend\.venv\Lib\site-packages\yt_dlp\extractor\common.py", line 1272, in raise_no_formats
+    raise ExtractorError(msg, expected=expected, video_id=video_id)
+

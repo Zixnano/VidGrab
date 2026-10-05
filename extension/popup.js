@@ -49,15 +49,37 @@ let searchText = "";
 async function checkBackend() {
   const statusEl = document.getElementById("status");
   try {
-    const res = await fetch(`${BACKEND_BASE}/health`);
-    if (res.ok) {
-      statusEl.textContent = "Desktop app connected ✓";
-      statusEl.className = "ok";
+    const res = await fetch(`${BACKEND_BASE}/ping`);
+    if (!res.ok) throw new Error("bad status");
+    const { apiToken } = await chrome.storage.local.get("apiToken");
+    if (!apiToken) {
+      statusEl.textContent = "App running, but not paired. Open this extension's Options and test the connection.";
+      statusEl.className = "bad";
       return true;
     }
-    throw new Error("bad status");
+    let extra = "";
+    try {
+      const q = await fetch(`${BACKEND_BASE}/queue-status`, { headers: { "X-API-Token": apiToken } });
+      if (q.status === 401) {
+        statusEl.textContent = "App running, but the saved token was rejected. Re-pair in Options.";
+        statusEl.className = "bad";
+        return true;
+      }
+      if (q.ok) {
+        const s = await q.json();
+        const bits = [];
+        if (s.active) bits.push(`${s.active} downloading`);
+        if (s.queued) bits.push(`${s.queued} queued`);
+        if (s.youtube_hold_s > 0) bits.push(`YouTube held ${Math.ceil(s.youtube_hold_s / 60)} min`);
+        if (s.low_disk) bits.push("low disk space");
+        extra = bits.length ? " · " + bits.join(" · ") : "";
+      }
+    } catch (e) { /* older app without /queue-status: plain status */ }
+    statusEl.textContent = "Desktop app connected ✓" + extra;
+    statusEl.className = "ok";
+    return true;
   } catch (e) {
-    statusEl.textContent = "Desktop app not running — launch it, then reopen this popup.";
+    statusEl.textContent = "Desktop app not running. Launch it, then reopen this popup.";
     statusEl.className = "bad";
     return false;
   }
@@ -80,9 +102,98 @@ function setItems(items, tabRef) {
   renderMedia();
 }
 
+// ---- v5: recent downloads (live) and the per-site pill switch -------------
+function fmtB(n) {
+  if (!n) return "";
+  const u = ["B", "KB", "MB", "GB"]; let i = 0; let v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+
+async function refreshRecent() {
+  const box = document.getElementById("recent");
+  const list = document.getElementById("recentList");
+  try {
+    const { apiToken } = await chrome.storage.local.get("apiToken");
+    if (!apiToken) { box.style.display = "none"; return; }
+    const res = await fetch(`${BACKEND_BASE}/jobs`, { headers: { "X-API-Token": apiToken } });
+    if (!res.ok) { box.style.display = "none"; return; }
+    const jobs = Object.values(await res.json());
+    jobs.sort((a, b) => (b.created_ts || 0) - (a.created_ts || 0));
+    const recent = jobs.filter((j) => j.status !== "skipped").slice(0, 5);
+    if (!recent.length) { box.style.display = "none"; return; }
+    list.textContent = "";
+    for (const j of recent) {
+      const pct = j.size_total ? Math.min(100, Math.round(100 * (j.size_done || 0) / j.size_total))
+                               : (j.status === "done" ? 100 : 0);
+      const row = document.createElement("div");
+      row.className = "rjob" + (j.status === "error" ? " err" : "");
+      const name = document.createElement("span");
+      name.className = "rname"; name.textContent = j.filename || j.url; name.title = j.filename || "";
+      const bar = document.createElement("div");
+      bar.className = "rbar";
+      const fill = document.createElement("i"); fill.style.width = pct + "%";
+      bar.appendChild(fill);
+      const meta = document.createElement("div");
+      meta.className = "rmeta";
+      const stat = document.createElement("span");
+      stat.className = "rstat";
+      const retrying = j.status === "queued" && (j.retry_after || 0) > Date.now() / 1000;
+      stat.textContent = retrying ? "retrying soon" : j.status + (j.status === "downloading" ? ` ${pct}%` : "");
+      const right = document.createElement("span");
+      right.textContent = j.status === "downloading" ? (j.speed || "") : fmtB(j.size_total);
+      meta.appendChild(stat); meta.appendChild(right);
+      row.appendChild(name); row.appendChild(bar); row.appendChild(meta);
+      list.appendChild(row);
+    }
+    box.style.display = "block";
+  } catch (e) {
+    box.style.display = "none";
+  }
+}
+
+function startRecent() {
+  refreshRecent();
+  setInterval(refreshRecent, 1500);
+}
+
+async function setupSiteSwitch() {
+  const btn = document.getElementById("siteToggle");
+  const nameEl = document.getElementById("siteName");
+  const row = document.getElementById("siteRow");
+  let host = "";
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    host = new URL(tab.url).hostname.replace(/^www\./, "").toLowerCase();
+  } catch (e) {}
+  if (!host) { row.style.display = "none"; return; }
+  nameEl.textContent = host;
+  const paint = async () => {
+    const { disabledSites = [] } = await chrome.storage.local.get("disabledSites");
+    const off = disabledSites.includes(host);
+    btn.textContent = off ? "Show pill on this site" : "Hide pill on this site";
+  };
+  btn.addEventListener("click", async () => {
+    const { disabledSites = [] } = await chrome.storage.local.get("disabledSites");
+    const next = disabledSites.includes(host)
+      ? disabledSites.filter((h) => h !== host) : [...disabledSites, host];
+    await chrome.storage.local.set({ disabledSites: next });
+    paint();
+  });
+  paint();
+}
+
+const TINY_BYTES = 100 * 1024;
+
 function visibleItems() {
+  const hideTiny = document.getElementById("hideTiny");
+  const tinyOn = !hideTiny || hideTiny.checked;
   return mediaItems.filter((it) => {
     if (filterSet && !filterSet.has(categoryOf(it.url))) return false;
+    // Known-size tiny files are almost always page assets, not downloads.
+    // HLS/DASH manifests are tiny by nature, so they are exempt.
+    if (tinyOn && it.size > 0 && it.size < TINY_BYTES
+        && categoryOf(it.url) !== "m3u8") return false;
     if (searchText) {
       const hay = (it.url + " " + fileName(it.url)).toLowerCase();
       if (!hay.includes(searchText)) return false;
@@ -101,11 +212,38 @@ function renderMedia() {
   } else {
     for (const it of visible) list.appendChild(rowEl(it));
   }
-  const checked = mediaItems.filter((i) => i.checked);
+  const checked = visible.filter((i) => i.checked);
+  const hidden = mediaItems.length - visible.length;
   statusEl.textContent = mediaItems.length
-    ? `${checked.length} of ${mediaItems.length} selected`
+    ? `${checked.length} of ${visible.length} selected` + (hidden ? ` (${hidden} hidden by filter)` : "")
     : "";
   updateToolbar();
+  probeUnknownSizes(visible);
+}
+
+// HEAD-probe items whose size is unknown (a few at a time) so the tiny-file
+// filter and the size labels have real numbers. Extension pages are exempt
+// from CORS thanks to host_permissions.
+const _sizeProbed = new Set();
+async function probeUnknownSizes(items) {
+  const todo = items.filter((i) => !i.size && !_sizeProbed.has(i.url)
+                                   && /^https?:/i.test(i.url)).slice(0, 25);
+  if (!todo.length) return;
+  todo.forEach((i) => _sizeProbed.add(i.url));
+  let changed = false;
+  const queue = todo.slice();
+  const worker = async () => {
+    while (queue.length) {
+      const it = queue.shift();
+      try {
+        const r = await fetch(it.url, { method: "HEAD", signal: AbortSignal.timeout(6000) });
+        const n = parseInt(r.headers.get("content-length") || "0", 10) || 0;
+        if (n) { it.size = n; changed = true; }
+      } catch (e) { /* leave size unknown */ }
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  if (changed) renderMedia();
 }
 
 function rowEl(it) {
@@ -168,15 +306,17 @@ function setStatus(text) {
 // ---------------- toolbar ----------------
 
 function updateToolbar() {
-  const checked = mediaItems.filter((i) => i.checked);
+  const checked = visibleItems().filter((i) => i.checked);
   document.getElementById("btnMerge").disabled =
     !checked.some((i) => categoryOf(i.url) === "m3u8");
   document.getElementById("btnDownload").disabled = !checked.length;
+  document.getElementById("btnDownload").textContent =
+    checked.length ? `Download (${checked.length})` : "Download";
   document.getElementById("btnCopy").disabled = !checked.length;
 }
 
 function sendBatch(viaMerge) {
-  const checked = mediaItems.filter((i) => i.checked);
+  const checked = visibleItems().filter((i) => i.checked);
   if (!checked.length) return;
   if (viaMerge && checked.some((i) => categoryOf(i.url) === "m3u8")) {
     if (!confirm("HLS streams (.m3u8) will be merged into a single file by the desktop app. Continue?")) return;
@@ -261,10 +401,24 @@ function selectOtherTab(tabId, activate) {
 // ---------------- filter / search ----------------
 
 function rebuildFilterSet() {
-  const boxes = Array.from(document.querySelectorAll("#filterPanel input[type=checkbox]"));
+  const boxes = Array.from(document.querySelectorAll("#filterPanel input[data-type], #filterPanel input[value]"))
+    .filter((b) => b.value && b.id !== "hideTiny");
   const on = new Set(boxes.filter((b) => b.checked).map((b) => b.value));
   filterSet = on.size === boxes.length ? null : on;
+  const tiny = document.getElementById("hideTiny");
+  chrome.storage.local.set({ popupFilter: { types: Array.from(on), hideTiny: tiny ? tiny.checked : true } });
   renderMedia();
+}
+
+async function restoreFilter() {
+  const { popupFilter } = await chrome.storage.local.get("popupFilter");
+  if (!popupFilter || !Array.isArray(popupFilter.types)) return;
+  const want = new Set(popupFilter.types);
+  document.querySelectorAll("#filterPanel input[value]").forEach((b) => {
+    if (b.id !== "hideTiny") b.checked = want.has(b.value);
+  });
+  const tiny = document.getElementById("hideTiny");
+  if (tiny && typeof popupFilter.hideTiny === "boolean") tiny.checked = popupFilter.hideTiny;
 }
 
 // ---------------- grab-all (secondary, unchanged feature) ----------------
@@ -371,6 +525,8 @@ async function grabAll(tab) {
 
 (async () => {
   await checkBackend();
+  startRecent();
+  setupSiteSwitch();
 
   document.getElementById("tabCurrent").addEventListener("click", () => showTab("current"));
   document.getElementById("tabOther").addEventListener("click", () => showTab("other"));
@@ -378,7 +534,7 @@ async function grabAll(tab) {
   document.getElementById("btnMerge").addEventListener("click", () => sendBatch(true));
   document.getElementById("btnDownload").addEventListener("click", () => sendBatch(false));
   document.getElementById("btnCopy").addEventListener("click", () => {
-    const urls = mediaItems.filter((i) => i.checked).map((i) => i.url);
+    const urls = visibleItems().filter((i) => i.checked).map((i) => i.url);
     if (!urls.length) return;
     navigator.clipboard.writeText(urls.join("\n")).then(() =>
       setStatus(`Copied ${urls.length} URL(s) ✓`));
@@ -392,11 +548,15 @@ async function grabAll(tab) {
     renderMedia();
   });
   document.getElementById("btnFilter").addEventListener("click", () => {
+    // Read the real state: the panel's initial display comes from CSS, so
+    // comparing the inline style made the first click a no-op.
     const p = document.getElementById("filterPanel");
-    p.style.display = p.style.display === "none" ? "block" : "none";
+    p.style.display = getComputedStyle(p).display === "none" ? "block" : "none";
   });
+  await restoreFilter();
   document.querySelectorAll("#filterPanel input[type=checkbox]")
     .forEach((b) => b.addEventListener("change", rebuildFilterSet));
+  rebuildFilterSet();
   document.getElementById("btnClear").addEventListener("click", () => {
     if (!currentTab) return;
     chrome.runtime.sendMessage({ type: "CLEAR_VIDEOS", tabId: currentTab.id }, () => {

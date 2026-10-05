@@ -15,12 +15,13 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from downloader import maybe_convert_to_mp4, _repair_recording, _probe_recording, _CREATE_NO_WINDOW, _WORKERS
+from downloader import maybe_convert_to_mp4, _repair_recording, _probe_recording, _CREATE_NO_WINDOW, _WORKERS, queue_status
+from engines import clear_youtube_cooldown
 from settings import MAX_UPLOAD_BYTES
 import queue
 import html
 from settings import APP_PORT, APP_VERSION, STATE, save_settings, safe_filename, guess_filename, _unique_path, _dest_for, stat_for, disk_usage_for
-from jobs import transition, repair_status, JobEvent, JobPhase, set_phase, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks, _fire_show_dialog_hooks
+from jobs import reorder_job, transition, repair_status, JobEvent, JobPhase, set_phase, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks, _fire_show_dialog_hooks
 
 from logging_setup import log, LOG_QUEUE
 
@@ -40,6 +41,9 @@ TOKEN_PROTECTED_PATHS = {
     "/probe", "/rules", "/jobs", "/stats", "/convert", "/logs",
     "/category", "/probe-head", "/settings", "/probe-formats",
     "/upload-token", "/redownload", "/show-add-dialog",
+    "/clear-failed", "/queue-status", "/dup-check", "/favicon",
+    "/update-status", "/update-skip", "/ytdlp-update", "/ytdlp-rollback",
+    "/reorder",
 }
 
 # Random per-launch key, embedded in the LAN web UI's action links so that
@@ -141,7 +145,7 @@ def ping():
     """Liveness + pairing-state probe for the Options 'Test connection'
     button. Unlike /pair this never flips _PAIR_GRANTED, so it can be
     called any number of times per session."""
-    return jsonify({"ok": True, "paired": _PAIR_GRANTED})
+    return jsonify({"ok": True, "paired": _PAIR_GRANTED, "version": APP_VERSION})
 
 @app.route("/download", methods=["POST"])
 def download():
@@ -149,6 +153,7 @@ def download():
     url = data.get("url")
     if not url:
         return jsonify({"error": "missing url"}), 400
+    dup = _find_duplicate(url)
     jid = new_job(
         url, filename=data.get("filename"), category=data.get("category"),
         referer=data.get("referer"), cookie=data.get("cookie"),
@@ -156,8 +161,11 @@ def download():
         format_id=data.get("format_id"), target_format=data.get("target_format"),
         resolution=data.get("resolution"), multi=bool(data.get("multi")),
         download_playlist=data.get("download_playlist", False),
+        page_url=data.get("page_url"),
     )
-    return jsonify({"job_id": jid})
+    # The job is still created (re-downloading on purpose is legitimate);
+    # the hint lets the caller tell the user it was a repeat.
+    return jsonify({"job_id": jid, "duplicate_of": dup["id"] if dup else None})
 
 @app.route("/show-add-dialog", methods=["POST"])
 def show_add_dialog():
@@ -174,6 +182,8 @@ def show_add_dialog():
     pick = bool(data.get("pick_playlist") or data.get("download_playlist"))
     if pick:
         log("show-add-dialog: playlist picker requested")
+    dup = None if pick else _find_duplicate(url)
+    dup_id = dup["id"] if dup else None
     if STATE.get("skip_add_dialog") and not pick:
         jid = new_job(
             url, filename=data.get("filename"),
@@ -183,8 +193,10 @@ def show_add_dialog():
             format_id=data.get("format_id"),
             target_format=data.get("target_format"),
             download_playlist=data.get("download_playlist", False),
+            page_url=data.get("page_url"),
         )
-        return jsonify({"ok": True, "auto_queued": True, "job_id": jid})
+        return jsonify({"ok": True, "auto_queued": True, "job_id": jid,
+                        "duplicate_of": dup_id})
     _fire_show_dialog_hooks({
         "url": url,
         "filename": data.get("filename"),
@@ -196,8 +208,11 @@ def show_add_dialog():
         "target_format": data.get("target_format"),
         "download_playlist": data.get("download_playlist", False),
         "pick_playlist": pick,
+        "page_url": data.get("page_url"),
+        "duplicate_of": dup_id,
+        "_req_ts": time.time(),   # lets the GUI log how long the dialog took to open
     })
-    return jsonify({"ok": True, "auto_queued": False})
+    return jsonify({"ok": True, "auto_queued": False, "duplicate_of": dup_id})
 
 @app.route("/batch", methods=["POST"])
 def batch():
@@ -235,6 +250,7 @@ def batch():
             target_format=it.get("target_format"),
             resolution=it.get("resolution"), multi=bool(it.get("multi")),
             download_playlist=it.get("download_playlist", data.get("download_playlist", False)),
+            page_url=data.get("page_url") or data.get("referer"),
             **pl,
         ))
     if deferred_save:
@@ -255,6 +271,11 @@ def _job_action(job_id, action):
         job["pause_evt"].clear()
         job["stop_evt"].clear()
         job["error"] = None
+        # v5: a manual Resume overrides auto-retry delays and the YouTube
+        # hold (e.g. the user just switched VPN after a bot check).
+        job["retry_count"] = 0
+        job["retry_after"] = 0
+        clear_youtube_cooldown()
         w = _WORKERS.get(job_id)
         if (job["status"] == "paused" and job.get("type") != "generic"
                 and w is not None and w.is_alive()):
@@ -316,6 +337,10 @@ def redownload(job_id):
     job["pause_evt"].clear()
     job["stop_evt"].clear()
     job["error"] = None
+    job["retry_count"] = 0
+    job["retry_after"] = 0
+    job["no_archive"] = True   # an explicit redownload must not be skipped
+    clear_youtube_cooldown()
     job["size_done"] = 0
     job["size_total"] = 0
     transition(job, JobEvent.RESUME)
@@ -493,6 +518,154 @@ def upload():
 @app.route("/stats", methods=["GET"])
 def stats():
     return jsonify({"samples": STATE.get("download_stats", [])[-600:]})
+
+
+def _norm_url_key(url):
+    """Compare URLs ignoring fragments; YouTube links by video id."""
+    try:
+        u = urlparse(url or "")
+        host = (u.hostname or "").lower()
+        if host == "youtu.be":
+            return "yt:" + u.path.strip("/")
+        if host.endswith("youtube.com"):
+            m = re.search(r"(?:^|&)v=([\w-]{11})", u.query or "")
+            if m:
+                return "yt:" + m.group(1)
+        return u._replace(fragment="").geturl()
+    except Exception:
+        return url or ""
+
+
+def _find_duplicate(url):
+    key = _norm_url_key(url)
+    for j in list(JOBS.values()):
+        if (j.get("status") in ("done", "downloading", "queued", "paused")
+                and _norm_url_key(j.get("url")) == key):
+            return j
+    return None
+
+
+@app.route("/reorder/<jid>", methods=["POST"])
+def reorder(jid):
+    """Move a queued job in the start order: {"action": top|up|down|bottom}."""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        pos = reorder_job(jid, str(data.get("action") or ""))
+    except KeyError:
+        return jsonify({"error": "no such job"}), 404
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if pos is None:
+        return jsonify({"error": "only queued jobs can be reordered"}), 409
+    save_jobs_snapshot()
+    return jsonify({"ok": True, "position": pos})
+
+
+@app.route("/dup-check", methods=["POST"])
+def dup_check():
+    data = request.get_json(force=True, silent=True) or {}
+    j = _find_duplicate(data.get("url") or "")
+    return jsonify({"duplicate": ({"job_id": j["id"], "status": j["status"],
+                                   "filename": j.get("filename")} if j else None)})
+
+
+@app.route("/queue-status", methods=["GET"])
+def queue_status_route():
+    return jsonify(queue_status())
+
+
+@app.route("/clear-failed", methods=["POST"])
+def clear_failed():
+    """Remove error rows (and their partial files). Optional JSON body:
+    {"older_than_hours": N} limits it to rows at least that old."""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        hours = float(data.get("older_than_hours") or 0)
+    except (TypeError, ValueError):
+        hours = 0
+    cutoff = time.time() - hours * 3600
+    removed = 0
+    for jid, j in list(JOBS.items()):
+        if j.get("status") != "error":
+            continue
+        if hours and (j.get("created_ts") or 0) > cutoff:
+            continue
+        j["stop_evt"].set()
+        cleanup_partial_files(j)
+        JOBS.pop(jid, None)
+        removed += 1
+    if removed:
+        save_jobs_snapshot()
+    return jsonify({"removed": removed})
+
+
+_FAVICON_DOMAIN_RE = re.compile(r"^[a-z0-9.-]{3,253}$")
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+@app.route("/favicon", methods=["POST"])
+def favicon_store():
+    """The extension sends each site's favicon once (PNG data URL)."""
+    import base64
+    from settings import icons_dir
+    data = request.get_json(force=True, silent=True) or {}
+    domain = str(data.get("domain") or "").lower().strip()
+    uri = str(data.get("data_url") or "")
+    prefix = "data:image/png;base64,"
+    if not _FAVICON_DOMAIN_RE.match(domain) or not uri.startswith(prefix):
+        return jsonify({"error": "bad favicon request"}), 400
+    try:
+        raw = base64.b64decode(uri[len(prefix):], validate=True)
+    except Exception:
+        return jsonify({"error": "bad base64"}), 400
+    if len(raw) > 65536 or not raw.startswith(_PNG_MAGIC):
+        return jsonify({"error": "not a small PNG"}), 400
+    d = icons_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (domain + ".png")).write_bytes(raw)
+    return jsonify({"ok": True})
+
+
+@app.route("/favicon/<domain>", methods=["GET"])
+def favicon_get(domain):
+    from flask import send_file
+    from settings import icons_dir
+    domain = domain.lower()
+    p = icons_dir() / (domain + ".png")
+    if not _FAVICON_DOMAIN_RE.match(domain) or not p.is_file():
+        return jsonify({"error": "no icon"}), 404
+    return send_file(str(p), mimetype="image/png")
+
+
+@app.route("/update-status", methods=["GET"])
+def update_status():
+    import updater
+    import ytdlp_update
+    return jsonify({"app": updater.get_update_state(),
+                    "ytdlp": ytdlp_update.status(),
+                    "queue": queue_status()})
+
+
+@app.route("/update-skip", methods=["POST"])
+def update_skip():
+    import updater
+    data = request.get_json(force=True, silent=True) or {}
+    updater.skip_version(str(data.get("tag") or ""))
+    return jsonify({"ok": True})
+
+
+@app.route("/ytdlp-update", methods=["POST"])
+def ytdlp_update_now():
+    """Stage the newest yt-dlp now (applies on next launch)."""
+    import ytdlp_update
+    threading.Thread(target=ytdlp_update.update_ytdlp, daemon=True).start()
+    return jsonify({"started": True})
+
+
+@app.route("/ytdlp-rollback", methods=["POST"])
+def ytdlp_rollback():
+    import ytdlp_update
+    return jsonify({"removed": ytdlp_update.rollback()})
 
 @app.route("/version", methods=["GET"])
 def version():

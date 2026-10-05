@@ -140,6 +140,116 @@ chrome.runtime.onInstalled.addListener(() => {
 // the app started after the extension was installed.
 pairIfNeeded();
 
+// ---- v5: site favicon, sent once per domain so the app can show a source icon.
+const _faviconTried = new Set();
+async function noteFavicon(pageUrl) {
+  try {
+    const host = new URL(pageUrl).hostname.replace(/^www\./, "").toLowerCase();
+    if (!host || _faviconTried.has(host) || /^[\d.:]+$/.test(host)) return;
+    _faviconTried.add(host);
+    const { faviconSent = {} } = await chrome.storage.local.get("faviconSent");
+    if (faviconSent[host]) return;
+    const u = new URL(chrome.runtime.getURL("/_favicon/"));
+    u.searchParams.set("pageUrl", pageUrl);
+    u.searchParams.set("size", "32");
+    const r = await fetch(u.toString());
+    if (!r.ok) { _faviconTried.delete(host); return; }
+    const blob = await r.blob();
+    if (blob.type !== "image/png" || blob.size > 60000) return;
+    const dataUrl = await new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = () => reject(fr.error);
+      fr.readAsDataURL(blob);
+    });
+    const { res } = await authedFetch("/favicon", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domain: host, data_url: dataUrl }),
+    });
+    if (res.ok) {
+      faviconSent[host] = Date.now();
+      await chrome.storage.local.set({ faviconSent });
+    } else {
+      _faviconTried.delete(host);
+    }
+  } catch (e) {
+    console.debug("Video Grabber: favicon skipped", e);
+  }
+}
+
+// Pill / context menu -> the app's Add dialog (or auto-queue if the user
+// ticked "don't show again" in the app).
+async function showAddDialogFor(msg) {
+  const alive = await checkBackend();
+  if (!alive) {
+    return { ok: false, error: "Video Grabber app isn't running." };
+  }
+  const cookie = await cookieHeaderFor(msg.url).catch(() => "");
+  const pageCookie = await cookieHeaderFor(msg.pageUrl).catch(() => "");
+  try {
+    const { res, unpaired } = await authedFetch("/show-add-dialog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: msg.url,
+        filename: msg.filename || null,
+        referer: msg.pageUrl,
+        page_url: msg.pageUrl,
+        cookie: cookie || pageCookie,
+        user_agent: navigator.userAgent,
+        format_id: msg.format_id || null,
+        target_format: msg.target_format || null,
+        download_playlist: msg.download_playlist || false,
+        pick_playlist: msg.pick_playlist || false,
+      }),
+    });
+    if (unpaired) {
+      return { ok: false, error: "Not paired yet." };
+    }
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) noteFavicon(msg.pageUrl || msg.url);
+    return { ok: res.ok, job_id: data.job_id, auto_queued: data.auto_queued,
+             duplicate_of: data.duplicate_of || null, error: data.error };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+// ---- v5: right-click "Download with Video Grabber"
+function ensureContextMenus() {
+  try {
+    chrome.contextMenus.removeAll(() => {
+      chrome.contextMenus.create({
+        id: "vg-link", title: "Download with Video Grabber",
+        contexts: ["link", "video", "audio", "image"],
+      });
+      chrome.contextMenus.create({
+        id: "vg-page", title: "Send this page to Video Grabber",
+        contexts: ["page"],
+      });
+    });
+  } catch (e) {}
+}
+chrome.runtime.onInstalled.addListener(ensureContextMenus);
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  const url = info.linkUrl || info.srcUrl || info.pageUrl;
+  if (!url || /^(blob|data):/i.test(url)) return;
+  const resp = await showAddDialogFor({
+    url, pageUrl: (tab && tab.url) || info.pageUrl || url,
+  });
+  if (!resp.ok) {
+    try {
+      chrome.notifications.create("", {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+        title: "Video Grabber",
+        message: resp.error || "Couldn't send that to the app.",
+      });
+    } catch (e) {}
+  }
+});
+
 async function sendToBackend({ url, pageUrl, filename, format_id, target_format }) {
   const alive = await checkBackend();
   if (!alive) {
@@ -154,6 +264,7 @@ async function sendToBackend({ url, pageUrl, filename, format_id, target_format 
       body: JSON.stringify({
         url,
         referer: pageUrl,
+        page_url: pageUrl,
         cookie: cookie || pageCookie,
         user_agent: navigator.userAgent,
         filename: filename || null,
@@ -165,13 +276,16 @@ async function sendToBackend({ url, pageUrl, filename, format_id, target_format 
       return { ok: false, error: "Not paired yet — open the extension's Options page and paste in the pairing token from the desktop app." };
     }
     const data = await res.json().catch(() => ({}));
-    return { ok: res.ok, job_id: data.job_id, error: data.error };
+    if (res.ok) noteFavicon(pageUrl || url);
+    return { ok: res.ok, job_id: data.job_id,
+             duplicate_of: data.duplicate_of || null, error: data.error };
   } catch (e) {
     return { ok: false, error: String(e) };
   }
 }
 
 chrome.downloads.onCreated.addListener(async (item) => {
+  const t0 = Date.now();
   const { interceptDownloads } = await chrome.storage.local.get("interceptDownloads");
   if (!interceptDownloads) return;
 
@@ -179,47 +293,46 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
   if (item.byExtensionId === chrome.runtime.id) return;
 
-  // Task 4: every intercepted download opens the app's Add dialog now —
-  // the app is what decides what to do with it, not a hardcoded extension
-  // whitelist. Only true internal-app-request exclusions remain: the
-  // backend itself (localhost/raw IP — these are the app's own HTTP
-  // traffic, not user downloads) and the extension's own downloads
-  // (guarded above by byExtensionId). The old KNOWN_EXTS regex and its
-  // HEAD-probe-for-attachment-disposition fallback are gone — both only
-  // added latency/gaps without changing the user's actual intent, which
-  // is "show me the dialog for every download I click". Users who don't
-  // want the dialog already have the correct escape hatch server-side via
-  // the skip_add_dialog setting (api.py auto-queues instead of prompting);
-  // that logic stays in the backend and is not duplicated here.
+  // Every intercepted download opens the app's Add dialog; the app decides
+  // what to do with it. Only the backend's own traffic (localhost / raw IP)
+  // and the extension's own downloads (guarded above) are skipped. Users
+  // who don't want the dialog use skip_add_dialog in the app.
   const isLocalhost = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])/i.test(item.url);
   const isIpAddress = /^https?:\/\/\d{1,3}(\.\d{1,3}){3}/.test(item.url);
   if (isLocalhost || isIpAddress) return;
 
+  // Cancel first, everything else after: the browser keeps writing until
+  // this runs. Note Chrome only creates the download item once the server
+  // has answered, so a slow server delays this event no matter what we do;
+  // browserLag below shows how much of any delay happened before we ran.
   try {
     chrome.downloads.cancel(item.id);
   } catch (e) {
     return;
   }
+  const browserLag = item.startTime ? t0 - Date.parse(item.startTime) : -1;
 
-  let filename = null;
-  try {
-    const [full] = await chrome.downloads.search({ id: item.id });
-    if (full && full.filename) {
-      filename = full.filename.split(/[\\/]/).pop();
-    }
-  } catch (e) {}
+  // Filename lookup and cookie fetch are independent: run them together.
+  const [filename, cookie] = await Promise.all([
+    (async () => {
+      try {
+        const [full] = await chrome.downloads.search({ id: item.id });
+        if (full && full.filename) return full.filename.split(/[\\/]/).pop();
+      } catch (e) {}
+      return null;
+    })(),
+    cookieHeaderFor(item.url).catch(() => ""),
+  ]);
 
-  const cookie = await cookieHeaderFor(item.url).catch(() => "");
   let handedOff = false;
   try {
-    // v4.0.1 Fix 1: intercepted downloads open the Add dialog instead of
-    // queueing silently (skip_add_dialog still auto-queues server-side).
     const { res } = await authedFetch("/show-add-dialog", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         url: item.url,
         referer: item.referrer || "",
+        page_url: item.referrer || "",
         cookie: cookie,
         user_agent: navigator.userAgent,
         filename: filename,
@@ -229,10 +342,12 @@ chrome.downloads.onCreated.addListener(async (item) => {
   } catch (e) {
     handedOff = false;
   }
-  if (!handedOff) {
-    // The browser download was already cancelled — give it back to the
-    // browser if the app rejected the handoff (validation error, unpaired,
-    // app busy...) so the user's click never just vanishes.
+  console.debug(`[VG] intercept: browser lag ${browserLag}ms, handoff ${Date.now() - t0}ms, ok=${handedOff}`);
+  if (handedOff) {
+    noteFavicon(item.referrer || item.url);
+  } else {
+    // The browser download was already cancelled: give it back if the app
+    // rejected the handoff so the user's click never just vanishes.
     try {
       chrome.downloads.download({ url: item.url, filename: filename || undefined });
     } catch (_) {}
@@ -280,6 +395,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           body: JSON.stringify({
             items,
             referer: msg.pageUrl,
+            page_url: msg.pageUrl,
             cookie,
             user_agent: navigator.userAgent,
             download_playlist: msg.download_playlist || false,
@@ -290,6 +406,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         const data = await res.json().catch(() => ({}));
+        if (res.ok) noteFavicon(msg.pageUrl);
         sendResponse({ ok: res.ok, job_ids: data.job_ids, error: data.error });
       } catch (e) {
         sendResponse({ ok: false, error: String(e) });
@@ -366,41 +483,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "SHOW_ADD_DIALOG") {
     // Pill -> pre-download confirmation dialog in the desktop app.
-    (async () => {
-      const alive = await checkBackend();
-      if (!alive) {
-        sendResponse({ ok: false, error: "Video Grabber app isn't running." });
-        return;
-      }
-      const cookie = await cookieHeaderFor(msg.url).catch(() => "");
-      const pageCookie = await cookieHeaderFor(msg.pageUrl).catch(() => "");
-      try {
-        const { res, unpaired } = await authedFetch("/show-add-dialog", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            url: msg.url,
-            filename: msg.filename || null,
-            referer: msg.pageUrl,
-            cookie: cookie || pageCookie,
-            user_agent: navigator.userAgent,
-            format_id: msg.format_id || null,
-            target_format: msg.target_format || null,
-            download_playlist: msg.download_playlist || false,
-            pick_playlist: msg.pick_playlist || false,
-          }),
-        });
-        if (unpaired) {
-          sendResponse({ ok: false, error: "Not paired yet." });
-          return;
-        }
-        const data = await res.json().catch(() => ({}));
-        sendResponse({ ok: res.ok, job_id: data.job_id,
-                       auto_queued: data.auto_queued, error: data.error });
-      } catch (e) {
-        sendResponse({ ok: false, error: String(e) });
-      }
-    })();
+    showAddDialogFor(msg).then(sendResponse);
     return true; // async
   }
 

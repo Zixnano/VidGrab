@@ -162,6 +162,55 @@ QScrollBar::handle:horizontal:hover {{
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
     width: 0;
 }}
+QTableView::item:hover {{
+    background: {p['bg_elevated']};
+}}
+QHeaderView::section:hover {{
+    color: {p['text']};
+    background: {p['bg_panel']};
+}}
+QPushButton:disabled {{
+    color: {p['text_muted']};
+    background: {p['bg_base']};
+    border-color: {p['border']};
+}}
+QToolButton {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {p['radius']};
+    padding: 4px;
+}}
+QToolButton:hover {{
+    background: {p['bg_elevated']};
+    border-color: {p['border']};
+}}
+QTabBar QToolButton {{
+    background: {p['bg_panel']};
+    border: 1px solid {p['border']};
+}}
+QTabBar::tab:selected {{
+    border-bottom: 2px solid {p['accent']};
+}}
+QListWidget {{
+    background: {p['bg_panel']};
+    border: 1px solid {p['border']};
+    border-radius: {p['radius']};
+    outline: 0;
+}}
+QListWidget::item {{
+    padding: 8px 12px;
+    border-radius: 6px;
+}}
+QListWidget::item:hover {{
+    background: {p['bg_elevated']};
+}}
+QListWidget::item:selected {{
+    background: {p['accent_dim']};
+    color: {p['text']};
+}}
+QComboBox:hover, QSpinBox:hover, QLineEdit:hover {{
+    border-color: {p['border_hi']};
+}}
 QProgressBar {{
     background: {p['bg_elevated']};
     border: 1px solid {p['border']};

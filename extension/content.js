@@ -15,6 +15,57 @@
   const DISMISSED = new WeakSet();
   const RECORDERS = new WeakMap();
 
+  // ---- v5: per-site on/off switch and per-site quality memory -------------
+  const SITE = location.hostname.replace(/^www\./, "").toLowerCase();
+  let siteDisabled = false;
+  const LIVE = [];            // {video, wrap} for every pill we created
+  let lastQuality = {};       // host -> {res: "1920x1080"}
+
+  try {
+    chrome.storage.local.get(["disabledSites", "lastQuality"]).then((st) => {
+      siteDisabled = Array.isArray(st.disabledSites) && st.disabledSites.includes(SITE);
+      lastQuality = st.lastQuality || {};
+      if (siteDisabled) removeAllPills(); else scan();
+    }).catch(() => {});
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local") return;
+      if (changes.lastQuality) lastQuality = changes.lastQuality.newValue || {};
+      if (changes.disabledSites) {
+        const list = changes.disabledSites.newValue;
+        const now = Array.isArray(list) && list.includes(SITE);
+        if (now === siteDisabled) return;
+        siteDisabled = now;
+        if (siteDisabled) removeAllPills(); else scan();
+      }
+    });
+  } catch (e) { /* extension context gone: pills simply stay enabled */ }
+
+  function removeAllPills() {
+    while (LIVE.length) {
+      const { video, wrap } = LIVE.pop();
+      try { wrap.remove(); } catch (e) {}
+      HANDLED.delete(video);
+    }
+  }
+
+  function rememberQuality(f) {
+    if (!f || !f.resolution) return;
+    lastQuality[SITE] = { res: f.resolution };
+    try { chrome.storage.local.set({ lastQuality }); } catch (e) {}
+  }
+
+  // Put the format matching this site's last pick first and star it.
+  function orderFormats(formats) {
+    const want = lastQuality[SITE] && lastQuality[SITE].res;
+    if (!want) return { list: formats, starred: null };
+    const i = formats.findIndex((f) => f.resolution === want);
+    if (i <= 0) return { list: formats, starred: i === 0 ? formats[0] : null };
+    const list = formats.slice();
+    const [hit] = list.splice(i, 1);
+    list.unshift(hit);
+    return { list, starred: hit };
+  }
+
   // Playlist support: a YouTube watch URL carrying &list=... can be sent
   // as a single video, or to the app's playlist picker (pick_playlist) where
   // the user chooses items; each becomes its own job. list= stays in the
@@ -187,6 +238,11 @@
     return { wrap, btn, label, icon, menu, position };
   }
 
+  // v5: tell the user when a send was a repeat of something already queued.
+  function sentLabel(resp, fallback) {
+    return resp && resp.duplicate_of ? "Sent ✓ (already in your list)" : fallback;
+  }
+
   function setLabel(overlay, text, color) {
     overlay.label.textContent = text;
     if (color) overlay.icon.style.color = color;
@@ -324,7 +380,7 @@
           return;
         }
         if (resp && resp.ok) {
-          setLabel(overlay, "Sent to app ✓", "#4caf50");
+          setLabel(overlay, sentLabel(resp, "Sent to app ✓"), "#4caf50");
           setTimeout(() => setLabel(overlay, "Send page URL to Grabber", "#b388ff"), 2500);
         } else {
           setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", "#e53935");
@@ -580,10 +636,12 @@
     addDivider(menu);
   }
   function wire(video) {
+    if (siteDisabled) return;
     if (HANDLED.has(video) || DISMISSED.has(video)) return;
     HANDLED.add(video);
 
     const overlay = makeOverlay(video);
+    LIVE.push({ video, wrap: overlay.wrap });
     const isBlob = () => (video.currentSrc || "").startsWith("blob:");
     let menuOpen = false;
     let menuSeq = 0;
@@ -658,7 +716,7 @@
           return;
         }
         if (resp && resp.ok) {
-          setLabel(overlay, resp.auto_queued ? "Queued ✓" : "Sent to app ✓", "#4caf50");
+          setLabel(overlay, sentLabel(resp, resp.auto_queued ? "Queued ✓" : "Sent to app ✓"), "#4caf50");
           setTimeout(() => setLabel(overlay, "Download ▾", "#4caf50"), 2500);
         } else {
           setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", "#e53935");
@@ -718,10 +776,12 @@
             } else {
               // Task 2: no client-side truncation — the backend already
               // returns a sorted, sanity-capped list (best quality first).
-              for (const f of formats) {
+              const ordered = orderFormats(formats);
+              for (const f of ordered.list) {
                 const tf = f.ext === "webm" ? "webm" : null;
-                addMenuItem(fmtBox, formatLabel(f), {},
+                addMenuItem(fmtBox, (f === ordered.starred ? "★ " : "") + formatLabel(f), {},
                   () => {
+                    rememberQuality(f);
                     closeMenu();
                     setLabel(overlay, "Sending…");
                     chrome.runtime.sendMessage({
@@ -739,7 +799,7 @@
                       }
                       if (resp && resp.ok) {
                         setLabel(overlay,
-                          resp.auto_queued ? "Queued ✓" : "Sent to app ✓",
+                          sentLabel(resp, resp.auto_queued ? "Queued ✓" : "Sent to app ✓"),
                           "#4caf50");
                         setTimeout(() => setLabel(overlay, "Download ▾", "#4caf50"), 2500);
                       } else {
@@ -806,10 +866,11 @@
           return;
         }
         // Task 2: no client-side truncation — see note above.
-        for (const f of formats) {
+        const ordered = orderFormats(formats);
+        for (const f of ordered.list) {
           const tf = f.ext === "webm" ? "webm" : null;
-          addMenuItem(fmtBox, formatLabel(f), {},
-            () => sendChoice({ format_id: f.format_id, target_format: tf }));
+          addMenuItem(fmtBox, (f === ordered.starred ? "★ " : "") + formatLabel(f), {},
+            () => { rememberQuality(f); sendChoice({ format_id: f.format_id, target_format: tf }); });
         }
       });
     }

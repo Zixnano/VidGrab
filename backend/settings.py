@@ -119,10 +119,48 @@ STATE = {
 
 _V4_DEFAULTS = {k: v for k, v in list(STATE.items())[-12:]}
 
+# --- v5 additions. Kept in their own dict (NOT appended to STATE above):
+# _V4_DEFAULTS slices the last 12 STATE items, so appending keys there
+# would silently shift that window and drop v4 defaults from migration.
+_V5_DEFAULTS = {
+    # YouTube request pacing (yt-dlp jobs on YouTube hosts only).
+    # sleep_interval/max: random gap in seconds between YouTube job starts.
+    # 0 for max disables pacing entirely.
+    "ytdlp_sleep_interval": 5,
+    "ytdlp_max_sleep_interval": 15,
+    "ytdlp_sleep_interval_requests": 1,
+    "ytdlp_sleep_interval_subtitles": 1,
+    # How long YouTube jobs are held after a "not a bot" check. Manual
+    # Resume/Redownload clears the hold (e.g. after switching VPN).
+    "ytdlp_bot_cooldown_minutes": 30,
+    # Optional proxy (http/https/socks4/socks5/socks5h URL). Scope "youtube"
+    # sends only YouTube traffic through it; "all" sends every download.
+    "proxy_url": "",
+    "proxy_scope": "youtube",
+    # Pause starting new jobs when free space on the output drive drops
+    # below this many MB (0 disables).
+    "min_free_space_mb": 500,
+    # Background update checks.
+    "auto_update_check": True,
+    "update_check_hours": 6,
+    "skipped_update_tag": "",
+    "ytdlp_auto_update": True,
+    # Legacy whole-playlist jobs skip videos already in archive.txt.
+    "ytdlp_use_archive": True,
+    # GUI: hide failed rows older than this many hours from All/Unfinished
+    # (the Failed view still lists them). 0 = never hide.
+    "hide_old_errors_hours": 24,
+    # GUI: one tray notification when a batch of 2+ downloads finishes.
+    "notify_queue_done": True,
+}
+STATE.update(_V5_DEFAULTS)
+
 
 def _migrate_settings(old):
-    """Fill any keys missing from a v3.x settings.json with v4 defaults."""
+    """Fill any keys missing from an older settings.json with v4/v5 defaults."""
     for k, v in _V4_DEFAULTS.items():
+        old.setdefault(k, v)
+    for k, v in _V5_DEFAULTS.items():
         old.setdefault(k, v)
 
 
@@ -253,6 +291,9 @@ def _unique_path(path):
     if not path.exists():
         return path
     stem, ext = os.path.splitext(path.name)
+    # Collapse existing " (N)" suffixes first so repeats never stack into
+    # "name (2) (2).mp4".
+    stem = re.sub(r"(?: \(\d+\))+$", "", stem) or stem
     i = 2
     while True:
         candidate = path.with_name(f"{stem} ({i}){ext}")
@@ -422,3 +463,147 @@ def stat_for(job):
     return dest
 
 
+
+
+
+# ------------------------------------------------------------------ v5 ----
+# Proxy, naming, source-site and archive helpers.
+
+_PROXY_SCHEMES = ("http", "https", "socks4", "socks5", "socks5h")
+
+
+def _is_yt_host(host):
+    host = (host or "").lower()
+    return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+
+
+def proxy_for(url):
+    """Proxy URL to use for `url`, or None. Honors proxy_scope."""
+    p = str(STATE.get("proxy_url") or "").strip()
+    if not p:
+        return None
+    try:
+        u = urlparse(p)
+    except ValueError:
+        return None
+    if u.scheme.lower() not in _PROXY_SCHEMES or not u.netloc:
+        return None
+    if STATE.get("proxy_scope", "youtube") == "all":
+        return p
+    return p if _is_yt_host(urlparse(url or "").hostname) else None
+
+
+def proxies_for(url):
+    """requests-style proxies dict, or None. SOCKS needs PySocks; without
+    it the proxy is skipped (and logged once) rather than failing every
+    request."""
+    p = proxy_for(url)
+    if not p:
+        return None
+    if p.lower().startswith("socks"):
+        try:
+            import socks  # noqa: F401  (PySocks)
+        except ImportError:
+            if not getattr(proxies_for, "_warned", False):
+                proxies_for._warned = True
+                log("proxy: SOCKS proxy set but PySocks isn't installed; "
+                    "generic downloads will go direct (yt-dlp is unaffected)")
+            return None
+    return {"http": p, "https": p}
+
+
+_JUNK_STEMS = {
+    "watch", "index", "download", "downloads", "video", "videos", "playlist",
+    "file", "stream", "master", "manifest", "embed", "player", "view", "get",
+    "status", "document", "media", "content", "default", "untitled", "null",
+    "undefined", "unknown", "live", "clip",
+}
+_JUNK_PATTERN_RE = re.compile(
+    r"(?:video|download|file|watch|playlist|media)[ _-]?\(?\d*\)?(?: \(\d+\))*")
+_TITLE_SUFFIX_RE = re.compile(
+    r"\s*[-|\u2013\u2014:]\s*(?:YouTube|Twitch|Twitter|Vimeo|Facebook|Instagram|"
+    r"TikTok|Reddit|Dailymotion|Bilibili)\s*$", re.I)
+_TITLE_X_RE = re.compile(r"\s*/\s*X\s*$")
+
+
+def is_junk_stem(stem):
+    """True for names that say nothing: 'watch', 'index', pure numbers,
+    'watch (2) (2)', 'video_1', etc."""
+    s = (stem or "").strip().lower()
+    if len(s) < 2:
+        return True
+    if s in _JUNK_STEMS or s.isdigit():
+        return True
+    return bool(_JUNK_PATTERN_RE.fullmatch(s))
+
+
+def clean_title(title):
+    """Drop notification counts like '(3) ' and ' - YouTube'-style suffixes."""
+    t = re.sub(r"^\s*\(\d+\+?\)\s*", "", title or "")
+    t = _TITLE_SUFFIX_RE.sub("", t)
+    t = _TITLE_X_RE.sub("", t)
+    return t.strip()
+
+
+def site_host(url):
+    h = (urlparse(url or "").hostname or "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def source_site_for(*urls):
+    """First usable site domain among the given URLs (page, referer, file)."""
+    for u in urls:
+        h = site_host(u)
+        if h and h not in ("localhost",) and not re.fullmatch(r"[\d.:]+", h):
+            return h
+    return None
+
+
+def generated_name(url):
+    """Fallback stem when nothing better exists: site_YYYY-MM-DD_HHMMSS."""
+    parts = site_host(url).split(".")
+    label = parts[-2] if len(parts) >= 2 else (parts[0] if parts and parts[0] else "download")
+    label = re.sub(r"[^A-Za-z0-9]+", "", label) or "download"
+    return safe_filename(f"{label}_{time.strftime('%Y-%m-%d_%H%M%S')}")
+
+
+_ARCHIVE_LOCK = threading.Lock()
+
+
+def archive_path():
+    return HOME / "archive.txt"
+
+
+def archive_ids():
+    """Set of 'extractor id' lines recorded as downloaded (yt-dlp format)."""
+    try:
+        with _ARCHIVE_LOCK:
+            return {ln.strip() for ln in
+                    archive_path().read_text(encoding="utf-8").splitlines()
+                    if ln.strip()}
+    except OSError:
+        return set()
+
+
+def archive_add(extractor, vid):
+    """Record a finished download so playlist pickers can flag it later."""
+    if not extractor or not vid:
+        return
+    line = f"{str(extractor).lower()} {vid}"
+    try:
+        with _ARCHIVE_LOCK:
+            p = archive_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if line in {ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()}:
+                    return
+            except OSError:
+                pass
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except OSError as e:
+        log(f"archive write failed: {e}")
+
+
+def icons_dir():
+    return HOME / "icons"

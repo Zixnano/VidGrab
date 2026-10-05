@@ -7,7 +7,9 @@ import threading
 import time
 
 import settings
-from settings import STATE, category_for, safe_filename, guess_filename, detect_type, guess_ext_from_head, stat_for
+from settings import (STATE, category_for, safe_filename, guess_filename, detect_type,
+                      guess_ext_from_head, stat_for, is_junk_stem, clean_title,
+                      generated_name, source_site_for)
 from logging_setup import log
 
 
@@ -122,6 +124,53 @@ def _migrate_extensionless(job):
         log(f"extensionless migration failed: {e}")
 
 
+_PRIO_LOCK = threading.Lock()
+_PRIO_LAST = 0.0
+
+
+def _next_priority():
+    """Strictly increasing start-order value (creation time, nudged so two
+    jobs created in the same tick never tie)."""
+    global _PRIO_LAST
+    with _PRIO_LOCK:
+        _PRIO_LAST = max(time.time(), _PRIO_LAST + 1e-6)
+        return _PRIO_LAST
+
+
+def start_order_key(j):
+    """Dispatcher order: lower starts first. Reordering permutes these values."""
+    return j.get("priority") or j.get("created_ts") or 0
+
+
+def reorder_job(jid, action):
+    """Move a queued job within the start order. action: top, up, down,
+    bottom. Only queued jobs take part (others have no queue position).
+    Returns the new 0-based position among queued jobs, or None when the
+    job isn't queued. Raises KeyError for an unknown id."""
+    if action not in ("top", "up", "down", "bottom"):
+        raise ValueError(f"bad reorder action: {action}")
+    job = JOBS[jid]
+    if job.get("status") != "queued":
+        return None
+    queued = sorted((x for x in JOBS.values() if x.get("status") == "queued"),
+                    key=start_order_key)
+    values = [start_order_key(x) for x in queued]
+    i = next(n for n, x in enumerate(queued) if x is job)
+    if action == "top":
+        queued.insert(0, queued.pop(i)); i = 0
+    elif action == "bottom":
+        queued.append(queued.pop(i)); i = len(queued) - 1
+    elif action == "up" and i > 0:
+        queued[i - 1], queued[i] = queued[i], queued[i - 1]; i -= 1
+    elif action == "down" and i < len(queued) - 1:
+        queued[i + 1], queued[i] = queued[i], queued[i + 1]; i += 1
+    # Hand the same sorted values back out in the new order: the relative
+    # order against jobs created later is untouched.
+    for x, v in zip(queued, values):
+        x["priority"] = v
+    return i
+
+
 def _migrate_job(j):
     """Backfill v4 job fields on a restored pre-v4 (v3.3) snapshot dict so
     no code path can KeyError on fields added after the snapshot was made."""
@@ -137,9 +186,16 @@ def _migrate_job(j):
         "download_playlist": False,
         "playlist_id": None, "playlist_title": None,
         "playlist_index": None, "playlist_url": None,
+        # v5
+        "auto_name": False, "retry_count": 0, "retry_after": 0,
+        "failed_ts": None,
     }
     for k, v in defaults.items():
         j.setdefault(k, v)
+    j.setdefault("priority", j.get("created_ts") or time.time())
+    # v5: backfill the source site from the file URL for older jobs.
+    if "source_site" not in j:
+        j["source_site"] = source_site_for(j.get("url"))
     return j
 
 
@@ -264,7 +320,7 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
             user_agent=None, job_type=None, format_id=None, target_format=None,
             resolution=None, multi=False, download_playlist=False, defer=False,
             playlist_id=None, playlist_title=None, playlist_index=None,
-            playlist_url=None, snapshot=True, created_ts=None):
+            playlist_url=None, snapshot=True, created_ts=None, page_url=None):
     log(f"new_job: filename={filename!r} url_basename={guess_filename(url)!r}")
     jid = next_job_id()
     jtype = job_type or detect_type(url)
@@ -288,6 +344,19 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
         fname = _b
         _b, _e = os.path.splitext(fname)
     log(f"new_job: after extension logic fname={fname!r}")
+    # v5 naming: strip "(3) " / " - YouTube" noise from caller-supplied
+    # titles, and replace names that say nothing ("watch", "12345", "index")
+    # with site_date_time. yt-dlp jobs flagged auto_name use the real video
+    # title as the filename instead (see engines.download).
+    auto_named = False
+    _stem, _ext = os.path.splitext(fname)
+    _clean = clean_title(_stem)
+    if _clean and _clean != _stem:
+        fname, _stem = _clean + _ext, _clean
+    if is_junk_stem(_stem):
+        fname = safe_filename(generated_name(url)) + _ext
+        auto_named = not (multi and resolution)
+        log(f"new_job: junk name {_stem!r} -> {fname!r} (auto_name={auto_named})")
     # Session 10: multi-quality checklist - when the caller queued several
     # formats for one URL, disambiguate with the resolution suffix
     # ("Video.mp4" -> "Video_1080p.mp4"). Single-format keeps old naming.
@@ -322,6 +391,10 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
         "playlist_id": playlist_id, "playlist_title": playlist_title,
         "playlist_index": playlist_index, "playlist_url": playlist_url,
         "completed_ts": None,
+        "auto_name": auto_named,
+        "source_site": source_site_for(page_url, referer, url),
+        "retry_count": 0, "retry_after": 0,
+        "priority": _next_priority(), "failed_ts": None,
         "size_total": 0, "size_done": 0, "speed": "", "error": None,
         "referer": referer, "cookie": cookie, "user_agent": user_agent,
         "created_ts": created_ts if created_ts is not None else time.time(),
@@ -381,6 +454,7 @@ class JobEvent(enum.Enum):
     SKIP = "skip"
     HOLD = "hold"
     RELEASE = "release"
+    RETRY = "retry"   # v5: auto-retry after a transient failure (back to queued)
 
 
 class JobPhase(enum.Enum):
@@ -400,6 +474,7 @@ _TRANSITIONS = {
     (JobStatus.DOWNLOADING, JobEvent.STOP): JobStatus.STOPPED,
     (JobStatus.DOWNLOADING, JobEvent.COMPLETE): JobStatus.DONE,
     (JobStatus.DOWNLOADING, JobEvent.FAIL): JobStatus.ERROR,
+    (JobStatus.DOWNLOADING, JobEvent.RETRY): JobStatus.QUEUED,        # v5 auto-retry
     (JobStatus.PAUSED, JobEvent.RESUME): JobStatus.QUEUED,
     (JobStatus.PAUSED, JobEvent.STOP): JobStatus.STOPPED,
     (JobStatus.STOPPED, JobEvent.RESUME): JobStatus.QUEUED,
@@ -426,6 +501,10 @@ def transition(j, event):
     if nxt is None:
         raise ValueError(f"illegal job transition: {cur.value} + {ev.value}")
     j["status"] = nxt.value
+    if ev is JobEvent.FAIL:
+        j["failed_ts"] = time.time()   # lets the GUI hide old failures
+    elif ev is JobEvent.RESUME:
+        j["failed_ts"] = None
     if ev is JobEvent.PAUSE and j.get("pause_evt") is not None:
         j["pause_evt"].set()
     elif ev is JobEvent.RESUME:

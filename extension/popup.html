@@ -32,8 +32,9 @@
   .toolbar button:disabled { opacity: 0.4; cursor: default; }
 
   #filterPanel { border: 1px solid #eee; border-radius: 6px; padding: 6px 8px;
-                 margin-bottom: 6px; font-size: 12px; display: none; }
-  #filterPanel label { margin-right: 10px; }
+                 margin-bottom: 6px; font-size: 12px; display: block; }
+  #filterPanel label { margin-right: 10px; white-space: nowrap; }
+  #filterPanel .tiny { display: block; margin: 6px 0 0; color: #555; }
   #searchInput { width: 100%; box-sizing: border-box; padding: 5px 8px; margin-bottom: 6px;
                  border: 1px solid #ddd; border-radius: 6px; font-size: 12px; display: none; }
 
@@ -51,11 +52,26 @@
   #grabSendBtn { width: 100%; padding: 6px; margin-top: 6px; cursor: pointer; }
   #grabSendBtn:disabled { opacity: 0.5; cursor: default; }
   .divider { border-top: 1px solid #eee; margin: 10px 0 8px; }
+
+  /* v5: recent downloads + per-site switch */
+  #recent { margin-bottom: 8px; }
+  #recent h2 { font-size: 11px; font-weight: 600; color: #555; margin: 0 0 4px; }
+  .rjob { border: 1px solid #eee; border-radius: 6px; padding: 4px 7px; margin-bottom: 3px; font-size: 12px; }
+  .rjob .rname { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rjob .rmeta { display: flex; justify-content: space-between; color: #666; font-size: 11px; }
+  .rjob .rbar { height: 3px; background: #eee; border-radius: 2px; margin: 3px 0; overflow: hidden; }
+  .rjob .rbar > i { display: block; height: 100%; background: #2e7d32; }
+  .rjob.err .rmeta .rstat { color: #c62828; }
+  #siteRow { display: flex; justify-content: space-between; align-items: center;
+             font-size: 11px; color: #555; margin-bottom: 6px; }
+  #siteToggle { font-size: 11px; padding: 2px 8px; cursor: pointer; }
 </style>
 </head>
 <body>
   <h1>Video Grabber</h1>
   <div id="status">Checking desktop app…</div>
+  <div id="recent" style="display:none;"><h2>Recent downloads</h2><div id="recentList"></div></div>
+  <div id="siteRow"><span id="siteName"></span><button id="siteToggle">Hide pill on this site</button></div>
 
   <div class="tabs">
     <button id="tabCurrent" class="tab active">Current Page</button>
@@ -68,11 +84,12 @@
     <label><input type="checkbox" value="webm" checked/> webm</label>
     <label><input type="checkbox" value="m3u8" checked/> m3u8</label>
     <label><input type="checkbox" value="mp3" checked/> mp3</label>
-    <label><input type="checkbox" value="image" checked/> image</label>
-    <label><input type="checkbox" value="doc" checked/> doc</label>
-    <label><input type="checkbox" value="archive" checked/> archive</label>
-    <label><input type="checkbox" value="programs" checked/> programs</label>
-    <label><input type="checkbox" value="other" checked/> other</label>
+    <label><input type="checkbox" value="image"/> image</label>
+    <label><input type="checkbox" value="doc"/> doc</label>
+    <label><input type="checkbox" value="archive"/> archive</label>
+    <label><input type="checkbox" value="programs"/> programs</label>
+    <label><input type="checkbox" value="other"/> other</label>
+    <label class="tiny"><input type="checkbox" id="hideTiny" checked/> Hide files under 100 KB</label>
   </div>
   <div id="mediaList"><div class="empty">Scanning this tab…</div></div>
   <div id="mediaStatus"></div>

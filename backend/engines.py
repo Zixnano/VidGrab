@@ -8,11 +8,13 @@ import glob
 import hashlib
 import os
 import json
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import traceback
 import time
 from dataclasses import dataclass, asdict
@@ -209,11 +211,10 @@ def _ytdlp_version_check():
     """Log a warning if yt-dlp is more than 30 days old. YouTube extraction
     breaks regularly; stale versions fail silently."""
     try:
-        from importlib.metadata import version as _v, PackageNotFoundError
-        try:
-            v = _v("yt-dlp")
-        except PackageNotFoundError:
-            log("yt-dlp not installed as a package — skipping version check")
+        import ytdlp_update
+        v = ytdlp_update.active_version()
+        if not v:
+            log("yt-dlp version unknown — skipping version check")
             return
         try:
             from datetime import date
@@ -228,6 +229,137 @@ def _ytdlp_version_check():
             pass
     except Exception as e:
         log(f"yt-dlp version check failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# YouTube pacing. yt-dlp's own sleep_interval only spaces videos inside ONE
+# YoutubeDL instance, and every per-item playlist job is its own instance,
+# so it cannot pace across jobs. This gate does: each YouTube job start
+# reserves the next slot, a random lo..hi seconds after the previous one.
+# The first job after an idle period starts immediately.
+# ---------------------------------------------------------------------------
+_PACE_LOCK = threading.Lock()
+_PACE_NEXT_OK = 0.0
+
+
+def _is_youtube_url(url):
+    try:
+        return _is_youtube_host(urlparse(url).hostname)
+    except Exception:
+        return False
+
+
+def _pace_range():
+    """(lo, hi) seconds from settings, sanitized. hi == 0 means disabled."""
+    def _num(key, default):
+        try:
+            return max(0, int(STATE.get(key, default) or 0))
+        except (TypeError, ValueError):
+            return default
+    lo = _num("ytdlp_sleep_interval", 5)
+    hi = _num("ytdlp_max_sleep_interval", 15)
+    return lo, max(lo, hi)
+
+
+def pace_before_start(url, cancel_check=None):
+    """Block until this YouTube job's reserved start slot arrives.
+
+    cancel_check, if given, is called about twice a second while waiting
+    and may raise (DownloadCancelled) to abort the wait. Non-YouTube URLs
+    return immediately.
+    """
+    global _PACE_NEXT_OK
+    if not _is_youtube_url(url):
+        return
+    lo, hi = _pace_range()
+    if hi <= 0:
+        return
+    with _PACE_LOCK:
+        now = time.time()
+        start_at = max(now, _PACE_NEXT_OK)
+        _PACE_NEXT_OK = start_at + random.uniform(lo, hi)
+    wait = start_at - time.time()
+    if wait > 0.5:
+        log(f"pacing: waiting {wait:.0f}s before this YouTube request")
+    while True:
+        remaining = start_at - time.time()
+        if remaining <= 0:
+            return
+        if cancel_check:
+            cancel_check()
+        time.sleep(min(0.5, remaining))
+
+
+# ---------------------------------------------------------------------------
+# Error classification + YouTube cooldown (v5). Pure helpers: the retry
+# policy itself lives in downloader.run_ytdlp.
+#   bot_check  -> never auto-retried; YouTube jobs are held (cooldown)
+#   rate_limit -> auto-retry with long backoff, YouTube held meanwhile
+#   network    -> auto-retry with short backoff
+#   fatal/other-> fail as before (private, removed, unsupported, unknown)
+# ---------------------------------------------------------------------------
+_FATAL_MARKERS = (
+    "private video", "video unavailable", "this video is not available",
+    "has been removed", "unsupported url", "members-only", "members only",
+    "confirm your age", "age-restricted", "not available in your country",
+    "who has blocked it", "copyright", "this video is private",
+    "requires payment", "premieres in", "live event will begin",
+)
+_RATE_MARKERS = ("http error 429", "too many requests", "rate-limited",
+                 "rate limited", "rate limit")
+_NETWORK_MARKERS = (
+    "timed out", "timeout", "connection reset", "connection aborted",
+    "connection refused", "remote end closed", "incompleteread",
+    "temporary failure in name resolution", "getaddrinfo failed",
+    "network is unreachable", "name or service not known",
+    "http error 500", "http error 502", "http error 503", "http error 504",
+    "unable to connect", "ssl: ", "eof occurred", "read error",
+)
+
+
+def classify_ytdlp_error(msg):
+    """Return 'bot_check', 'rate_limit', 'network', 'fatal' or 'other'."""
+    m = (msg or "").lower()
+    # "Sign in to confirm your age" is an age gate, not a bot check, so
+    # match the bot wording specifically.
+    if "not a bot" in m:
+        return "bot_check"
+    if any(k in m for k in _RATE_MARKERS):
+        return "rate_limit"
+    if any(k in m for k in _FATAL_MARKERS):
+        return "fatal"
+    if any(k in m for k in _NETWORK_MARKERS):
+        return "network"
+    return "other"
+
+
+_YT_HOLD_LOCK = threading.Lock()
+_YT_HOLD_UNTIL = 0.0
+
+
+def set_youtube_cooldown(seconds, reason=""):
+    """Hold queued YouTube jobs for `seconds` (never shortens an
+    existing hold). Non-YouTube jobs are unaffected."""
+    global _YT_HOLD_UNTIL
+    until = time.time() + max(0, seconds)
+    with _YT_HOLD_LOCK:
+        if until > _YT_HOLD_UNTIL:
+            _YT_HOLD_UNTIL = until
+    log(f"YouTube jobs held for {int(seconds)}s ({reason or 'cooldown'})")
+
+
+def youtube_cooldown_remaining():
+    with _YT_HOLD_LOCK:
+        return max(0.0, _YT_HOLD_UNTIL - time.time())
+
+
+def clear_youtube_cooldown():
+    global _YT_HOLD_UNTIL
+    with _YT_HOLD_LOCK:
+        was = _YT_HOLD_UNTIL > time.time()
+        _YT_HOLD_UNTIL = 0.0
+    if was:
+        log("YouTube hold cleared (manual retry)")
 
 
 class Engine(Protocol):
@@ -261,6 +393,9 @@ class YtDlpEngine:
         js_rt = find_js_runtime()
         if js_rt:
             ydl_opts["js_runtimes"] = js_rt
+        _px = proxy_for(url)
+        if _px:
+            ydl_opts["proxy"] = _px
         from yt_dlp import YoutubeDL  # lazy: keeps ~100 MB out of idle RAM
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -310,6 +445,9 @@ class YtDlpEngine:
         headers = opts.get("headers") or {}
         is_playlist = bool(opts.get("download_playlist"))
 
+        # Space out YouTube requests across jobs (see pace_before_start).
+        pace_before_start(url, opts.get("cancel_check"))
+
         # FIX: playlist mode needs a per-item template, otherwise every
         # playlist entry overwrites the same "watch (N).mp4" file. Use the
         # playlist index + video title so each item lands in its own file.
@@ -325,13 +463,29 @@ class YtDlpEngine:
             # (falls back to "Playlist" when yt-dlp has no title for it).
             outtmpl = (parent_t + os.sep + "%(playlist_title|Playlist)s"
                        + os.sep + "%(playlist_index)03d - %(title)s.%(ext)s")
+        elif opts.get("use_title"):
+            # v5: the job's name was a placeholder (junk/generated), so let
+            # yt-dlp name the file after the real video title. The final
+            # path is captured by post_hooks below.
+            outtmpl = parent_t + os.sep + "%(title).150s.%(ext)s"
         else:
             outtmpl = parent_t + os.sep + dest.stem.replace("%", "%%") + ".%(ext)s"
+
+        final_paths = []
+        seen = {}
+
+        def _hook(d):
+            info = d.get("info_dict") or {}
+            if info.get("id"):
+                seen["id"] = info["id"]
+                seen["ek"] = str(info.get("extractor_key") or "")
+            progress_cb(d)
 
         ydl_opts = {
             "outtmpl": outtmpl,
             "http_headers": headers,
-            "progress_hooks": [progress_cb],
+            "progress_hooks": [_hook],
+            "post_hooks": [final_paths.append],
             "quiet": True, "no_warnings": True,
             "continuedl": True,
             "noplaylist": not is_playlist,
@@ -346,15 +500,6 @@ class YtDlpEngine:
             "writesubtitles": False,
             "writeautomaticsub": False,
             "socket_timeout": 30,
-            # Session D / PO token: bgutil only fires for clients that
-            # request a token. "default" is a yt-dlp alias whose target
-            # varies by version and currently resolves to clients that
-            # never need a PO token, so the plugin was sitting idle.
-            # "web" and "web_safari" reliably request a token; mweb/tv
-            # are fallbacks if web/web_safari fail.
-            "extractor_args": {
-                "youtube": {"player_client": ["web", "web_safari", "mweb", "tv"]},
-            },
         }
 
         # FIX: playlist mode gets per-item progress output so you can watch
@@ -430,6 +575,39 @@ class YtDlpEngine:
         if lim and lim > 0:
             ydl_opts["ratelimit"] = lim * 1024
 
+        _px = proxy_for(url)
+        if _px:
+            ydl_opts["proxy"] = _px
+        # Legacy whole-playlist jobs skip videos already in the archive.
+        # Redownload bypasses it (job["no_archive"]); per-item picker jobs
+        # never use it, they are recorded for the picker's "already
+        # downloaded" flag instead (see archive_add below).
+        if (is_playlist and STATE.get("ytdlp_use_archive", True)
+                and not opts.get("no_archive")):
+            ydl_opts["download_archive"] = str(archive_path())
+
+        # YouTube-only request pacing. Not applied to other sites: a
+        # 1 s sleep per request would crawl through long HLS/DASH
+        # fragment lists on hosts that don't rate-limit.
+        if _is_youtube_url(url):
+            lo, hi = _pace_range()
+            if hi > 0:
+                try:
+                    req_s = max(0, int(STATE.get("ytdlp_sleep_interval_requests", 1) or 0))
+                    sub_s = max(0, int(STATE.get("ytdlp_sleep_interval_subtitles", 1) or 0))
+                except (TypeError, ValueError):
+                    req_s, sub_s = 1, 1
+                if req_s:
+                    ydl_opts["sleep_interval_requests"] = req_s
+                if sub_s:
+                    ydl_opts["sleep_interval_subtitles"] = sub_s
+                # Legacy whole-playlist jobs run many videos inside this one
+                # YoutubeDL instance, so yt-dlp's own inter-video sleep is
+                # what paces them (per-item jobs are paced by the gate).
+                if is_playlist:
+                    ydl_opts["sleep_interval"] = lo
+                    ydl_opts["max_sleep_interval"] = hi
+
         # v4.0.5 diagnostics: freeze the environment + full traceback so a
         # [WinError 2] reports exactly which line/subprocess raised it.
         diag_opts = dict(ydl_opts)
@@ -442,6 +620,11 @@ class YtDlpEngine:
             pass
         try:
             diag_opts.pop("progress_hooks", None)
+            diag_opts.pop("post_hooks", None)
+            if diag_opts.get("proxy"):
+                # Never write proxy credentials (user:pass@host) to the log.
+                diag_opts["proxy"] = re.sub(r"//[^/@]*@", "//<redacted>@",
+                                            str(diag_opts["proxy"]))
         except Exception:
             pass
         log(f"yt-dlp diagnostics: _MEIPASS={getattr(sys, '_MEIPASS', None)} "
@@ -456,6 +639,13 @@ class YtDlpEngine:
             log(f"job {opts.get('job_id') or dest.name}: FULL TRACEBACK:\n"
                 f"{traceback.format_exc()}")
             raise
+
+        if not is_playlist and seen.get("id"):
+            archive_add(seen.get("ek") or "youtube", seen["id"])
+
+        # v5: title-named jobs report the real final path from post_hooks.
+        if opts.get("use_title") and final_paths:
+            return Path(final_paths[-1])
 
         # Playlist mode: yt-dlp already wrote one file per item using the
         # %(playlist_index)s-%(title)s template; dest.stem glob won't match
@@ -560,6 +750,9 @@ def probe_playlist(url, headers=None, start=0, limit=200):
     js_rt = find_js_runtime()
     if js_rt:
         ydl_opts["js_runtimes"] = js_rt
+    _px = proxy_for(probe_url)
+    if _px:
+        ydl_opts["proxy"] = _px
     from yt_dlp import YoutubeDL  # lazy: keeps ~100 MB out of idle RAM
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -594,6 +787,7 @@ def probe_playlist(url, headers=None, start=0, limit=200):
                 "duration": _as_int_or_none(info.get("duration")),
                 "uploader": info.get("uploader") or None,
                 "available": True,
+                "archived": ("youtube " + str(info.get("id"))) in archive_ids(),
             }],
         }
 
@@ -627,6 +821,10 @@ def probe_playlist(url, headers=None, start=0, limit=200):
             "available": available,
         })
 
+    if is_yt:
+        _arch = archive_ids()
+        for _it in items:
+            _it["archived"] = bool(_it["id"]) and ("youtube " + _it["id"]) in _arch
     ext = str(info.get("extractor") or "").split(":")[0].lower()
     src_id = info.get("id")
     if ext and src_id:
@@ -711,7 +909,7 @@ TWITCH_LIKE_HOSTS = [
 ]
 
 
-from settings import STATE  # late binding is fine; settings has no engine imports
+from settings import STATE, proxy_for, archive_path, archive_ids, archive_add  # late binding is fine; settings has no engine imports
 
 _ENGINE_POOL = {"yt-dlp": YtDlpEngine, "streamlink": StreamlinkEngine}
 
