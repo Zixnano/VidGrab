@@ -24,9 +24,10 @@ import settings
 from settings import (STATE, load_settings, save_settings, safe_filename, _unique_path,
                       guess_ext_from_head, stat_for, _dest_for,
                       effective_speed_limit_kbps, LIMITER, get_shutdown_pending,
-                      set_shutdown_pending)
+                      set_shutdown_pending, detect_type)
 from jobs import (start_order_key, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks,
-                  transition, JobEvent, JobPhase, set_phase, resolve_playlist_dir)
+                  transition, JobEvent, JobPhase, set_phase, resolve_playlist_dir,
+                  repair_status)
 from logging_setup import log, LOG_QUEUE
 
 
@@ -660,43 +661,74 @@ def run_ytdlp(job_id):
     transition(job, JobEvent.START)
     try:
         real = engine.download(job["url"], job.get("format_id"), dest, opts, progress_cb)
-        try:
-            job["filename"] = real.name
-            # maybe_convert_target falls back to auto-mp4 when the job has no
-            # explicit target, and honors target_format even when auto_mp4 is off.
-            real = maybe_convert_target(job, real)
-            job["filename"] = real.name
-            job["size_total"] = job["size_done"] = real.stat().st_size
-        except Exception as e:
-            log(f"job {job_id}: post-download filename fixup failed: {e}")
-        transition(job, JobEvent.COMPLETE)
-        job["completed_ts"] = time.time()
-        job["retry_count"] = 0
-        job["retry_after"] = 0
-        log(f"job {job_id}: complete ✓ ({job['filename']})")
-        if job.get("download_playlist"):
-            # Legacy whole-playlist job: remember which folder it wrote into
-            # so the GUI's Open can find it.
-            job["playlist_dir"] = resolve_playlist_dir(job)
-        try:
-            d = stat_for(job)
-            if d.exists():
-                record_stat(job["size_done"])
-                scan_file(d)
-                # D3: once per playlist batch, on the last item.
-                if not _playlist_group_pending(job):
-                    maybe_open_folder(d)
-                    maybe_play_sound()
-        except Exception:
-            pass
-        maybe_shutdown_if_idle()
     except DownloadCancelled:
         transition(job, JobEvent.STOP)
         log(f"job {job_id}: stopped")
-    except Exception as e:
-        _handle_ytdlp_failure(job_id, job, e)
-    finally:
         save_jobs_snapshot()
+        return
+    except Exception as e:
+        # Fall-through: if yt-dlp has no extractor for this URL, don't
+        # fail the job — hand it to the generic HTTP engine instead.
+        # Almost any URL that returns bytes can be fetched that way.
+        raw = str(e)
+        low = raw.lower()
+        is_unsupported = (
+            "unsupported url" in low
+            or "no suitable extractor" in low
+            or "extractor_error" in low
+        )
+        # Only fall through when the URL itself looks like a file fetch,
+        # not when yt-dlp failed on a real media site (e.g. a private
+        # YouTube video) — a generic retry would just 403 there.
+        if is_unsupported and detect_type(job["url"]) == "generic":
+            log(f"job {job_id}: yt-dlp has no extractor, falling through "
+                f"to generic HTTP ({raw[:120]})")
+            # Reset state: engine.download may have touched counters.
+            job["error_kind"] = None
+            job["error"] = None
+            transition(job, JobEvent.FAIL)  # move out of downloading cleanly
+            try:
+                transition(job, JobEvent.RESUME)  # -> queued
+            except ValueError:
+                # If FAIL->RESUME isn't legal from this state, force-requeue.
+                repair_status(job, "queued")
+            job["type"] = "generic"
+            # Generic single-shot downloader runs synchronously here.
+            run_generic(job_id)
+            return
+        _handle_ytdlp_failure(job_id, job, e)
+        return
+    try:
+        job["filename"] = real.name
+        # maybe_convert_target falls back to auto-mp4 when the job has no
+        # explicit target, and honors target_format even when auto_mp4 is off.
+        real = maybe_convert_target(job, real)
+        job["filename"] = real.name
+        job["size_total"] = job["size_done"] = real.stat().st_size
+    except Exception as e:
+        log(f"job {job_id}: post-download filename fixup failed: {e}")
+    transition(job, JobEvent.COMPLETE)
+    job["completed_ts"] = time.time()
+    job["retry_count"] = 0
+    job["retry_after"] = 0
+    log(f"job {job_id}: complete ✓ ({job['filename']})")
+    if job.get("download_playlist"):
+        # Legacy whole-playlist job: remember which folder it wrote into
+        # so the GUI's Open can find it.
+        job["playlist_dir"] = resolve_playlist_dir(job)
+    try:
+        d = stat_for(job)
+        if d.exists():
+            record_stat(job["size_done"])
+            scan_file(d)
+            # D3: once per playlist batch, on the last item.
+            if not _playlist_group_pending(job):
+                maybe_open_folder(d)
+                maybe_play_sound()
+    except Exception:
+        pass
+    maybe_shutdown_if_idle()
+    save_jobs_snapshot()
 
 
 # Auto-retry schedule (seconds), indexed by attempt number. rate_limit waits

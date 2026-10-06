@@ -902,6 +902,14 @@
       // MSE-only sites (Twitch) have no currentSrc yet but still need the menu —
       // it offers "Send page URL to yt-dlp". Only bail when there's truly nothing.
       if (!video.currentSrc && !isBlob() && !isMseOnlySite()) return;
+      // On extractor sites where the player only exposes a blob (Reddit,
+      // Redgifs, TikTok, X in-feed), there is no direct file to hand over.
+      // The page URL is the download, so make the pill a one-click send
+      // instead of forcing the user into the menu.
+      if (isExtractorSite() && (isBlob() || !video.currentSrc)) {
+        handleSendPageUrl(video, overlay, null);
+        return;
+      }
       toggleMenu();
     });
   }

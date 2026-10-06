@@ -1,7 +1,7 @@
 """Application settings, paths, filename helpers, bandwidth profiles."""
 from pathlib import Path
 from urllib.parse import unquote
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import glob
 import json
 import os
@@ -281,11 +281,37 @@ def guess_ext_from_head(url):
     return ext
 
 
+_QUERY_NAME_KEYS = ("fn", "filename", "file", "name", "file_name")
+
+
+def _filename_from_query(url):
+    """Pick a filename out of a query string (fn=, filename=, ...).
+    Returns "" when none looks usable."""
+    try:
+        qs = parse_qs(urlparse(url).query)
+    except Exception:
+        return ""
+    for key in _QUERY_NAME_KEYS:
+        for v in qs.get(key, []):
+            v = (v or "").strip()
+            if not v:
+                continue
+            # Only accept values that look like a filename with an
+            # extension: "report.pdf" yes, "abc123" no, "a/b" no.
+            base = os.path.basename(v.replace("\\", "/"))
+            if base and os.path.splitext(base)[1] and len(base) < 200:
+                return unquote(base)
+    return ""
+
+
 def guess_filename(url, content_disposition=None):
     if content_disposition:
         m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', content_disposition)
         if m:
             return safe_filename(unquote(m.group(1)))
+    qname = _filename_from_query(url)
+    if qname:
+        return safe_filename(qname)
     path = urlparse(url).path
     name = os.path.basename(path) or "download"
     return safe_filename(unquote(name))
@@ -323,9 +349,14 @@ _PLAIN_FILE_EXT_RE = re.compile(
     r"mp3|wav|flac|m4a|aac|ogg|opus|"
     r"zip|rar|7z|tar|gz|bz2|xz|"
     r"pdf|docx?|xlsx?|pptx?|txt|md|csv|json|xml|yaml|yml|"
+    r"html?|css|"
     r"py|js|ts|java|c|cpp|h|hpp|rs|go|rb|php|sh|bat|ps1|"
     r"exe|msi|dmg|deb|rpm|apk|"
     r"jpg|jpeg|png|gif|webp|avif|svg|bmp|ico)(\?|#|$)", re.I)
+
+# Query params that commonly carry the filename (Dropbox, ChatGPT,
+# S3 presigned URLs, Google Drive, generic file hosts).
+_FILENAME_QUERY_KEYS = ("fn", "filename", "file", "name", "file_name")
 
 
 def detect_type(url):
@@ -333,6 +364,25 @@ def detect_type(url):
         return "ytdlp"
     if _PLAIN_FILE_EXT_RE.search(url):
         return "generic"
+    # Filename in the query string? (fn=..., filename=..., file=...)
+    # Match the extension regex against each value; anchor it so
+    # "?fn=foo.pdf" matches but "?fn=foo.pdfbar" doesn't.
+    try:
+        qs = parse_qs(urlparse(url).query)
+        for key in _FILENAME_QUERY_KEYS:
+            for v in qs.get(key, []):
+                if re.search(r"\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpg|mpeg|ts|"
+                             r"mp3|wav|flac|m4a|aac|ogg|opus|"
+                             r"zip|rar|7z|tar|gz|bz2|xz|"
+                             r"pdf|docx?|xlsx?|pptx?|txt|md|csv|json|xml|yaml|yml|"
+                             r"html?|css|"
+                             r"py|js|ts|java|c|cpp|h|hpp|rs|go|rb|php|sh|bat|ps1|"
+                             r"exe|msi|dmg|deb|rpm|apk|"
+                             r"jpg|jpeg|png|gif|webp|avif|svg|bmp|ico)$",
+                             (v or "").strip(), re.I):
+                    return "generic"
+    except Exception:
+        pass
     return "ytdlp"
 
 
