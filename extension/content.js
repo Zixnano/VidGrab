@@ -11,6 +11,17 @@
 //     it live with MediaRecorder. The button switches to "Record" for those.
 
 (() => {
+  // Theme colors copied from the app (see background.js refreshTheme).
+  let TH = { bg_base: "#0a0a0f", bg_elevated: "#1a1a24", border_hi: "#33333f", text: "#e6e6eb",
+             text_muted: "#8a8a95", accent: "#26c6da", success: "#4caf50", error: "#ef5350",
+             info: "#42a5f5" };
+  try {
+    chrome.storage.local.get("theme").then((st) => { if (st.theme) TH = { ...TH, ...st.theme }; }).catch(() => {});
+    chrome.storage.onChanged.addListener((c, area) => {
+      if (area === "local" && c.theme && c.theme.newValue) TH = { ...TH, ...c.theme.newValue };
+    });
+  } catch (e) { /* keep defaults */ }
+
   const HANDLED = new WeakSet();
   const DISMISSED = new WeakSet();
   const RECORDERS = new WeakMap();
@@ -132,7 +143,8 @@
     wrap.style.cssText = `
       position: fixed; z-index: 2147483647; display: flex; align-items: center;
       gap: 6px; font: 13px/1.2 -apple-system, Segoe UI, Roboto, sans-serif;
-      background: rgba(20,20,24,0.88); color: #fff; padding: 6px 8px;
+      background: ${TH.bg_base}e0; color: ${TH.text}; padding: 6px 8px;
+      border: 1px solid ${TH.border_hi};
       border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.4);
       pointer-events: auto; user-select: none;
     `;
@@ -143,11 +155,11 @@
     const btn = document.createElement("button");
     btn.style.cssText = `
       display:flex; align-items:center; gap:6px; background:transparent;
-      border:1px solid rgba(255,255,255,0.35); color:#fff; border-radius:6px;
+      border:1px solid ${TH.border_hi}; color:${TH.text}; border-radius:6px;
       padding:4px 10px; font: inherit; cursor:pointer;
     `;
     const icon = document.createElement("span");
-    icon.style.cssText = "color:#4caf50; font-size:11px;";
+    icon.style.cssText = `color:${TH.accent}; font-size:11px;`;
     icon.textContent = "▶";
     const label = document.createElement("span");
     btn.appendChild(icon);
@@ -157,7 +169,7 @@
     closeBtn.textContent = "✕";
     closeBtn.title = "Hide";
     closeBtn.style.cssText = `
-      background:transparent; border:none; color:#bbb; cursor:pointer;
+      background:transparent; border:none; color:${TH.text_muted}; cursor:pointer;
       font-size:12px; padding:2px 4px;
     `;
     closeBtn.addEventListener("click", (e) => {
@@ -171,8 +183,8 @@
     const menu = document.createElement("div");
     menu.style.cssText = `
       position: absolute; top: 100%; left: 0; margin-top: 6px; min-width: 250px;
-      background: rgba(18,22,28,0.97); color: #fff;
-      border: 1px solid rgba(255,255,255,0.12); border-radius: 10px;
+      background: ${TH.bg_elevated}f8; color: ${TH.text};
+      border: 1px solid ${TH.border_hi}; border-radius: 10px;
       box-shadow: 0 6px 24px rgba(0,0,0,0.5);
       display: none; flex-direction: column; padding: 6px;
       font: 12px/1.4 -apple-system, Segoe UI, Roboto, sans-serif;
@@ -307,12 +319,12 @@
     const el = document.createElement("div");
     el.textContent = text;
     el.style.cssText = "padding:6px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;";
-    if (opts.dim) el.style.color = "#9aa7b4";
+    if (opts.dim) el.style.color = TH.text_muted;
     if (opts.header) {
-      el.style.cssText += "cursor:default;font-weight:600;color:#e6edf3;";
+      el.style.cssText += `cursor:default;font-weight:600;color:${TH.text};`;
     }
     if (!opts.header) {
-      el.addEventListener("mouseenter", () => { el.style.background = "rgba(76,175,80,0.18)"; });
+      el.addEventListener("mouseenter", () => { el.style.background = TH.accent + "30"; });
       el.addEventListener("mouseleave", () => { el.style.background = "transparent"; });
       el.addEventListener("click", (e) => { e.stopPropagation(); if (onClick) onClick(); });
     }
@@ -361,7 +373,7 @@
     if (closeMenu) closeMenu();
     const pu = pageUrlFor(video);
     if (!pu) {
-      setLabel(overlay, "Couldn't find tweet link", "#e53935");
+      setLabel(overlay, "Couldn't find tweet link", TH.error);
       return;
     }
     setLabel(overlay, "Sending…");
@@ -376,14 +388,14 @@
       },
       (resp) => {
         if (chrome.runtime.lastError) {
-          setLabel(overlay, "Extension error", "#e53935");
+          setLabel(overlay, "Extension error", TH.error);
           return;
         }
         if (resp && resp.ok) {
-          setLabel(overlay, sentLabel(resp, "Sent to app ✓"), "#4caf50");
-          setTimeout(() => setLabel(overlay, "Send page URL to Grabber", "#b388ff"), 2500);
+          setLabel(overlay, sentLabel(resp, "Sent to app ✓"), TH.accent);
+          setTimeout(() => setLabel(overlay, "Send page URL to Grabber", TH.info), 2500);
         } else {
-          setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", "#e53935");
+          setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", TH.error);
         }
       }
     );
@@ -458,7 +470,7 @@
     // R.5: floating indicator — elapsed timer, pause/resume, stop.
     const el = document.createElement("div");
     el.style.cssText = `position: fixed; left: 12px; bottom: 12px; z-index: 2147483647;
-      background: rgba(20,20,20,.92); color: #fff; font: 12px system-ui, sans-serif;
+      background: ${TH.bg_base}ee; color: ${TH.text}; font: 12px system-ui, sans-serif;
       padding: 6px 10px; border-radius: 6px; display: flex; gap: 8px; align-items: center;`;
     const t = document.createElement("span");
     const btnPause = document.createElement("button");
@@ -527,7 +539,7 @@
           selfBrowserSurface: "include",
         });
       } catch (e) {
-        setLabel(overlay, "Capture cancelled", "#e53935");
+        setLabel(overlay, "Capture cancelled", TH.error);
         return;
       }
     } else if (mode === "screen") {
@@ -537,7 +549,7 @@
           audio: true,
         });
       } catch (e) {
-        setLabel(overlay, "Capture cancelled", "#e53935");
+        setLabel(overlay, "Capture cancelled", TH.error);
         return;
       }
     }
@@ -555,7 +567,7 @@
       try { recorder = new MediaRecorder(stream); }
       catch (e2) {
         stream.getTracks().forEach((t) => t.stop());
-        setLabel(overlay, "Recorder unsupported", "#e53935");
+        setLabel(overlay, "Recorder unsupported", TH.error);
         return;
       }
     }
@@ -574,7 +586,7 @@
       chrome.runtime.sendMessage({ type: "GET_UPLOAD_NONCE" }, async (nresp) => {
         if (chrome.runtime.lastError || !nresp || !nresp.ok || !nresp.nonce) {
           saveBlob(blob, guessName);
-          setLabel(overlay, "Saved ✓ (browser) — Record again", "#4caf50");
+          setLabel(overlay, "Saved ✓ (browser) — Record again", TH.accent);
           RECORDERS.delete(video);
           return;
         }
@@ -587,14 +599,14 @@
             body: form,
           });
           if (res.ok) {
-            setLabel(overlay, "Sent to app ✓ — Record again", "#4caf50");
+            setLabel(overlay, "Sent to app ✓ — Record again", TH.accent);
           } else {
             const data = await res.json().catch(() => ({}));
-            setLabel(overlay, (data.error || "Upload rejected").slice(0, 40), "#e53935");
+            setLabel(overlay, (data.error || "Upload rejected").slice(0, 40), TH.error);
           }
         } catch (e) {
           saveBlob(blob, guessName);
-          setLabel(overlay, "Saved ✓ (browser) — Record again", "#4caf50");
+          setLabel(overlay, "Saved ✓ (browser) — Record again", TH.accent);
         }
         RECORDERS.delete(video);
       });
@@ -603,7 +615,7 @@
     RECORDERS.set(video, state);
     makeRecIndicator(state, overlay);
     recNotify("Video Grabber", `Recording started — ${usedMode} (${recQuality}).`);
-    setLabel(overlay, "● Recording — see indicator", "#e53935");
+    setLabel(overlay, "● Recording — see indicator", TH.error);
   }
 
   function handleRecordToggle(video, overlay) {
@@ -684,7 +696,7 @@
       closeMenu();
       const pu = pageUrlFor(video);
       if (force_page_url && !pu) {
-        setLabel(overlay, "Couldn't find tweet link", "#e53935");
+        setLabel(overlay, "Couldn't find tweet link", TH.error);
         return;
       }
       setLabel(overlay, "Sending…");
@@ -712,14 +724,14 @@
       };
       chrome.runtime.sendMessage(payload, (resp) => {
         if (chrome.runtime.lastError) {
-          setLabel(overlay, "Extension error", "#e53935");
+          setLabel(overlay, "Extension error", TH.error);
           return;
         }
         if (resp && resp.ok) {
-          setLabel(overlay, sentLabel(resp, resp.auto_queued ? "Queued ✓" : "Sent to app ✓"), "#4caf50");
-          setTimeout(() => setLabel(overlay, "Download ▾", "#4caf50"), 2500);
+          setLabel(overlay, sentLabel(resp, resp.auto_queued ? "Queued ✓" : "Sent to app ✓"), TH.accent);
+          setTimeout(() => setLabel(overlay, "Download ▾", TH.accent), 2500);
         } else {
-          setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", "#e53935");
+          setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", TH.error);
         }
       });
     }
@@ -794,17 +806,17 @@
                       target_format: tf,
                     }, (resp) => {
                       if (chrome.runtime.lastError) {
-                        setLabel(overlay, "Extension error", "#e53935");
+                        setLabel(overlay, "Extension error", TH.error);
                         return;
                       }
                       if (resp && resp.ok) {
                         setLabel(overlay,
                           sentLabel(resp, resp.auto_queued ? "Queued ✓" : "Sent to app ✓"),
-                          "#4caf50");
-                        setTimeout(() => setLabel(overlay, "Download ▾", "#4caf50"), 2500);
+                          TH.accent);
+                        setTimeout(() => setLabel(overlay, "Download ▾", TH.accent), 2500);
                       } else {
                         setLabel(overlay,
-                          (resp && resp.error) || "Failed", "#e53935");
+                          (resp && resp.error) || "Failed", TH.error);
                       }
                     });
                   });
@@ -878,7 +890,7 @@
     const refresh = () => {
       if (RECORDERS.has(video)) return; // don't clobber label mid-recording
       if (isMseOnlySite()) {
-        setLabel(overlay, "Send page URL ▾", "#b388ff");
+        setLabel(overlay, "Send page URL ▾", TH.info);
         return;
       }
       if (!video.currentSrc) {
@@ -886,9 +898,9 @@
         return;
       }
       if (isBlob()) {
-        setLabel(overlay, "Record this video ▾", "#e53935");
+        setLabel(overlay, "Record this video ▾", TH.error);
       } else {
-        setLabel(overlay, "Download ▾", "#4caf50");
+        setLabel(overlay, "Download ▾", TH.accent);
       }
     };
     refresh();

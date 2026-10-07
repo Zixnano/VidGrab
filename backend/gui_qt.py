@@ -62,13 +62,50 @@ _ICON_CACHE = {}
 
 _TRAY_ICONS = {}
 
+SEL = _PAL["bg_sel"]      # selected row / active nav background
+SOFT = _PAL["text_soft"]  # secondary nav text
+
+
+def _sync_palette(settings=None):
+    """Re-read the theme tokens into this module's color globals. Painted
+    pieces (progress delegate, row colors, tray icon) read these at paint
+    time, so calling this and repainting is enough for a live theme change."""
+    global _PAL, ACCENT, BG, PANEL, BORDER, TEXT, MUTED, DANGER, WARN, SUCCESS, TRACK, SEL, SOFT
+    _PAL = resolve_palette(settings)
+    ACCENT, BG, PANEL, BORDER = _PAL["accent"], _PAL["bg_base"], _PAL["bg_panel"], _PAL["border"]
+    TEXT, MUTED = _PAL["text"], _PAL["text_muted"]
+    DANGER, WARN, SUCCESS = _PAL["error"], _PAL["warning"], _PAL["success"]
+    TRACK, SEL, SOFT = _PAL["bg_elevated"], _PAL["bg_sel"], _PAL["text_soft"]
+    _ICON_CACHE.clear()
+    _TRAY_ICONS.clear()
+    _STATUS_COLORS.update({"downloading": SUCCESS, "done": SUCCESS, "paused": WARN,
+                           "stopped": DANGER, "error": DANGER, "queued": MUTED,
+                           "skipped": _PAL["text_dim"]})
+
+
+def reapply_theme():
+    """Rebuild the app stylesheet from saved settings and repaint the main
+    window. Called after Settings saves."""
+    from gui_style import build_qss
+    st = load_settings()
+    _sync_palette(st)
+    app = QApplication.instance()
+    if app is not None:
+        app.setStyleSheet(build_qss(st))
+    w = globals().get("_window")
+    if w is not None:
+        w.table.viewport().update()
+        w.table.horizontalHeader().viewport().update()
+        w.select_category(w.current_filter)
+        w.apply_shell()
+
 
 def _make_tray_icon(active: bool):
     """Green dot while downloading, grey when idle — like IDM's tray."""
     key = "active" if active else "idle"
     if key in _TRAY_ICONS:
         return _TRAY_ICONS[key]
-    color = QColor(ACCENT if active else "#666666")
+    color = QColor(ACCENT if active else _PAL["text_dim"])
     pm = QPixmap(32, 32)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -87,11 +124,11 @@ def _status_icon(status):
     if key in _ICON_CACHE:
         return _ICON_CACHE[key]
     colors = {
-        "downloading": "#4caf50", "done": "#4caf50", "paused": "#ffca28",
-        "stopped": "#ef5350", "error": "#ef5350", "queued": "#9e9e9e",
-        "skipped": "#607d8b",
+        "downloading": SUCCESS, "done": SUCCESS, "paused": WARN,
+        "stopped": DANGER, "error": DANGER, "queued": MUTED,
+        "skipped": _PAL["text_dim"],
     }
-    color = QColor(colors.get(key, "#9e9e9e"))
+    color = QColor(colors.get(key, MUTED))
     pm = QPixmap(14, 14)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
@@ -104,10 +141,9 @@ def _status_icon(status):
     return pm
 
 
-_STATUS_COLORS = {
-    "downloading": "#4caf50", "done": "#4caf50", "paused": "#ffca28",
-    "stopped": "#ef5350", "error": "#ef5350", "queued": "#9e9e9e",
-    "skipped": "#607d8b",
+_STATUS_COLORS = {   # refreshed by _sync_palette()
+    "downloading": SUCCESS, "done": SUCCESS, "paused": WARN,
+    "stopped": DANGER, "error": DANGER, "queued": MUTED, "skipped": MUTED,
 }
 
 
@@ -169,7 +205,7 @@ def _site_icon(site):
         p.drawPixmap(1, 1, fav.scaled(16, 16, Qt.KeepAspectRatio, Qt.SmoothTransformation))
     else:
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#1b2a35"))
+        p.setBrush(QColor(TRACK))
         p.drawRoundedRect(1, 1, 16, 16, 4, 4)
         f = QFont("Segoe UI", 8)
         f.setBold(True)
@@ -590,7 +626,7 @@ class DownloadModel(QAbstractTableModel):
             pw = self.parent_window
             fade = getattr(pw, "_recently_done", {}).get(j.get("id"), 0) if pw else 0
             if fade > 0:
-                flash = QColor("#173c2a")
+                flash = QColor(SEL)
                 base = QColor(PANEL)
                 t = max(0.0, min(1.0, float(fade)))
                 return QColor(
@@ -644,11 +680,11 @@ class DownloadModel(QAbstractTableModel):
                 if s == "paused":
                     return QColor(WARN)
                 if s == "skipped":
-                    return QColor("#607d8b")
+                    return QColor(_PAL["text_dim"])
             if col in (1, 3, 6, 7, 8):
-                return QColor("#b8c4cf")
+                return QColor(SOFT)
             if col == 5:
-                return QColor("#a9b7c5")
+                return QColor(SOFT)
             return QColor(TEXT)
         return None
 
@@ -1690,23 +1726,6 @@ class _SettingsNav(QWidget):
 class SettingsDialog(QDialog):
     """Tabbed settings editor — POSTs each value to /settings on Save."""
 
-    PRESET_LABELS = [("amoled_black", "AMOLED Black"),
-                      ("dark_gray", "Dark Gray"),
-                      ("high_contrast", "High Contrast")]
-    ACCENT_SWATCHES = ["#26c6da", "#7c4dff", "#66bb6a", "#ffa726",
-                       "#ef5350", "#42a5f5", "#ec407a"]
-    TOKEN_ORDER = ("bg_base", "bg_panel", "bg_elevated", "border", "border_hi",
-                   "text", "text_muted", "text_dim", "accent", "accent_dim",
-                   "success", "warning", "error", "info")
-    TOKEN_LABELS = {
-        "bg_base": "Main background", "bg_panel": "Panels",
-        "bg_elevated": "Dialogs / dropdowns", "border": "Borders",
-        "border_hi": "Borders (hover)", "text": "Main text",
-        "text_muted": "Secondary text", "text_dim": "Faint text",
-        "accent": "Accent (fine-tune)", "accent_dim": "Accent (pressed)",
-        "success": "Success", "warning": "Warning", "error": "Error", "info": "Info",
-    }
-
     def __init__(self, parent=None, api=None):
         super().__init__(parent)
         self.api = api
@@ -1739,8 +1758,6 @@ class SettingsDialog(QDialog):
         # v4 (Session 6): self.accent / self._theme_tokens still live here
         # since _save_inner reads them, but their controls now live in the
         # Theme tab below — one place for everything theme-related.
-        self.accent = s.get("accent", "#26c6da")
-        self._theme_tokens = dict(s.get("theme_tokens") or {})
         self.notify_queue_done = QCheckBox("Show one notification when a batch of downloads finishes")
         self.notify_queue_done.setChecked(bool(s.get("notify_queue_done", True)))
         gl.addRow(self.notify_queue_done)
@@ -1749,106 +1766,10 @@ class SettingsDialog(QDialog):
         gl.addRow(self.animations_enabled)
         tabs.addTab(g, "General")
 
-        # ---- Theme tab — redesigned to be approachable, not a raw token
-        # editor. Preset + accent + a real live preview up front; the old
-        # 14-row raw-hex table is still here for power users, just hidden
-        # behind a checkbox instead of being the first thing anyone sees. ----
-        tw = QWidget()
-        tl = QVBoxLayout(tw)
-        tl.setSpacing(14)
-
-        preset_label = QLabel("Preset")
-        preset_label.setObjectName("SectionLabel")
-        tl.addWidget(preset_label)
-        self.theme_preset = QComboBox()
-        for key, label in self.PRESET_LABELS:
-            self.theme_preset.addItem(label, userData=key)
-        preset = s.get("theme_preset", "amoled_black")
-        if preset not in dict(self.PRESET_LABELS):
-            preset = "amoled_black"
-        idx = self.theme_preset.findData(preset)
-        if idx >= 0:
-            self.theme_preset.setCurrentIndex(idx)
-        self.theme_preset.currentIndexChanged.connect(lambda _i: self._refresh_theme_preview())
-        tl.addWidget(self.theme_preset)
-
-        accent_label = QLabel("Accent color")
-        accent_label.setObjectName("SectionLabel")
-        tl.addWidget(accent_label)
-        accent_row = QHBoxLayout()
-        self._accent_swatches = []
-        for hexcolor in self.ACCENT_SWATCHES:
-            b = QPushButton()
-            b.setFixedSize(28, 28)
-            b.setCursor(Qt.PointingHandCursor)
-            b.setToolTip(hexcolor)
-            b.clicked.connect(lambda _=False, c=hexcolor: self._set_accent(c))
-            accent_row.addWidget(b)
-            self._accent_swatches.append((hexcolor, b))
-        self.accent_btn = QPushButton(f"Custom…  {self.accent}")
-        self.accent_btn.clicked.connect(self._pick_accent)
-        accent_row.addWidget(self.accent_btn)
-        accent_row.addStretch(1)
-        tl.addLayout(accent_row)
-        self._restyle_accent_swatches()
-
-        preview_label = QLabel("Preview")
-        preview_label.setObjectName("SectionLabel")
-        tl.addWidget(preview_label)
-        self.theme_preview_frame = QFrame()
-        self.theme_preview_frame.setObjectName("ThemePreviewFrame")
-        pf = QVBoxLayout(self.theme_preview_frame)
-        pf.setContentsMargins(16, 16, 16, 16)
-        pf.setSpacing(10)
-        ptitle = QLabel("Video Grabber")
-        ptitle.setObjectName("PreviewTitle")
-        pf.addWidget(ptitle)
-        psub = QLabel("This is roughly what your download list will look like")
-        psub.setObjectName("PreviewMuted")
-        pf.addWidget(psub)
-        pbtn_row = QHBoxLayout()
-        pbtn1 = QPushButton("Download")
-        pbtn1.setObjectName("PreviewPrimary")
-        pbtn2 = QPushButton("Cancel")
-        pbtn2.setObjectName("PreviewSecondary")
-        pbtn_row.addWidget(pbtn1)
-        pbtn_row.addWidget(pbtn2)
-        pbtn_row.addStretch(1)
-        pf.addLayout(pbtn_row)
-        self.theme_preview_bar = QProgressBar()
-        self.theme_preview_bar.setRange(0, 100)
-        self.theme_preview_bar.setValue(64)
-        pf.addWidget(self.theme_preview_bar)
-        tl.addWidget(self.theme_preview_frame)
-
-        self.show_advanced_theme = QCheckBox("Show advanced color overrides")
-        self.show_advanced_theme.setChecked(bool(s.get("theme_tokens")))
-        tl.addWidget(self.show_advanced_theme)
-        self.tok_table = QTableWidget(0, 3)
-        self.tok_table.setHorizontalHeaderLabels(["Setting", "Color", ""])
-        self.tok_table.horizontalHeader().setStretchLastSection(True)
-        self.tok_table.verticalHeader().setVisible(False)
-        for name in self.TOKEN_ORDER:
-            self._add_token_row(name)
-        self.tok_table.setVisible(self.show_advanced_theme.isChecked())
-        self.show_advanced_theme.toggled.connect(self.tok_table.setVisible)
-        tl.addWidget(self.tok_table)
-
-        row = QHBoxLayout()
-        exp = QPushButton("Export theme…")
-        imp = QPushButton("Import theme…")
-        reset_theme_btn = QPushButton("Reset to defaults")
-        exp.clicked.connect(self._export_theme)
-        imp.clicked.connect(self._import_theme)
-        reset_theme_btn.clicked.connect(self._reset_theme_all)
-        row.addWidget(exp)
-        row.addWidget(imp)
-        row.addWidget(reset_theme_btn)
-        row.addStretch(1)
-        tl.addLayout(row)
-        tl.addStretch(1)
-        self._refresh_theme_preview()
-        tabs.addTab(tw, "Theme")
+        # ---- Theme tab (gui_theme_page.py) ----
+        from gui_theme_page import ThemePage
+        self.theme_page = ThemePage(s)
+        tabs.addTab(self.theme_page, "Theme")
 
         # ---- Downloads ----
         d = QWidget()
@@ -2193,155 +2114,6 @@ class SettingsDialog(QDialog):
         log("engine update check: " + "; ".join(lines))
         QMessageBox.information(self, "Engine versions", "\n".join(lines))
 
-    def _add_token_row(self, name):
-        from palette import resolve_palette
-        base = resolve_palette({})[name]
-        r = self.tok_table.rowCount()
-        self.tok_table.insertRow(r)
-        item = QTableWidgetItem(self.TOKEN_LABELS.get(name, name))
-        item.setToolTip(name)  # raw token key, for anyone editing a theme.json by hand
-        self.tok_table.setItem(r, 0, item)
-        btn = QPushButton(self._theme_tokens.get(name, base))
-        btn.setStyleSheet(f"background: {btn.text()}; color: #fff; border: 0;")
-        btn.clicked.connect(lambda _=False, n=name, b=btn: self._pick_token_color(n, b))
-        self.tok_table.setCellWidget(r, 1, btn)
-        reset = QPushButton("Reset")
-        reset.clicked.connect(lambda _=False, n=name, b=btn: self._reset_token(n, b))
-        self.tok_table.setCellWidget(r, 2, reset)
-
-    def _pick_token_color(self, name, btn):
-        from palette import resolve_palette
-        cur = QColor(self._theme_tokens.get(name, resolve_palette({})[name]))
-        c = QColorDialog.getColor(cur, self, f"Color for {self.TOKEN_LABELS.get(name, name)}")
-        if c.isValid():
-            self._theme_tokens[name] = c.name()
-            btn.setText(c.name())
-            btn.setStyleSheet(f"background: {c.name()}; color: #fff; border: 0;")
-            self._refresh_theme_preview()
-
-    def _reset_token(self, name, btn):
-        from palette import resolve_palette
-        self._theme_tokens.pop(name, None)
-        base = resolve_palette({})[name]
-        btn.setText(base)
-        btn.setStyleSheet(f"background: {base}; color: #fff; border: 0;")
-        self._refresh_theme_preview()
-
-    def _restyle_accent_swatches(self):
-        """Highlight whichever swatch (if any) matches the current accent."""
-        for hexcolor, btn in getattr(self, "_accent_swatches", []):
-            selected = hexcolor.lower() == self.accent.lower()
-            btn.setStyleSheet(
-                f"background:{hexcolor}; border-radius:14px; "
-                f"border:2px solid {'#ffffff' if selected else hexcolor};")
-
-    def _set_accent(self, hexcolor):
-        """Single entry point for changing the accent — used by swatch
-        clicks, the custom color picker, and theme import, so the swatch
-        highlight/preview never drift out of sync with self.accent."""
-        self.accent = hexcolor
-        self.accent_btn.setText(f"Custom…  {self.accent}")
-        self._restyle_accent_swatches()
-        self._refresh_theme_preview()
-
-    def _reset_theme_all(self):
-        """One button to get back to the app's defaults — preset, accent,
-        and every advanced token override at once."""
-        self._theme_tokens = {}
-        self.tok_table.setRowCount(0)
-        for name in self.TOKEN_ORDER:
-            self._add_token_row(name)
-        idx = self.theme_preset.findData("amoled_black")
-        if idx >= 0:
-            self.theme_preset.setCurrentIndex(idx)
-        self._set_accent("#26c6da")
-
-    def _refresh_theme_preview(self):
-        """Live preview: restyle a small mock UI (title, buttons, progress
-        bar) with the palette the current preset+accent+overrides would
-        resolve to — not a raw QSS text dump, so it's actually readable at
-        a glance."""
-        from palette import resolve_palette
-        tokens = resolve_palette({
-            "theme_preset": self.theme_preset.currentData() or "amoled_black",
-            "accent": self.accent,
-            "theme_tokens": dict(self._theme_tokens),
-        })
-        self.theme_preview_frame.setStyleSheet(f"""
-        #ThemePreviewFrame {{
-            background: {tokens['bg_panel']}; border: 1px solid {tokens['border']};
-            border-radius: {tokens['radius']};
-        }}
-        #ThemePreviewFrame QLabel {{ background: transparent; }}
-        #ThemePreviewFrame QLabel#PreviewTitle {{
-            color: {tokens['text']}; font-weight: 600; font-size: 14px;
-        }}
-        #ThemePreviewFrame QLabel#PreviewMuted {{
-            color: {tokens['text_muted']}; font-size: 11px;
-        }}
-        #ThemePreviewFrame QPushButton#PreviewPrimary {{
-            background: {tokens['accent']}; color: {tokens['bg_base']};
-            border: none; border-radius: {tokens['radius']}; padding: 8px 16px;
-            font-weight: 600;
-        }}
-        #ThemePreviewFrame QPushButton#PreviewSecondary {{
-            background: {tokens['bg_elevated']}; color: {tokens['text']};
-            border: 1px solid {tokens['border']}; border-radius: {tokens['radius']};
-            padding: 8px 16px;
-        }}
-        #ThemePreviewFrame QProgressBar {{
-            background: {tokens['bg_elevated']}; border: 1px solid {tokens['border']};
-            border-radius: {tokens['radius_pill']}; text-align: center;
-            color: {tokens['text_muted']};
-        }}
-        #ThemePreviewFrame QProgressBar::chunk {{
-            background: {tokens['accent']}; border-radius: {tokens['radius_pill']};
-        }}
-        """)
-
-    def _export_theme(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export theme", "theme.json",
-                                              "JSON (*.json)")
-        if not path:
-            return
-        theme = {"theme_preset": self.theme_preset.currentData() or "amoled_black",
-                 "accent": self.accent,
-                 "theme_tokens": dict(self._theme_tokens)}
-        Path(path).write_text(json.dumps(theme, indent=2, sort_keys=True),
-                              encoding="utf-8")
-
-    def _import_theme(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import theme", "",
-                                              "JSON (*.json)")
-        if not path:
-            return
-        try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("not an object")
-            if data.get("theme_preset"):
-                i = self.theme_preset.findData(str(data["theme_preset"]))
-                if i >= 0:
-                    self.theme_preset.setCurrentIndex(i)
-            toks = data.get("theme_tokens")
-            self._theme_tokens = dict(toks) if isinstance(toks, dict) else {}
-            self.tok_table.setRowCount(0)
-            for name in self.TOKEN_ORDER:
-                self._add_token_row(name)
-            # accent last: _set_accent() also calls _refresh_theme_preview(),
-            # which needs the just-rebuilt token table / new preset in place.
-            if data.get("accent"):
-                self._set_accent(str(data["accent"]))
-            else:
-                self._refresh_theme_preview()
-        except Exception as e:
-            QMessageBox.warning(self, "Import failed", str(e))
-
-    def _pick_accent(self):
-        c = QColorDialog.getColor(QColor(self.accent), self, "Custom accent color")
-        if c.isValid():
-            self._set_accent(c.name())
-
     def _add_rule_row(self, domain, category, engine):
         row = self.rules_table.rowCount()
         self.rules_table.insertRow(row)
@@ -2416,13 +2188,14 @@ class SettingsDialog(QDialog):
                                   {ext: not cb.isChecked()
                                    for ext, cb in self.ft_checks.items()})
             # --- v4 (Session 6) ---
-            self.api.save_setting("accent", self.accent)
-            self.api.save_setting("theme_preset", self.theme_preset.currentData() or "amoled_black")
-            self.api.save_setting("theme_tokens", self._theme_tokens)
-            # 13.2: rebuild QSS from the freshly saved settings and reapply
-            # app-wide so theme changes land without a restart.
-            from gui_style import build_qss
-            QApplication.instance().setStyleSheet(build_qss(load_settings()))
+            tv = self.theme_page.values()
+            self.api.save_setting("accent", tv["accent"])
+            self.api.save_setting("theme_preset", tv["theme_preset"])
+            self.api.save_setting("theme_tokens", tv["theme_tokens"])
+            self.api.save_setting("shell_enabled", tv["shell_enabled"])
+            self.api.save_setting("shell_color", tv["shell_color"])
+            # rebuild the stylesheet and repaint so the theme lands live
+            reapply_theme()
             self.api.save_setting("animations_enabled",
                                   self.animations_enabled.isChecked())
             self.api.save_setting("prefer_source_quality",
@@ -3073,7 +2846,9 @@ class MainWindow(QMainWindow):
         cl.addWidget(self.log)
         bl.addWidget(content, 1)
         root_layout.addWidget(body, 1)
-        self.setCentralWidget(root)
+        self._root = root
+        self.shell = None
+        self.apply_shell()
         status = QStatusBar()
         status.setObjectName("BottomStatus")
         self.status_label = QLabel("● Connecting…")
@@ -3119,82 +2894,9 @@ class MainWindow(QMainWindow):
         a = QAction("About Video Grabber…", self); a.triggered.connect(self.show_about); t.addAction(a)
 
     def _apply_styles(self):
-        self.setStyleSheet(f"""
-        * {{ font-family: "Segoe UI"; color: {TEXT}; }}
-        QMainWindow, QWidget {{ background: {BG}; }}
-        QMenuBar {{ background: {PANEL}; color: {MUTED}; padding: 3px 8px; }}
-        QMenuBar::item:selected {{ background: #18242e; color: {TEXT}; }}
-        QMenu {{ background: #111a23; border: 1px solid #2a3b49; padding: 6px; }}
-        QMenu::item {{ padding: 8px 26px 8px 12px; border-radius: 5px; }}
-        QMenu::item:selected {{ background: #1b2a35; }}
-        #Toolbar {{ background: {PANEL}; border-bottom: 1px solid {BORDER}; }}
-        #ToolbarTitle {{ font-size: 16px; font-weight: 600; }}
-        #ToolbarButton {{
-            background: transparent; border: 1px solid transparent;
-            border-radius: 7px; padding: 8px 11px; color: #c5d0da;
-        }}
-        #ToolbarButton:hover {{ background: #18242e; border-color: #263846; color: white; }}
-        #ToolbarButton:pressed {{ background: #20313e; }}
-        #Search {{
-            background: #0d151d; border: 1px solid #293b49;
-            border-radius: 8px; padding: 8px 12px; min-width: 200px;
-        }}
-        #Search:focus {{ border-color: {ACCENT}; }}
-        #Sidebar {{ background: #0d151d; border-right: 1px solid {BORDER}; }}
-        #Brand {{ font-size: 12px; font-weight: 700; letter-spacing: 1px; color: #dce6ed; }}
-        #SectionLabel {{ color: #6f8191; font-size: 10px; font-weight: 700; letter-spacing: 1.4px; }}
-        #SidebarSeparator {{ color: {BORDER}; background: {BORDER}; max-height: 1px; }}
-        QToolButton[nav="true"] {{
-            text-align: left; background: transparent; border: 0;
-            border-radius: 6px; color: #9caebb; padding: 0 10px;
-        }}
-        QToolButton[nav="true"]:hover {{ background: #15212b; color: #e9f0f5; }}
-        QTableView {{
-            background: {PANEL}; border: 1px solid {BORDER}; border-radius: 8px;
-            selection-background-color: #173c2a; selection-color: white; outline: 0;
-        }}
-        QHeaderView::section {{
-            background: #121d27; color: #8fa1b0; border: 0;
-            border-bottom: 1px solid {BORDER}; padding: 11px 10px;
-            font-size: 11px; font-weight: 600;
-        }}
-        QTableView::item {{ border: 0; padding: 7px 8px; }}
-        QTableView::item:selected {{ background: #173c2a; }}
-        #Details {{
-            background: #0c141c; border: 1px solid {BORDER}; border-radius: 7px;
-            padding: 8px 12px; color: #b8c4cf; font-size: 12px;
-        }}
-        #EmptyState {{ color: #6f8191; font-size: 14px; background: transparent; }}
-        #HoldLabel {{ color: {WARN}; padding-right: 12px; }}
-        #UpdateBadge {{
-            color: {ACCENT}; border: 0; padding: 0 12px; font-weight: 600;
-            background: transparent;
-        }}
-        #UpdateBadge:hover {{ color: white; }}
-        QListWidget#SettingsNav {{
-            background: #0d151d; border: 1px solid {BORDER}; border-radius: 8px;
-            padding: 4px; outline: 0;
-        }}
-        QListWidget#SettingsNav::item {{ padding: 9px 12px; border-radius: 6px; color: #9caebb; }}
-        QListWidget#SettingsNav::item:hover {{ background: #15212b; color: #e9f0f5; }}
-        QListWidget#SettingsNav::item:selected {{ background: #173c2a; color: white; }}
-        QScrollArea {{ background: transparent; border: 0; }}
-        #LogLine {{
-            background: #0c141c; border: 1px solid {BORDER}; border-radius: 7px;
-            padding: 8px 12px; color: #8fa1b0; font-family: "Consolas";
-            font-size: 11px;
-        }}
-        #BottomStatus {{ background: #0a1016; border-top: 1px solid {BORDER}; color: #718493; }}
-        #StatusLabel {{ color: {SUCCESS}; padding-left: 10px; }}
-        QDialog {{ background: {PANEL}; }}
-        QLineEdit, QComboBox {{
-            background: #0d151d; border: 1px solid #293b49;
-            border-radius: 6px; padding: 7px;
-        }}
-        QPushButton {{ background: #18242e; border: 1px solid #2b3d4b;
-            border-radius: 6px; padding: 7px 13px; }}
-        QPushButton:hover {{ background: #20313e; }}
-        """)
+        # All styling now comes from gui_style.build_qss (app-wide), so the
+        # window follows the Theme settings. Nothing is hardcoded here.
+        self.setStyleSheet("")
 
     # ---------------------------------------------------------------- v5 ---
     _EMPTY_TEXT = {
@@ -3266,7 +2968,8 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _apply_toolbar_text(self):
-        compact = self.width() < 1240
+        extra = 262 if getattr(self, "shell", None) else 0   # the shell eats width
+        compact = (self.width() - extra) < 1240
         for btn, icon, label in getattr(self, "_tb", []):
             btn.setText(icon if compact else f"{icon}  {label}")
             btn.setToolTip(label)
@@ -3648,6 +3351,49 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Settings error", str(e))
 
+    # ---- optional handheld shell (gui_shell.py) ----
+    def apply_shell(self):
+        """Wrap the main view in the handheld shell, or unwrap it, per the
+        shell_enabled / shell_color settings. Safe to call repeatedly."""
+        st = load_settings()
+        old = self.takeCentralWidget()
+        if old is not None and old is not self._root:
+            old.layout().removeWidget(self._root)
+            self._root.setParent(None)
+            old.deleteLater()
+        if st.get("shell_enabled"):
+            from gui_shell import ShellFrame
+            self.shell = ShellFrame(self._root, st.get("shell_color", "cream"))
+            self.shell.dpad.connect(self._shell_dpad)
+            self.shell.button.connect(self._shell_button)
+            self.setCentralWidget(self.shell)
+        else:
+            self.shell = None
+            self.setCentralWidget(self._root)
+        self._root.show()
+        self._apply_toolbar_text()
+
+    def _shell_dpad(self, d):
+        if d in ("up", "down"):
+            n = self.model.rowCount()
+            if not n:
+                return
+            cur = self.table.currentIndex().row()
+            self.table.selectRow(max(0, min(n - 1, (0 if cur < 0 else cur) + (-1 if d == "up" else 1))))
+        else:
+            names = list(self.sidebar.buttons.keys())
+            i = names.index(self.current_filter) if self.current_filter in names else 0
+            self.select_category(names[(i + (-1 if d == "left" else 1)) % len(names)])
+
+    def _shell_button(self, name):
+        if name == "start":
+            self.toggle_queue()
+        elif name == "select":
+            self.search.setFocus()
+            self.search.selectAll()
+        elif self._selected_rows():
+            self._selected("resume" if name == "a" else "pause")
+
     def toggle_queue(self):
         """Flip the dispatcher's queue_running flag via /settings."""
         running = not bool(load_settings().get("queue_running", True))
@@ -3755,10 +3501,9 @@ class MainWindow(QMainWindow):
     def select_category(self, name):
         self.current_filter = name
         for n, b in self.sidebar.buttons.items():
-            b.setStyleSheet(
-                f"QToolButton {{ background: {'#173c2a' if n == name else 'transparent'}; "
-                f"color: {'#ffffff' if n == name else '#9caebb'}; }}"
-            )
+            b.setProperty("active", n == name)
+            b.style().unpolish(b)
+            b.style().polish(b)
         self.apply_filter(self.search.text())
 
     def _selected_rows(self):
@@ -4147,6 +3892,7 @@ def launch_gui(new_job_hook=None, home_dir=None, show_dialog_hook=None):
         CONFIG_PATH = HOME / "settings.json"
     _app = QApplication.instance() or QApplication(sys.argv)
     from gui_style import build_qss
+    _sync_palette(load_settings())
     _app.setStyleSheet(build_qss(load_settings()))
     _app.setApplicationName("Video Grabber")
     _app.setFont(QFont("Segoe UI", 10))

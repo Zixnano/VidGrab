@@ -44,7 +44,7 @@ TOKEN_PROTECTED_PATHS = {
     "/upload-token", "/redownload", "/show-add-dialog",
     "/clear-failed", "/queue-status", "/dup-check", "/favicon",
     "/update-status", "/update-skip", "/ytdlp-update", "/ytdlp-rollback",
-    "/reorder",
+    "/reorder", "/theme",
 }
 
 # Random per-launch key, embedded in the LAN web UI's action links so that
@@ -824,6 +824,18 @@ def update_settings():
             STATE[k] = v
     save_settings()
     return jsonify({"ok": True})
+
+@app.route("/theme", methods=["GET"])
+def theme():
+    """Resolved color tokens, so the extension popup, options page and
+    in-page pill can follow the app's Theme settings."""
+    from palette import resolve_palette
+    pal = resolve_palette(STATE)
+    keys = ("bg_base", "bg_panel", "bg_elevated", "bg_sel", "bg_hover", "border",
+            "border_hi", "text", "text_soft", "text_muted", "text_dim", "accent",
+            "accent_dim", "text_on_accent", "success", "warning", "error", "info",
+            "radius", "font", "font_mono")
+    return jsonify({k: pal[k] for k in keys if k in pal})
 
 @app.route("/remote", methods=["GET"])
 def remote_ui():

@@ -157,6 +157,10 @@ _V5_DEFAULTS = {
     # provider to fire (see bgutil-ytdlp-pot-provider issue #253).
     # Only applied to YouTube URLs. Non-YouTube jobs are unaffected.
     "ytdlp_player_clients": [],
+    # GUI (v5.2): optional handheld shell around the main window.
+    # shell_color is one of: cream, black, indigo, silver.
+    "shell_enabled": False,
+    "shell_color": "cream",
 }
 STATE.update(_V5_DEFAULTS)
 

@@ -140,6 +140,16 @@ chrome.runtime.onInstalled.addListener(() => {
 // the app started after the extension was installed.
 pairIfNeeded();
 
+// ---- v5.2: copy the app's theme into storage so the pill follows it.
+async function refreshTheme() {
+  try {
+    const { res, unpaired } = await authedFetch("/theme");
+    if (unpaired || !res.ok) return;
+    await chrome.storage.local.set({ theme: await res.json() });
+  } catch (e) { /* app not running: keep the last saved theme */ }
+}
+refreshTheme();
+
 // ---- v5: site favicon, sent once per domain so the app can show a source icon.
 const _faviconTried = new Set();
 async function noteFavicon(pageUrl) {

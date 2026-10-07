@@ -3,72 +3,92 @@
 <head>
 <meta charset="utf-8" />
 <style>
-  body { width: 380px; font: 13px -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 10px; color: #222; }
-  h1 { font-size: 14px; margin: 0 0 6px; }
-  #status { font-size: 12px; margin-bottom: 8px; padding: 6px 8px; border-radius: 6px; }
-  .ok { background: #e8f5e9; color: #2e7d32; }
-  .bad { background: #fdecea; color: #c62828; }
+  :root { --bg:#0a0a0f; --panel:#12121a; --elev:#1a1a24; --sel:#173a41; --hover:#1a1a24;
+          --bd:#242430; --bd-hi:#33333f; --tx:#e6e6eb; --tx-soft:#b3b3bd; --mu:#8a8a95; --dim:#5a5a65;
+          --ac:#26c6da; --ac-dim:#1a8a99; --on-ac:#0a0a0f; --ok:#4caf50; --warn:#ffb300; --err:#ef5350;
+          --info:#42a5f5; --r:10px; --font:-apple-system, "Segoe UI", Roboto, sans-serif; color-scheme:dark; }
+  * { box-sizing: border-box; }
+  body { width: 380px; font: 13px/1.4 var(--font); margin: 0; padding: 12px; color: var(--tx); background: var(--bg); }
+  button { font: inherit; color: var(--tx); background: var(--elev); border: 1px solid var(--bd);
+           border-radius: var(--r); cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--bd-hi); background: var(--hover); }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--ac); outline-offset: 2px; }
+  .hdr { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .hdr img { width: 32px; height: 32px; border-radius: 8px; }
+  .hdr b { display: block; font-size: 15px; }
+  .hdr small { color: var(--mu); letter-spacing: .06em; font-size: 11px; }
+  #status { font-size: 12px; margin-bottom: 10px; padding: 8px 12px; border-radius: var(--r); }
+  .ok { background: color-mix(in srgb, var(--ok) 14%, var(--panel)); color: var(--ok); }
+  .ok:before { content: "\25CF  "; font-size: 10px; }
+  .bad { background: color-mix(in srgb, var(--err) 14%, var(--panel)); color: var(--err); }
 
-  .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
-  .tab { flex: 1; padding: 6px; font-size: 12px; border: 1px solid #ddd; background: #fafafa;
-         border-radius: 6px; cursor: pointer; }
-  .tab.active { background: #2e7d32; color: #fff; border-color: #2e7d32; }
+  .tabs { display: flex; gap: 3px; margin-bottom: 8px; padding: 3px; background: var(--elev); border-radius: var(--r); }
+  .tab { flex: 1; padding: 7px; font-size: 12px; border: 0; background: transparent; color: var(--mu); }
+  .tab:hover:not(:disabled) { background: transparent; color: var(--tx); }
+  .tab.active { background: var(--ac); color: var(--on-ac); font-weight: 600; }
 
   #otherTabs { margin-bottom: 6px; }
-  .otab { display: flex; justify-content: space-between; padding: 5px 8px; border: 1px solid #eee;
-          border-radius: 6px; margin-bottom: 4px; cursor: pointer; font-size: 12px; }
-  .otab:hover { background: #f5f5f5; }
-  .otab.sel { border-color: #2e7d32; background: #e8f5e9; }
+  .otab { display: flex; justify-content: space-between; padding: 6px 10px; border: 1px solid var(--bd);
+          border-radius: var(--r); margin-bottom: 4px; cursor: pointer; font-size: 12px; background: var(--panel); }
+  .otab:hover { background: var(--hover); }
+  .otab.sel { border-color: var(--ac); background: var(--sel); }
 
-  .mrow { display: flex; align-items: center; gap: 6px; border: 1px solid #eee;
-          border-radius: 6px; padding: 5px 7px; margin-bottom: 4px; }
-  .mrow input[type=checkbox] { flex-shrink: 0; }
+  .mrow { display: flex; align-items: center; gap: 8px; border: 1px solid var(--bd); background: var(--panel);
+          border-radius: var(--r); padding: 6px 9px; margin-bottom: 5px; }
+  .mrow:hover { border-color: var(--bd-hi); }
+  .mrow input[type=checkbox] { flex-shrink: 0; accent-color: var(--ac); }
   .mrow .mname { font-size: 12px; word-break: break-all; flex: 1; }
   .mrow .macts { flex-shrink: 0; white-space: nowrap; }
-  .mrow .macts button { font-size: 12px; padding: 2px 5px; cursor: pointer; }
+  .mrow .macts button { font-size: 12px; padding: 2px 7px; }
 
-  .toolbar { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0 4px; }
-  .toolbar button { flex: 1 1 auto; font-size: 11px; padding: 4px 6px; cursor: pointer; }
-  .toolbar button:disabled { opacity: 0.4; cursor: default; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 5px; margin: 10px 0 4px; }
+  .toolbar button { flex: 1 1 auto; font-size: 11px; padding: 6px 8px; }
+  .toolbar button:disabled { opacity: .4; cursor: default; }
+  #btnDownload { background: var(--ac); color: var(--on-ac); border-color: var(--ac); font-weight: 600; }
+  #btnDownload:hover:not(:disabled) { background: var(--ac-dim); border-color: var(--ac-dim); }
 
-  #filterPanel { border: 1px solid #eee; border-radius: 6px; padding: 6px 8px;
-                 margin-bottom: 6px; font-size: 12px; display: block; }
-  #filterPanel label { margin-right: 10px; white-space: nowrap; }
-  #filterPanel .tiny { display: block; margin: 6px 0 0; color: #555; }
-  #searchInput { width: 100%; box-sizing: border-box; padding: 5px 8px; margin-bottom: 6px;
-                 border: 1px solid #ddd; border-radius: 6px; font-size: 12px; display: none; }
+  #filterPanel { border: 1px solid var(--bd); background: var(--panel); border-radius: var(--r);
+                 padding: 8px; margin-bottom: 8px; font-size: 12px; display: block; }
+  #filterPanel label { position: relative; display: inline-block; margin: 0 4px 5px 0; padding: 3px 10px;
+                       border: 1px solid var(--bd); border-radius: 999px; color: var(--mu); cursor: pointer; white-space: nowrap; }
+  #filterPanel label input { position: absolute; opacity: 0; width: 0; height: 0; }
+  #filterPanel label:has(input:checked) { border-color: var(--ac); color: var(--ac); background: var(--sel); }
+  #filterPanel label:has(input:focus-visible) { outline: 2px solid var(--ac); outline-offset: 2px; }
+  #filterPanel .tiny { display: block; margin: 6px 0 0; padding: 0; border: 0; border-radius: 0; background: none;
+                       color: var(--mu); cursor: pointer; }
+  #filterPanel .tiny input { position: static; opacity: 1; width: auto; height: auto; accent-color: var(--ac); vertical-align: -2px; }
+  #searchInput { width: 100%; padding: 7px 10px; margin-bottom: 8px; border: 1px solid var(--bd);
+                 border-radius: var(--r); font: inherit; display: none; background: var(--bg); color: var(--tx); }
+  #searchInput:focus { border-color: var(--ac); outline: none; }
 
-  .empty { color: #888; font-size: 12px; padding: 12px 0; text-align: center; }
-  #mediaStatus { font-size: 11px; color: #555; min-height: 14px; margin-bottom: 4px; }
+  .empty { color: var(--dim); font-size: 12px; padding: 14px 0; text-align: center; }
+  #mediaStatus { font-size: 11px; color: var(--mu); min-height: 14px; margin-bottom: 4px; }
 
-  /* secondary action: page scan (unchanged feature) */
-  .grab-item { display: flex; align-items: flex-start; gap: 6px; border: 1px solid #eee;
-    border-radius: 6px; padding: 5px 7px; margin-bottom: 4px; }
-  .grab-item input[type=checkbox] { margin-top: 3px; flex-shrink: 0; }
+  .grab-item { display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--bd); background: var(--panel);
+    border-radius: var(--r); padding: 6px 9px; margin-bottom: 5px; }
+  .grab-item input[type=checkbox] { margin-top: 3px; flex-shrink: 0; accent-color: var(--ac); }
   .grab-item .name { font-size: 12px; word-break: break-all; }
-  .grab-toolbar { display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 6px; }
-  .grab-toolbar button { font-size: 11px; padding: 3px 8px; cursor: pointer; }
-  #grabSendBtn { width: 100%; padding: 6px; margin-top: 6px; cursor: pointer; }
-  #grabSendBtn:disabled { opacity: 0.5; cursor: default; }
-  .divider { border-top: 1px solid #eee; margin: 10px 0 8px; }
+  .grab-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .grab-toolbar button { font-size: 11px; padding: 4px 9px; }
+  #grabAllBtn, #grabSendBtn { width: 100%; padding: 8px; }
+  #grabSendBtn { margin-top: 6px; background: var(--ac); color: var(--on-ac); border-color: var(--ac); font-weight: 600; }
+  #grabSendBtn:disabled { opacity: .5; cursor: default; }
+  .divider { border-top: 1px solid var(--bd); margin: 12px 0 10px; }
 
-  /* v5: recent downloads + per-site switch */
-  #recent { margin-bottom: 8px; }
-  #recent h2 { font-size: 11px; font-weight: 600; color: #555; margin: 0 0 4px; }
-  .rjob { border: 1px solid #eee; border-radius: 6px; padding: 4px 7px; margin-bottom: 3px; font-size: 12px; }
+  #recent { margin-bottom: 10px; }
+  #recent h2 { font-size: 11px; font-weight: 600; color: var(--mu); margin: 0 0 5px; letter-spacing: .06em; }
+  .rjob { border: 1px solid var(--bd); background: var(--panel); border-radius: var(--r); padding: 6px 9px; margin-bottom: 4px; font-size: 12px; }
   .rjob .rname { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rjob .rmeta { display: flex; justify-content: space-between; color: #666; font-size: 11px; }
-  .rjob .rbar { height: 3px; background: #eee; border-radius: 2px; margin: 3px 0; overflow: hidden; }
-  .rjob .rbar > i { display: block; height: 100%; background: #2e7d32; }
-  .rjob.err .rmeta .rstat { color: #c62828; }
-  #siteRow { display: flex; justify-content: space-between; align-items: center;
-             font-size: 11px; color: #555; margin-bottom: 6px; }
-  #siteToggle { font-size: 11px; padding: 2px 8px; cursor: pointer; }
+  .rjob .rmeta { display: flex; justify-content: space-between; color: var(--mu); font-size: 11px; }
+  .rjob .rbar { height: 4px; background: var(--elev); border-radius: 4px; margin: 4px 0; overflow: hidden; }
+  .rjob .rbar > i { display: block; height: 100%; background: var(--ac); }
+  .rjob.err .rmeta .rstat { color: var(--err); }
+  #siteRow { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--mu); margin-bottom: 8px; }
+  #siteToggle { font-size: 11px; padding: 3px 10px; }
 </style>
 </head>
 <body>
-  <h1>Video Grabber</h1>
+  <div class="hdr"><img src="icons/icon48.png" alt=""><div><b>Video Grabber</b><small>BROWSER EXTENSION</small></div></div>
   <div id="status">Checking desktop app…</div>
   <div id="recent" style="display:none;"><h2>Recent downloads</h2><div id="recentList"></div></div>
   <div id="siteRow"><span id="siteName"></span><button id="siteToggle">Hide pill on this site</button></div>
@@ -105,7 +125,7 @@
   </div>
 
   <div class="divider"></div>
-  <button id="grabAllBtn" style="width:100%;padding:6px;margin-bottom:8px;cursor:pointer;">🔍 Grab all media/files on this page</button>
+  <button id="grabAllBtn" style="margin-bottom:8px;">🔍 Grab all media/files on this page</button>
   <div id="grabResult" style="font-size:11px;color:#555;margin-bottom:8px;"></div>
   <div id="grabToolbar" class="grab-toolbar" style="display:none;">
     <span id="grabCount" style="font-size:11px;color:#555;"></span>
@@ -114,6 +134,7 @@
   <div id="grabChecklist"></div>
   <button id="grabSendBtn" style="display:none;">Send selected to Grabber</button>
 
+  <script src="theme.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>
