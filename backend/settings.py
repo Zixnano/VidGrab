@@ -1,6 +1,7 @@
 """Application settings, paths, filename helpers, bandwidth profiles."""
 from pathlib import Path
 from urllib.parse import unquote
+import copy
 from urllib.parse import urlparse, parse_qs
 import glob
 import json
@@ -117,7 +118,23 @@ STATE = {
     "settings_version": 4,
 }
 
-_V4_DEFAULTS = {k: v for k, v in list(STATE.items())[-12:]}
+# Explicit on purpose: this used to be a slice of the last 12 STATE items,
+# which silently changed whenever a key was added to STATE. Same 12 keys and
+# values as the old slice; fresh containers so nothing aliases STATE.
+_V4_DEFAULTS = {
+    "bandwidth_profiles": [],
+    "bandwidth_profiles_enabled": False,
+    "accent": "#26c6da",
+    "theme_preset": "amoled_black",
+    "theme_tokens": {},
+    "animations_enabled": True,
+    "preferred_engines": [],
+    "engines_disabled": [],
+    "per_site_engine": {},
+    "prefer_source_quality": True,
+    "subtitle_languages": ["en"],
+    "settings_version": 4,
+}
 
 # --- v5 additions. Kept in their own dict (NOT appended to STATE above):
 # _V4_DEFAULTS slices the last 12 STATE items, so appending keys there
@@ -168,9 +185,9 @@ STATE.update(_V5_DEFAULTS)
 def _migrate_settings(old):
     """Fill any keys missing from an older settings.json with v4/v5 defaults."""
     for k, v in _V4_DEFAULTS.items():
-        old.setdefault(k, v)
+        old.setdefault(k, copy.deepcopy(v))
     for k, v in _V5_DEFAULTS.items():
-        old.setdefault(k, v)
+        old.setdefault(k, copy.deepcopy(v))
 
 
 _SHUTDOWN_PENDING = False
@@ -316,7 +333,10 @@ def guess_filename(url, content_disposition=None):
     qname = _filename_from_query(url)
     if qname:
         return safe_filename(qname)
-    path = urlparse(url).path
+    try:
+        path = urlparse(url).path
+    except ValueError:
+        path = ""
     name = os.path.basename(path) or "download"
     return safe_filename(unquote(name))
 
@@ -563,7 +583,11 @@ def proxy_for(url):
         return None
     if STATE.get("proxy_scope", "youtube") == "all":
         return p
-    return p if _is_yt_host(urlparse(url or "").hostname) else None
+    try:
+        host = urlparse(url or "").hostname
+    except ValueError:
+        return None
+    return p if _is_yt_host(host) else None
 
 
 def proxies_for(url):
@@ -619,7 +643,10 @@ def clean_title(title):
 
 
 def site_host(url):
-    h = (urlparse(url or "").hostname or "").lower()
+    try:
+        h = (urlparse(url or "").hostname or "").lower()
+    except ValueError:
+        h = ""
     return h[4:] if h.startswith("www.") else h
 
 

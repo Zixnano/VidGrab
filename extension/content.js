@@ -100,8 +100,17 @@
     /(^|\.)vimeo\.com$/i, /(^|\.)dailymotion\.com$/i, /(^|\.)twitter\.com$/i,
     /(^|\.)x\.com$/i, /(^|\.)reddit\.com$/i, /(^|\.)facebook\.com$/i,
     /(^|\.)instagram\.com$/i, /(^|\.)tiktok\.com$/i, /(^|\.)bilibili\.com$/i,
+    /(^|\.)redgifs\.com$/i,
   ];
   const isExtractorSite = () => EXTRACTOR_HOSTS.some((rx) => rx.test(location.hostname));
+  // Sites where the player is a blob and there is no format ladder worth a
+  // menu: one click sends the page URL. YouTube/Twitch/Vimeo etc. are NOT
+  // here on purpose, their menu offers formats and playlist items.
+  const ONE_CLICK_HOSTS = [
+    /(^|\.)reddit\.com$/i, /(^|\.)redgifs\.com$/i, /(^|\.)tiktok\.com$/i,
+    /(^|\.)x\.com$/i, /(^|\.)twitter\.com$/i,
+  ];
+  const isOneClickSite = () => ONE_CLICK_HOSTS.some((rx) => rx.test(location.hostname));
 
   function isVisible(el) {
     const r = el.getBoundingClientRect();
@@ -911,17 +920,18 @@
       e.stopPropagation();
       e.preventDefault();
       if (RECORDERS.has(video)) { handleRecordToggle(video, overlay); return; }
-      // MSE-only sites (Twitch) have no currentSrc yet but still need the menu —
-      // it offers "Send page URL to yt-dlp". Only bail when there's truly nothing.
-      if (!video.currentSrc && !isBlob() && !isMseOnlySite()) return;
       // On extractor sites where the player only exposes a blob (Reddit,
       // Redgifs, TikTok, X in-feed), there is no direct file to hand over.
       // The page URL is the download, so make the pill a one-click send
-      // instead of forcing the user into the menu.
-      if (isExtractorSite() && (isBlob() || !video.currentSrc)) {
+      // instead of forcing the user into the menu. This sits BEFORE the
+      // "nothing to do" bail below so an empty currentSrc still sends.
+      if (isOneClickSite() && (isBlob() || !video.currentSrc)) {
         handleSendPageUrl(video, overlay, null);
         return;
       }
+      // MSE-only sites (Twitch) have no currentSrc yet but still need the menu —
+      // it offers "Send page URL to yt-dlp". Only bail when there's truly nothing.
+      if (!video.currentSrc && !isBlob() && !isMseOnlySite()) return;
       toggleMenu();
     });
   }

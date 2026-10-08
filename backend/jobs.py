@@ -70,7 +70,7 @@ def save_jobs_snapshot():
         try:
             snap = {}
             for jid, j in list(JOBS.items()):
-                snap[jid] = {k: v for k, v in j.items()
+                snap[jid] = {k: v for k, v in list(j.items())
                              if k not in ("pause_evt", "stop_evt", "cookie", "referer", "user_agent", "error")}
             # Cap history at MAX_HISTORY jobs — always keep non-done jobs,
             # fill the rest with the newest done ones.
@@ -107,7 +107,10 @@ def save_jobs_snapshot():
 def _migrate_extensionless(job):
     """One-shot fix for restored jobs whose file landed with no extension."""
     try:
-        p = stat_for(job)
+        # _dest_for, not stat_for: stat_for renames job["filename"] to
+        # "name (2).ext" when size_done is 0, which is a side effect a
+        # read-only migration must not have.
+        p = settings._dest_for(job)
         if p.suffix or not p.exists():
             return
         ext = os.path.splitext(urlparse(job.get("url", "")).path)[1]
@@ -122,6 +125,27 @@ def _migrate_extensionless(job):
         save_jobs_snapshot()
     except Exception as e:
         log(f"extensionless migration failed: {e}")
+
+
+def _repair_zero_size(job):
+    """One-shot fixup for done jobs that display 0 B: the file exists on
+    disk, but size_total was never set (yt-dlp post-processing threw)."""
+    if job.get("size_total") or job.get("status") != "done":
+        return False
+    try:
+        # _dest_for, not stat_for: stat_for renames job["filename"] when
+        # size_done is 0 (which is exactly this case). The category is left
+        # alone on purpose: _dest_for builds the folder from it, and the
+        # file is already sitting in that folder.
+        p = settings._dest_for(job)
+        if p.exists() and p.stat().st_size > 0:
+            job["size_total"] = job["size_done"] = p.stat().st_size
+            log(f"repaired zero-size job {job.get('id')}: {job['filename']} "
+                f"({job['size_total']} bytes)")
+            return True
+    except Exception as e:
+        log(f"zero-size repair failed for job {job.get('id')}: {e}")
+    return False
 
 
 _PRIO_LOCK = threading.Lock()
@@ -279,6 +303,8 @@ def load_jobs_snapshot():
                     repair_status(j, "stopped")
                 JOBS[jid] = j
                 _migrate_extensionless(j)
+                if _repair_zero_size(j):
+                    migrated = True
                 if _migrate_playlist_dir(j):
                     migrated = True
             if migrated:
@@ -369,7 +395,10 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
     job_cat = category or category_for(fname)
 
     # Apply per-site rules
-    netloc = urlparse(url).netloc
+    try:
+        netloc = urlparse(url).netloc
+    except ValueError:
+        netloc = ""
     for rule in STATE.get("rules", []):
         if not isinstance(rule, dict):
             continue

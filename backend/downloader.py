@@ -22,7 +22,7 @@ import time
 
 import settings
 from settings import (STATE, load_settings, save_settings, safe_filename, _unique_path,
-                      guess_ext_from_head, stat_for, _dest_for,
+                      guess_ext_from_head, stat_for, _dest_for, category_for,
                       effective_speed_limit_kbps, LIMITER, get_shutdown_pending,
                       set_shutdown_pending, detect_type)
 from jobs import (start_order_key, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks,
@@ -33,6 +33,19 @@ from logging_setup import log, LOG_QUEUE
 
 # Keep ffmpeg / Defender from flashing console windows when frozen on Windows.
 _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def _try_transition(job, event):
+    """transition() for worker threads: an illegal transition (e.g. the API
+    already moved the job to stopped/paused while the worker was finishing)
+    is logged and returns False instead of raising out of the thread and
+    skipping the cleanup after it."""
+    try:
+        transition(job, event)
+        return True
+    except ValueError as e:
+        log(f"job {job.get('id')}: {e} (ignored)")
+        return False
 # --- yt-dlp YouTube runtime helpers -----------------------------------------
 
 
@@ -150,6 +163,9 @@ def maybe_convert_target(job, dest):
     except ValueError:
         log(f"target-format convert: invalid target '{target}', skipping")
         return dest
+    if target_path.exists():
+        # ffmpeg runs with -y: don't overwrite an unrelated existing file.
+        target_path = _unique_path(target_path)
     _ffdir = find_ffmpeg_dir()
     ffmpeg = str(Path(_ffdir) / "ffmpeg.exe") if _ffdir else "ffmpeg"
     cmd = [ffmpeg, "-y", "-i", str(dest)]
@@ -191,24 +207,52 @@ def _job_dest(job):
     return dest
 
 
-def _ffprobe_video_stream(path):
-    """True when ffprobe reports a video stream in the file.
+# Container names ffprobe reports for real video. PNGs, JPGs, GIFs, and
+# other still images report a v:0 stream but their format_name is
+# png_pipe / image2 / mjpeg / gif - those are not video and must not be
+# converted. Only real video containers pass this list.
+_VIDEO_CONTAINER_NAMES = ("mov,", "mp4,", "matroska", "webm", "avi",
+                          "mpeg", "mpegts", "flv", "asf", "3gp")
 
-    Content-based check: this is the ground truth for "is this a video",
-    regardless of the file's extension. Non-media files (.py, .zip, .pdf,
-    .json, ...) return False and are left untouched. Returns False on any
-    error (probe failed, file missing, ffprobe not found)."""
+# AVIF/HEIC stills live in an MP4-style container, so the container check
+# alone can't tell them from video. Never convert these by extension.
+_STILL_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif",
+                     ".heic", ".heif", ".bmp", ".ico", ".svg", ".tif", ".tiff"}
+
+
+def _ffprobe_video_stream(path):
+    """True when ffprobe reports a video stream in a real video container.
+
+    The container is checked FIRST on purpose. A PNG reports a v:0 stream
+    (it is a single-frame video to ffprobe) but its format_name is
+    png_pipe, so a stream-only check wrongly classifies still images as
+    video and lets them be wrapped into MP4. This order fixes that.
+
+    Non-media files (.py, .zip, .pdf, .json, .png, .jpg, ...) return
+    False and are left untouched. Returns False on any error."""
     _ffdir = find_ffmpeg_dir()
     ffprobe = str(Path(_ffdir) / "ffprobe.exe") if _ffdir else "ffprobe"
     try:
+        # Step 1: is this a real video container?
         r = subprocess.run(
+            [ffprobe, "-v", "error",
+             "-show_entries", "format=format_name", "-of", "csv=p=0",
+             str(path)],
+            capture_output=True, timeout=30, text=True, errors="replace",
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        fmt = (r.stdout or "").strip().lower()
+        if not any(c in fmt for c in _VIDEO_CONTAINER_NAMES):
+            return False
+        # Step 2: does it actually have a video stream?
+        r2 = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=codec_type", "-of", "csv=p=0",
              str(path)],
             capture_output=True, timeout=30, text=True, errors="replace",
             creationflags=_CREATE_NO_WINDOW,
         )
-        return r.returncode == 0 and "video" in (r.stdout or "").lower()
+        return r2.returncode == 0 and "video" in (r2.stdout or "").lower()
     except Exception as e:
         log(f"auto-mp4: ffprobe failed on {path.name}: {e}")
         return False
@@ -226,6 +270,8 @@ def maybe_convert_to_mp4(job, dest):
         return dest
     if dest.suffix.lower() == ".mp4":
         return dest
+    if dest.suffix.lower() in _STILL_IMAGE_EXTS:
+        return dest
     if not dest.exists() or dest.stat().st_size == 0:
         return dest
     if not _ffprobe_video_stream(dest):
@@ -236,6 +282,9 @@ def maybe_convert_to_mp4(job, dest):
     log(f"auto-mp4: ffmpeg={ffmpeg} exists={os.path.exists(ffmpeg)} "
         f"input={dest.name}")
     target = dest.with_suffix(".mp4")
+    if target.exists():
+        # ffmpeg runs with -y: don't overwrite an unrelated existing .mp4.
+        target = _unique_path(target)
     log(f"auto-mp4: output → {target}")
     for args in (
         ["-c", "copy", "-movflags", "+faststart"],
@@ -466,12 +515,12 @@ def run_generic_segmented(job_id):
                 p.unlink()
             except OSError:
                 pass
-        transition(job, JobEvent.STOP)
+        _try_transition(job, JobEvent.STOP)
         log(f"job {job_id}: stopped")
         save_jobs_snapshot()
         return
     if job.get("error"):
-        transition(job, JobEvent.FAIL)
+        _try_transition(job, JobEvent.FAIL)
         log(f"job {job_id}: FAILED (segmented) — {job['error']}")
         for p in parts:
             try:
@@ -487,7 +536,7 @@ def run_generic_segmented(job_id):
                 p.unlink()
             except OSError:
                 pass
-        transition(job, JobEvent.PAUSE)
+        _try_transition(job, JobEvent.PAUSE)
         job["size_done"] = 0
         log(f"job {job_id}: paused (segmented downloads restart on resume)")
         save_jobs_snapshot()
@@ -503,7 +552,7 @@ def run_generic_segmented(job_id):
         log(f"job {job_id}: WARNING — size mismatch (got {actual}, expected {total})")
         job["error"] = f"size mismatch: {actual}/{total}"
     dest = maybe_convert_target(job, dest)
-    transition(job, JobEvent.COMPLETE)
+    _try_transition(job, JobEvent.COMPLETE)
     job["completed_ts"] = time.time()
     job["speed"] = ""
     record_stat(job["size_done"])
@@ -548,7 +597,7 @@ def _run_generic_single(job_id):
                           timeout=STATE["connection_timeout"],
                           proxies=settings.proxies_for(job["url"])) as r:
             if r.status_code not in (200, 206):
-                transition(job, JobEvent.FAIL)
+                _try_transition(job, JobEvent.FAIL)
                 job["error"] = f"HTTP {r.status_code}"
                 log(f"job {job_id}: server returned {r.status_code}")
                 return
@@ -564,11 +613,11 @@ def _run_generic_single(job_id):
             with open(part, mode) as f:
                 for chunk in r.iter_content(chunk_size=65536):
                     if job["stop_evt"].is_set():
-                        transition(job, JobEvent.STOP)
+                        _try_transition(job, JobEvent.STOP)
                         log(f"job {job_id}: stopped")
                         return
                     if job["pause_evt"].is_set():
-                        transition(job, JobEvent.PAUSE)
+                        _try_transition(job, JobEvent.PAUSE)
                         log(f"job {job_id}: paused")
                         return
                     if not chunk:
@@ -595,7 +644,7 @@ def _run_generic_single(job_id):
                     f"expected {job['size_total']})")
                 job["error"] = f"size mismatch: {actual}/{job['size_total']}"
             dest = maybe_convert_target(job, dest)
-            transition(job, JobEvent.COMPLETE)
+            _try_transition(job, JobEvent.COMPLETE)
             job["completed_ts"] = time.time()
             job["speed"] = ""
             record_stat(job["size_done"])
@@ -606,8 +655,14 @@ def _run_generic_single(job_id):
             maybe_play_sound()
             maybe_shutdown_if_idle()
     except Exception as e:
-        transition(job, JobEvent.FAIL)
+        _try_transition(job, JobEvent.FAIL)
         job["error"] = str(e)
+        # Show what actually landed on disk instead of 0 B for a failed row.
+        try:
+            if part.exists():
+                job["size_done"] = part.stat().st_size
+        except OSError:
+            pass
         log(f"job {job_id}: FAILED — {e}")
     finally:
         save_jobs_snapshot()
@@ -662,7 +717,7 @@ def run_ytdlp(job_id):
     try:
         real = engine.download(job["url"], job.get("format_id"), dest, opts, progress_cb)
     except DownloadCancelled:
-        transition(job, JobEvent.STOP)
+        _try_transition(job, JobEvent.STOP)
         log(f"job {job_id}: stopped")
         save_jobs_snapshot()
         return
@@ -693,6 +748,12 @@ def run_ytdlp(job_id):
                 # If FAIL->RESUME isn't legal from this state, force-requeue.
                 repair_status(job, "queued")
             job["type"] = "generic"
+            # run_generic expects a DOWNLOADING job (start_job_thread normally
+            # does this). Without it the final COMPLETE transition is illegal
+            # from queued and the file would be fetched again by the dispatcher.
+            job["pause_evt"].clear()
+            job["stop_evt"].clear()
+            transition(job, JobEvent.START)
             # Generic single-shot downloader runs synchronously here.
             run_generic(job_id)
             return
@@ -707,7 +768,35 @@ def run_ytdlp(job_id):
         job["size_total"] = job["size_done"] = real.stat().st_size
     except Exception as e:
         log(f"job {job_id}: post-download filename fixup failed: {e}")
-    transition(job, JobEvent.COMPLETE)
+    # Second chance: file downloaded fine but the fixup above threw
+    # (bad path from the engine, transient stat failure, conversion glitch).
+    # Re-stat from disk so the row doesn't display "0 B" and empty bar.
+    # _dest_for (not stat_for): stat_for renames job["filename"] to
+    # "name (2).ext" when the file exists and size_done is still 0.
+    if not job.get("size_total"):
+        try:
+            _p = Path(real)
+            if not _p.exists():
+                _p = _dest_for(job)
+            if _p.exists():
+                job["filename"] = _p.name
+                job["size_total"] = job["size_done"] = _p.stat().st_size
+                log(f"job {job_id}: recovered size for {_p.name} "
+                    f"({job['size_total']} bytes)")
+            else:
+                log(f"job {job_id}: could not find file on disk to stat "
+                    f"(tried {real} and {_dest_for(job)})")
+        except Exception as e:
+            log(f"job {job_id}: size recovery failed: {e}")
+    # Category was guessed from the URL before the real filename existed.
+    # Recompute now that we know the final name.
+    try:
+        job["category"] = category_for(job["filename"])
+    except Exception:
+        pass
+    if not _try_transition(job, JobEvent.COMPLETE):
+        save_jobs_snapshot()
+        return
     job["completed_ts"] = time.time()
     job["retry_count"] = 0
     job["retry_after"] = 0
@@ -748,7 +837,7 @@ def _handle_ytdlp_failure(job_id, job, exc):
         mins = max(1, int(STATE.get("ytdlp_bot_cooldown_minutes", 30) or 30))
         if youtube:
             set_youtube_cooldown(mins * 60, "bot check")
-        transition(job, JobEvent.FAIL)
+        _try_transition(job, JobEvent.FAIL)
         job["error"] = (f"YouTube flagged this connection (bot check). YouTube jobs "
                         f"are held for {mins} min. Switch network/VPN, then press "
                         f"Resume to try again now. [{raw[:200]}]")
@@ -763,7 +852,7 @@ def _handle_ytdlp_failure(job_id, job, exc):
         try:
             transition(job, JobEvent.RETRY)
         except ValueError:
-            transition(job, JobEvent.FAIL)
+            _try_transition(job, JobEvent.FAIL)
             job["error"] = raw
             log(f"job {job_id}: FAILED — {raw}")
             return
@@ -777,7 +866,7 @@ def _handle_ytdlp_failure(job_id, job, exc):
             f"in {delay}s — {raw[:160]}")
         return
 
-    transition(job, JobEvent.FAIL)
+    _try_transition(job, JobEvent.FAIL)
     job["error"] = raw
     log(f"job {job_id}: FAILED ({kind}) — {raw}")
 
@@ -863,8 +952,11 @@ def dispatcher_loop():
         # (e.g. a job deleted or stopped between the status check and
         # start_job_thread).
         try:
-            for jid in [k for k, t in list(_WORKERS.items()) if not t.is_alive()]:
-                _WORKERS.pop(jid, None)
+            # Only drop the entry if it is still the dead thread: a resume
+            # may have registered a fresh worker for the same job meanwhile.
+            for jid, t in list(_WORKERS.items()):
+                if not t.is_alive() and _WORKERS.get(jid) is t:
+                    _WORKERS.pop(jid, None)
             if not STATE["queue_running"]:
                 continue
             if low_disk():
