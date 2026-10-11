@@ -44,6 +44,7 @@ CONFIG_PATH = HOME / "settings.json"
 # Palette-derived (single source of truth: palette.py).
 from palette import resolve_palette
 from settings import CATEGORIES, DISPLAY_VERSION, detect_type  # single source of truth: settings.py
+from gui_detail import IMAGE_EXT, VIDEO_EXT, DetailPane, ThumbLoader
 
 _PAL = resolve_palette()
 ACCENT = _PAL["accent"]
@@ -794,6 +795,94 @@ def _progress_pct(job):
         return float(job.get("conversion_progress") or 0)
     total = job.get("size_total") or 0
     return (job.get("size_done") or 0) / total * 100 if total else 0.0
+
+
+def _ffmpeg_dir():
+    """Folder with the app's own ffmpeg, if the backend module that knows it is
+    already loaded. Never imports anything new (server.py runs as __main__)."""
+    for mod in ("engines", "downloader", "jobs", "api"):
+        fn = getattr(sys.modules.get(mod), "find_ffmpeg_dir", None)
+        if fn:
+            try:
+                d = fn()
+                if d:
+                    return str(d)
+            except Exception:
+                pass
+    return None
+
+
+def _detail_info(j):
+    """Everything the detail pane shows, as plain strings, from one job dict."""
+    from urllib.parse import urlparse
+    status = j.get("status") or ""
+    converting = j.get("phase") == "converting"
+    total, done = j.get("size_total") or 0, j.get("size_done") or 0
+    pct = 100.0 if (status == "done" and not converting) else _progress_pct(j)
+    eta = _eta_seconds(j)
+    try:
+        path = _path_for(j)
+    except Exception:
+        path = None
+    ext = (path.suffix if path else Path(str(j.get("filename") or "")).suffix).lower()
+    if converting:
+        progress_text = f"Converting to {j.get('converting_fmt', '')}: {j.get('conversion_progress', 0)}%"
+    elif total:
+        progress_text = f"{fmt_bytes(done)} / {fmt_bytes(total)} ({pct:.0f}%)"
+    else:
+        progress_text = "Done" if status == "done" else status
+    speed = j.get("speed") or ""
+    remaining = _fmt_duration(eta) if eta is not None else ""
+    downloaded = fmt_bytes(done) if done else ""
+    note, note_color = [], ""
+    retry = _retry_text(j)
+    if retry:
+        note.append(f"Auto-retry: {retry}")
+        note_color = WARN
+    if j.get("error"):
+        note.append(str(j["error"])[:300])
+        note_color = DANGER
+    host = ""
+    try:
+        host = urlparse(str(j.get("url") or "")).hostname or ""
+    except Exception:
+        pass
+    general = [
+        ("URL", j.get("url")), ("Saved as", j.get("filename")), ("Category", j.get("category")),
+        ("Size", fmt_bytes(total) if total else ""), ("Created", fmt_ts(j.get("created_ts"))),
+        ("Status", f"{status} (converting)" if converting else status),
+        ("Saved to", str(path) if path else ""), ("Source", j.get("source_site")),
+    ]
+    if j.get("completed_ts"):
+        general.append(("Completed", fmt_ts(j.get("completed_ts"))))
+    progress = [
+        ("Progress", f"{pct:.0f}%"),
+        ("Downloaded", f"{fmt_bytes(done)} of {fmt_bytes(total)}" if total else downloaded),
+        ("Speed", speed), ("Time remaining", remaining),
+    ]
+    if converting:
+        progress.append(("Conversion", f"to {j.get('converting_fmt', '')}, {j.get('conversion_progress', 0)}%"))
+    if j.get("completed_ts"):
+        progress.append(("Completed", fmt_ts(j.get("completed_ts"))))
+    connections = [("Source site", j.get("source_site")), ("Host", host)]
+    # Only fields the job actually carries are listed (no placeholders).
+    for label, key in (("Engine", "engine"), ("Connections", "connections"),
+                       ("Segments", "segments"), ("Retries", "retry_count")):
+        if j.get(key) not in (None, "", 0):
+            connections.append((label, j.get(key)))
+    if retry:
+        connections.append(("Next retry", retry))
+    return {
+        "id": j.get("id"), "title": str(j.get("filename") or ""), "pct": pct,
+        "progress_text": progress_text, "speed": speed, "remaining": remaining,
+        "downloaded": downloaded, "note": "\n".join(note), "note_color": note_color,
+        "can_pause": status == "downloading",
+        "can_resume": status in ("paused", "stopped", "error"),
+        "can_stop": status in ("downloading", "paused", "queued"),
+        "done": status == "done",
+        "is_video": ext in VIDEO_EXT, "thumb_label": ext.lstrip(".").upper() or "FILE",
+        "general": general, "progress": progress, "connections": connections,
+    }
 
 
 class ProgressDelegate(QStyledItemDelegate):
@@ -2195,6 +2284,8 @@ class SettingsDialog(QDialog):
             self.api.save_setting("shell_enabled", tv["shell_enabled"])
             self.api.save_setting("shell_color", tv["shell_color"])
             self.api.save_setting("shell_backlight", tv["shell_backlight"])
+            self.api.save_setting("shell_colors", tv["shell_colors"])
+            self.api.save_setting("frame_cream", tv["frame_cream"])
             # rebuild the stylesheet and repaint so the theme lands live
             reapply_theme()
             self.api.save_setting("animations_enabled",
@@ -2342,6 +2433,7 @@ class BandwidthProfilesDialog(QDialog):
 
 class Sidebar(QFrame):
     category_selected = Signal(str)
+    tool_clicked = Signal(str)   # "settings" | "help" | "about"
 
     def __init__(self):
         super().__init__()
@@ -2367,6 +2459,24 @@ class Sidebar(QFrame):
         for name in CATEGORIES:
             self._add_nav(layout, name)
         layout.addStretch()
+        tools_label = QLabel("TOOLS")
+        tools_label.setObjectName("SectionLabel")
+        layout.addWidget(tools_label)
+        tools = QHBoxLayout()
+        tools.setSpacing(2)
+        for key, text, tip in (("settings", "Settings", "Open Settings"),
+                               ("help", "Help", "Tips and shortcuts"),
+                               ("about", "About", "About Video Grabber")):
+            b = QToolButton()
+            b.setObjectName("SidebarTool")
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            b.clicked.connect(lambda _=False, k=key: self.tool_clicked.emit(k))
+            tools.addWidget(b)
+        layout.addLayout(tools)
 
     def _add_nav(self, layout, name):
         btn = QToolButton()
@@ -2735,6 +2845,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         root = QWidget()
+        root.setObjectName("MainRoot")
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
@@ -2777,13 +2888,16 @@ class MainWindow(QMainWindow):
         tl.addWidget(self.search)
         root_layout.addWidget(toolbar)
         body = QWidget()
+        body.setObjectName("FrameArea")
         bl = QHBoxLayout(body)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(0)
         self.sidebar = Sidebar()
         self.sidebar.category_selected.connect(self.select_category)
+        self.sidebar.tool_clicked.connect(self._on_tool)
         bl.addWidget(self.sidebar)
         content = QWidget()
+        content.setObjectName("Content")
         cl = QVBoxLayout(content)
         cl.setContentsMargins(12, 12, 12, 10)
         cl.setSpacing(8)
@@ -2832,6 +2946,20 @@ class MainWindow(QMainWindow):
         self.details.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.details.setVisible(False)
         cl.addWidget(self.details)
+        self._log_lines = []
+        self._thumb_req = None
+        self.detail_pane = DetailPane(tabs_open=bool(_read_gui_state().get("detail_tabs_open", False)))
+        self.detail_pane.setVisible(False)
+        self.detail_pane.pause_clicked.connect(lambda: self._selected("pause"))
+        self.detail_pane.resume_clicked.connect(lambda: self._selected("resume"))
+        self.detail_pane.stop_clicked.connect(lambda: self._selected("stop"))
+        self.detail_pane.open_clicked.connect(lambda: self._open_selected(folder=False))
+        self.detail_pane.folder_clicked.connect(lambda: self._open_selected(folder="select"))
+        self.detail_pane.copy_clicked.connect(self._copy_selected_url)
+        self.detail_pane.tabs_toggled.connect(lambda on: _write_gui_state({"detail_tabs_open": bool(on)}))
+        self._thumbs = ThumbLoader(HOME / "thumbs", self)
+        self._thumbs.ready.connect(self._on_thumb_ready, Qt.QueuedConnection)
+        cl.addWidget(self.detail_pane)
         self.table.selectionModel().selectionChanged.connect(lambda *_: self._update_details())
         from PySide6.QtGui import QShortcut, QKeySequence
         for seq, act in (("Alt+Up", "up"), ("Alt+Down", "down")):
@@ -3001,36 +3129,62 @@ class MainWindow(QMainWindow):
             pass
 
     def _update_details(self):
-        """One-line-per-fact panel under the table for the selected row."""
+        """Panel under the table: the detail pane for one selected row, a
+        one-line count for several."""
         try:
             rows = self._selected_rows()
         except Exception:
             rows = []
         if not rows:
             self.details.setVisible(False)
+            self.detail_pane.setVisible(False)
             return
         if len(rows) > 1:
+            self.detail_pane.setVisible(False)
             self.details.setText(f"{len(rows)} downloads selected")
             self.details.setVisible(True)
             return
         j = rows[0]
-        e = _html.escape
-        site = j.get("source_site") or ""
-        lines = [f"<b>{e(str(j.get('filename') or ''))}</b>"
-                 + (f" &nbsp;\u00b7&nbsp; {e(site)}" if site else "")
-                 + f" &nbsp;\u00b7&nbsp; {e(str(j.get('status') or ''))}"]
-        retry = _retry_text(j)
-        if retry:
-            lines.append(f"<span style='color:{WARN}'>Auto-retry: {e(retry)}</span>")
-        if j.get("error"):
-            lines.append(f"<span style='color:{DANGER}'>{e(str(j['error'])[:600])}</span>")
-        lines.append(f"<span style='color:{MUTED}'>{e(str(j.get('url') or ''))}</span>")
-        try:
-            lines.append(f"<span style='color:{MUTED}'>{e(str(_path_for(j)))}</span>")
-        except Exception:
-            pass
-        self.details.setText("<br>".join(lines))
-        self.details.setVisible(True)
+        self.details.setVisible(False)
+        self.detail_pane.set_job(_detail_info(j))
+        self.detail_pane.setVisible(True)
+        req = (j.get("id"), j.get("status") == "done")
+        if req != self._thumb_req:
+            self._thumb_req = req
+            if req[1]:
+                try:
+                    self._thumbs.request(j["id"], _path_for(j), _ffmpeg_dir())
+                except Exception:
+                    pass
+        self._push_job_log(j.get("id"))
+
+    def _push_job_log(self, job_id):
+        pat = re.compile(rf"\bjob\s+{re.escape(str(job_id))}\b", re.I)
+        self.detail_pane.set_log_lines([ln for ln in self._log_lines if pat.search(ln)][-100:])
+
+    def _on_thumb_ready(self, job_id, path, duration):
+        self.detail_pane.set_thumb(job_id, path, duration)
+
+    def _copy_selected_url(self):
+        rows = self._selected_rows()
+        if len(rows) == 1:
+            QApplication.clipboard().setText(str(rows[0].get("url") or ""))
+
+    def _on_tool(self, key):
+        {"settings": self.open_settings, "help": self.show_help, "about": self.show_about}[key]()
+
+    def show_help(self):
+        QMessageBox.information(
+            self, "Help",
+            "<h3 style='margin-bottom:2px;'>Video Grabber</h3>"
+            "<p><b>Downloads</b><br>Click a row to see its details below. Double-click a "
+            "finished file to open it. Right-click a row for the full menu, and drag finished "
+            "files out into other apps. Alt+Up / Alt+Down reorder queued downloads.</p>"
+            "<p><b>Browser extension</b><br>Tools &gt; Copy pairing token, then paste it on the "
+            "extension's Options page.</p>"
+            "<p><b>Handheld shell</b><br>D-pad up/down moves the selection and left/right changes "
+            "the filter. A resumes and B pauses the selected download. START pauses or resumes "
+            "the whole queue. SELECT jumps to search. The power light switches the backlight.</p>")
 
     def refresh_queue_status(self):
         if self._queue_worker is not None:
@@ -3202,6 +3356,9 @@ class MainWindow(QMainWindow):
         try:
             if lines:
                 self.log.setText(lines[-1])
+            self._log_lines = [str(x) for x in (lines or [])]
+            if self.detail_pane.isVisible() and self.detail_pane.job_id is not None:
+                self._push_job_log(self.detail_pane.job_id)
         except Exception:
             pass
 
@@ -3365,7 +3522,8 @@ class MainWindow(QMainWindow):
         if st.get("shell_enabled"):
             from gui_shell import ShellFrame
             self.shell = ShellFrame(self._root, st.get("shell_color", "cream"),
-                                    backlight=bool(st.get("shell_backlight", True)))
+                                    backlight=bool(st.get("shell_backlight", True)),
+                                    overrides=st.get("shell_colors"), theme=st)
             self.shell.dpad.connect(self._shell_dpad)
             self.shell.button.connect(self._shell_button)
             self.setCentralWidget(self.shell)

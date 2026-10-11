@@ -20,6 +20,14 @@ from palette import (PRESET_NAMES, THEME_PRESETS, contrast, luminance, mix,
 ACCENT_SWATCHES = ["#26c6da", "#7c4dff", "#66bb6a", "#ffa726", "#ef5350",
                    "#42a5f5", "#ec407a", "#8ccf72", "#9aa09c"]
 
+SHELL_PART_GROUPS = [
+    ("Case colors", [("top", "Top"), ("body", "Body"), ("bottom", "Bottom"), ("edge", "Edge")]),
+    ("Control colors", [("dpad", "D-pad"), ("dpad_hi", "D-pad highlight"),
+                        ("select_start", "Select + Start"), ("button_labels", "Labels"),
+                        ("power_led", "Power LED"), ("bezel", "Screen bezel")]),
+]
+SHELL_PART_KEYS = [k for _, items in SHELL_PART_GROUPS for k, _ in items]
+
 GROUPS = [
     ("Surfaces", [("bg_base", "Window background"), ("bg_panel", "Panels and table"),
                   ("bg_elevated", "Menus and table header")]),
@@ -284,6 +292,9 @@ class ThemePage(QWidget):
         self._shell_on = bool(s.get("shell_enabled"))
         self._shell_color = s.get("shell_color") if s.get("shell_color") in SHELLS else "cream"
         self._backlight = bool(s.get("shell_backlight", True))
+        self._frame_cream = bool(s.get("frame_cream"))
+        self._shell_ov = self._clean_shell_colors(s.get("shell_colors"))
+        self._shell_rows = {}
         chrome = resolve_palette(s)
         self._ring, self._label = chrome["accent"], chrome["text"]
         self._rows = {}
@@ -360,14 +371,30 @@ class ThemePage(QWidget):
         sh_flow = FlowLayout(sh_host, 6)
         self._shell_sw = []
         for key, nm in SHELL_NAMES.items():
-            b = Swatch(SHELLS[key][1], self._label)
+            b = Swatch(SHELLS[key]["body"], self._label)
             b.setToolTip(nm)
             b.setAccessibleName(nm + " shell")
             b.clicked.connect(lambda _=False, k=key: self._pick_shell(k))
             sh_flow.addWidget(b)
             self._shell_sw.append((key, b))
         l4.addWidget(sh_host)
+        for gname, items in SHELL_PART_GROUPS:
+            gl = QLabel(gname.upper())
+            gl.setObjectName("SectionLabel")
+            l4.addSpacing(6)
+            l4.addWidget(gl)
+            for key, label in items:
+                l4.addLayout(self._make_shell_row(key, label))
         cl.addWidget(c4)
+
+        c5, l5 = _card("Window frame", "Paints the window frame (toolbar, menus, status bar and "
+                       "margins) cream around your theme's dark panels, like the handheld mockup. "
+                       "Works with or without the shell.")
+        self.frame_check = QCheckBox("Cream frame around the panels")
+        self.frame_check.setChecked(self._frame_cream)
+        self.frame_check.toggled.connect(self._frame_toggled)
+        l5.addWidget(self.frame_check)
+        cl.addWidget(c5)
 
         c3, l3 = _card("Fine-tune colors", None)
         head = QHBoxLayout()
@@ -461,6 +488,48 @@ class ThemePage(QWidget):
         self._rows[key] = (chip, reset, name)
         return lay
 
+    @staticmethod
+    def _clean_shell_colors(d):
+        """Keep only known parts with a valid color; empty means no override."""
+        if not isinstance(d, dict):
+            return {}
+        return {k: v for k, v in d.items()
+                if k in SHELL_PART_KEYS and isinstance(v, str) and v and QColor(v).isValid()}
+
+    def _shell_part(self, key):
+        return self._shell_ov.get(key) or SHELLS[self._shell_color].get(key, "#000000")
+
+    def _make_shell_row(self, key, label):
+        lay = QHBoxLayout()
+        lay.setSpacing(8)
+        name = QLabel(label)
+        name.setMinimumWidth(150)
+        chip = QPushButton()
+        chip.setMinimumWidth(110)
+        chip.setCursor(Qt.PointingHandCursor)
+        chip.setAccessibleName("Shell " + label)
+        chip.clicked.connect(lambda _=False, k=key: self._pick_shell_part(k))
+        reset = QToolButton()
+        reset.setText("Reset")
+        reset.setToolTip("Back to the shell's own color")
+        reset.clicked.connect(lambda _=False, k=key: self._reset_shell_part(k))
+        lay.addWidget(name)
+        lay.addWidget(chip)
+        lay.addWidget(reset)
+        lay.addStretch(1)
+        self._shell_rows[key] = (chip, reset, name, label)
+        return lay
+
+    def _pick_shell_part(self, key):
+        c = QColorDialog.getColor(QColor(self._shell_part(key)), self, "Choose color")
+        if c.isValid():
+            self._shell_ov[key] = c.name()
+            self._refresh()
+
+    def _reset_shell_part(self, key):
+        self._shell_ov.pop(key, None)
+        self._refresh()
+
     def _tokens(self):
         return resolve_palette({"theme_preset": self._preset, "accent": self._accent,
                                 "theme_tokens": dict(self._ov)})
@@ -487,6 +556,17 @@ class ThemePage(QWidget):
                                  + "Edit individual colors")
         self.accent_label.setText(f"Current accent: {self._accent.upper()}")
         self.backlight_check.setEnabled(self._shell_on)
+        for key, (chip, reset, name, label) in self._shell_rows.items():
+            col = self._shell_part(key)
+            fg = "#000000" if luminance(col) > 0.4 else "#ffffff"
+            chip.setText(col.upper())
+            chip.setStyleSheet(f"QPushButton {{ background: {col}; color: {fg}; "
+                               f"border: 1px solid {t['border_hi']}; padding: 5px 10px; }}")
+            edited = key in self._shell_ov
+            chip.setEnabled(self._shell_on)
+            reset.setEnabled(self._shell_on)
+            reset.setVisible(edited)
+            name.setText(label + ("  \u2022" if edited else ""))
         for key, b in self._shell_sw:
             b.setChecked(self._shell_on and key == self._shell_color)
             b.setEnabled(self._shell_on)
@@ -518,6 +598,10 @@ class ThemePage(QWidget):
 
     def _shell_toggled(self, on):
         self._shell_on = on
+        self._refresh()
+
+    def _frame_toggled(self, on):
+        self._frame_cream = on
         self._refresh()
 
     def _backlight_toggled(self, on):
@@ -567,6 +651,9 @@ class ThemePage(QWidget):
         self.shell_check.setChecked(False)
         self._backlight = True
         self.backlight_check.setChecked(True)
+        self._shell_ov = {}
+        self._frame_cream = False
+        self.frame_check.setChecked(False)
         self._pick_preset("amoled_black")
 
     def _export(self):
@@ -598,6 +685,10 @@ class ThemePage(QWidget):
             self.shell_check.setChecked(self._shell_on)
             self._backlight = bool(d.get("shell_backlight", self._backlight))
             self.backlight_check.setChecked(self._backlight)
+            self._frame_cream = bool(d.get("frame_cream", self._frame_cream))
+            self.frame_check.setChecked(self._frame_cream)
+            if isinstance(d.get("shell_colors"), dict):
+                self._shell_ov = self._clean_shell_colors(d["shell_colors"])
             self._refresh()
         except Exception as e:
             QMessageBox.warning(self, "Import failed", str(e))
@@ -605,4 +696,7 @@ class ThemePage(QWidget):
     def values(self):
         return {"theme_preset": self._preset, "accent": self._accent,
                 "theme_tokens": dict(self._ov), "shell_enabled": self._shell_on,
-                "shell_color": self._shell_color, "shell_backlight": self._backlight}
+                "shell_color": self._shell_color, "shell_backlight": self._backlight, "frame_cream": self._frame_cream,
+                # every key is sent ("" = no override) so the server's key-by-key
+                # dict merge can never leave a reset color behind
+                "shell_colors": {k: self._shell_ov.get(k, "") for k in SHELL_PART_KEYS}}

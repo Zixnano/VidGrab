@@ -7,14 +7,79 @@ from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QLinearGradient, QPai
                            QPen, QPolygonF, QRadialGradient, QTransform)
 from PySide6.QtWidgets import QHBoxLayout, QWidget
 
-# name: (top, body, bottom, edge)
-SHELLS = {
-    "cream": ("#efebdc", "#d9d3c0", "#b9b39f", "#8f8a78"),
-    "black": ("#4a4d4b", "#2f3231", "#1b1d1c", "#0c0d0d"),
-    "indigo": ("#6a6fc4", "#4a4fa8", "#2e3278", "#1d2050"),
-    "silver": ("#d5d9dc", "#b8bdc0", "#8e9396", "#6a6f72"),
+from palette import resolve_palette
+
+# Every shell is a dict of parts:
+#   top / body / bottom / edge   the case (gradient + outline)
+#   dpad, dpad_hi                D-pad cross and A/B key fill (hi = lit top)
+#   select_start                 SELECT/START pill (lit/shaded tones derived)
+#   button_labels                A/B letters, POWER text, SELECT/START captions
+#   power_led                    the LED dot
+#   bezel                        the screen surround
+# The user can override any part (settings "shell_colors"); see ShellFrame._col.
+_CONTROLS = {
+    "dpad": "#2b2e2c", "dpad_hi": "#4a4e4b", "select_start": "#e4dfcc",
+    "button_labels": "#6f6a58", "power_led": "#5ee07a", "bezel": "#1b1f1d",
 }
-SHELL_NAMES = {"cream": "Cream", "black": "Matte black", "indigo": "Indigo", "silver": "Silver"}
+
+
+def _shell(top, body, bottom, edge, **controls):
+    d = {"top": top, "body": body, "bottom": bottom, "edge": edge}
+    d.update(_CONTROLS)
+    d.update(controls)
+    return d
+
+
+SHELLS = {
+    "cream": _shell("#efebdc", "#d9d3c0", "#b9b39f", "#8f8a78"),
+    "black": _shell("#4a4d4b", "#2f3231", "#1b1d1c", "#0c0d0d",
+                    dpad="#121413", select_start="#3f4240", button_labels="#8c908d"),
+    "indigo": _shell("#6a6fc4", "#4a4fa8", "#2e3278", "#1d2050"),
+    "silver": _shell("#d5d9dc", "#b8bdc0", "#8e9396", "#6a6f72"),
+    "crystal": _shell("#f4f6f8", "#dfe4e8", "#bfc7cd", "#8d979e",
+                      dpad="#3a4046", dpad_hi="#5a626a", select_start="#eef1f3",
+                      button_labels="#6b747b"),
+    "atomic_purple": _shell("#b58ae0", "#8a5cc4", "#5e3a96", "#3d2368",
+                            dpad="#3b2260", dpad_hi="#5d3a94", select_start="#d9c5f0",
+                            button_labels="#eadcf8", bezel="#150c24"),
+    "graphite": _shell("#5b5f63", "#3c3f43", "#25282b", "#111315",
+                       dpad="#1a1c1e", dpad_hi="#43474b", select_start="#585c60",
+                       button_labels="#9aa0a5", bezel="#101213"),
+    "ruby": _shell("#e0505a", "#b8222e", "#7e1019", "#4f0910",
+                   dpad="#4a0f14", dpad_hi="#7a2028", select_start="#f0c9cc",
+                   button_labels="#f2d2d4", bezel="#1a0a0c"),
+    "sapphire": _shell("#3b5fc4", "#1b3280", "#0f1d4d", "#080f2b",
+                       dpad="#0c1534", dpad_hi="#2b4290", select_start="#2e4182",
+                       button_labels="#9fb4ee", bezel="#070b1a"),
+    "mint": _shell("#d9f5e6", "#aee3c6", "#7cbf9b", "#4f8a6a",
+                   dpad="#27403a", dpad_hi="#456b60", select_start="#e3f6ec",
+                   button_labels="#3f6b57", bezel="#16241f"),
+    "sunset": _shell("#ffb36b", "#f2825a", "#c8504f", "#8c2f3a",
+                     dpad="#4a2030", dpad_hi="#7a3a4a", select_start="#ffe0c8",
+                     button_labels="#5a2230", bezel="#1e0f16"),
+    "bloody": _shell("#6a1a1a", "#4a1010", "#2a0808", "#150404",
+                     dpad="#3a0808", dpad_hi="#5a1010", select_start="#6a2222",
+                     button_labels="#e8c8c8", power_led="#c03030", bezel="#0a0202"),
+}
+SHELL_NAMES = {
+    "cream": "Cream", "black": "Matte black", "indigo": "Indigo", "silver": "Silver",
+    "crystal": "Crystal", "atomic_purple": "Atomic purple", "graphite": "Graphite",
+    "ruby": "Ruby", "sapphire": "Sapphire", "mint": "Mint", "sunset": "Sunset",
+    "bloody": "Bloody",
+}
+SHELL_PARTS = ("top", "body", "bottom", "edge") + tuple(_CONTROLS)
+DARK_LUM = 0.06   # a case body darker than this gets the dark-theme bevels
+
+
+def _lin(v):
+    v /= 255.0
+    return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+
+def _luminance(c):
+    return 0.2126 * _lin(c.red()) + 0.7152 * _lin(c.green()) + 0.0722 * _lin(c.blue())
+
+
 COLUMN = 210   # width of the controls column
 
 
@@ -47,10 +112,16 @@ class ShellFrame(QWidget):
     dpad = Signal(str)      # "up" "down" "left" "right"
     button = Signal(str)    # "a" "b" "select" "start"
 
-    def __init__(self, inner, color="cream", parent=None, backlight=True):
+    def __init__(self, inner, color="cream", parent=None, backlight=True,
+                 overrides=None, theme=None):
         super().__init__(parent)
         self.inner = inner
         self.color = color if color in SHELLS else "cream"
+        self.overrides = dict(overrides) if isinstance(overrides, dict) else {}
+        # Speaker dots follow the APP theme accent, not the shell.
+        self._accent = QColor(resolve_palette(theme)["accent"])
+        if not self._accent.isValid():
+            self._accent = QColor("#8ccf72")
         self._hits = {}
         self.setMouseTracking(True)
         lay = QHBoxLayout(self)
@@ -66,6 +137,21 @@ class ShellFrame(QWidget):
     def set_color(self, color):
         self.color = color if color in SHELLS else "cream"
         self.update()
+
+    def set_overrides(self, overrides):
+        """Per-part colors, e.g. {"dpad": "#3a0808"}. Empty values mean 'no override'."""
+        self.overrides = dict(overrides) if isinstance(overrides, dict) else {}
+        self.update()
+
+    def _col(self, key):
+        """Override first, then the shell's own value, then the built-in default."""
+        for src in (self.overrides, SHELLS[self.color], _CONTROLS):
+            v = src.get(key)
+            if v:
+                c = QColor(v)
+                if c.isValid():
+                    return c
+        return QColor("#000000")
 
     def set_backlight(self, on):
         """Backlight off = dim green screen. The power light stays lit."""
@@ -91,8 +177,8 @@ class ShellFrame(QWidget):
 
     # ---- painting ----
     def paintEvent(self, _e):
-        top, body, bot, edge = (QColor(c) for c in SHELLS[self.color])
-        dark = self.color == "black"
+        top, body, bot, edge = (self._col(k) for k in ("top", "body", "bottom", "edge"))
+        dark = _luminance(body) < DARK_LUM
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
@@ -142,7 +228,7 @@ class ShellFrame(QWidget):
         p.setPen(QPen(QColor(255, 255, 255, 110 if not dark else 40), 1.5))
         p.drawPath(bez.translated(0, 1.5))
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#1b1f1d"))
+        p.setBrush(self._col("bezel"))
         p.drawPath(bez)
         p.save()
         p.setClipPath(bez)
@@ -231,24 +317,27 @@ class ShellFrame(QWidget):
 
     def _controls(self, p, w, h, dark):
         cx = w - COLUMN / 2 - 4
-        top, body, bot, edge = (QColor(c) for c in SHELLS[self.color])
-        ctl = QColor("#2b2e2c") if not dark else QColor("#121413")
-        ctl_hi = QColor("#4a4e4b")
-        label = QColor("#6f6a58") if not dark else QColor("#8c908d")
+        body, edge = self._col("body"), self._col("edge")
+        ctl, ctl_hi = self._col("dpad"), self._col("dpad_hi")
+        label = self._col("button_labels")
+        led_c = self._col("power_led")
         self._hits = {}
         # power light
         led = QPointF(w - 44, 74)
         halo = QRadialGradient(led, 18)
-        halo.setColorAt(0, QColor(94, 224, 122, 120))
-        halo.setColorAt(1, QColor(94, 224, 122, 0))
+        halo_c = QColor(led_c)
+        halo_c.setAlpha(120)
+        halo.setColorAt(0, halo_c)
+        halo_c.setAlpha(0)
+        halo.setColorAt(1, halo_c)
         p.setPen(Qt.NoPen)
         if self.backlight:
             p.setBrush(halo)
             p.drawEllipse(led, 18, 18)
         lg = QRadialGradient(QPointF(led.x() - 2, led.y() - 3), 10)
-        lg.setColorAt(0, QColor("#c8ffd3"))
-        lg.setColorAt(0.5, QColor("#5ee07a"))
-        lg.setColorAt(1, QColor("#2c9c47"))
+        lg.setColorAt(0, led_c.lighter(175))
+        lg.setColorAt(0.5, led_c)
+        lg.setColorAt(1, led_c.darker(170))
         p.setPen(QPen(QColor(0, 0, 0, 90), 1))
         p.setBrush(lg)
         p.drawEllipse(led, 8, 8)
@@ -263,6 +352,7 @@ class ShellFrame(QWidget):
         cross = QPainterPath()
         cross.addRoundedRect(QRectF(cx - ln / 2, dy - arm / 2, ln, arm), 10, 10)
         cross.addRoundedRect(QRectF(cx - arm / 2, dy - ln / 2, arm, ln), 10, 10)
+        cross.setFillRule(Qt.WindingFill)   # odd-even would punch a hole where the arms cross
         cross = cross.simplified()
         # shadow the cross casts into the well
         p.setPen(Qt.NoPen)
@@ -316,34 +406,38 @@ class ShellFrame(QWidget):
             self._raised(p, key, ctl_hi, ctl, QColor("#000"))
             f2 = p.font(); f2.setPixelSize(22); f2.setBold(True); f2.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0); p.setFont(f2)
             box = QRectF(x - 30, y - 30, 60, 60)
-            if dark:
-                p.setPen(QColor(0, 0, 0, 200))
-                p.drawText(box.translated(0, 1), Qt.AlignCenter, name.upper())
-                p.setPen(QColor("#6b716d"))
-            else:
-                p.setPen(QColor(255, 255, 255, 55))
-                p.drawText(box.translated(0, 1), Qt.AlignCenter, name.upper())
-                p.setPen(QColor(0, 0, 0, 170))
+            letter = QColor(label)
+            if abs(_luminance(letter) - _luminance(ctl_hi)) < 0.10:
+                # labels tuned for the case would vanish on the key: lift or sink them
+                letter = letter.lighter(260) if _luminance(ctl) < 0.3 else letter.darker(300)
+            p.setPen(QColor(0, 0, 0, 170))
+            p.drawText(box.translated(0, 1), Qt.AlignCenter, name.upper())
+            p.setPen(letter)
             p.drawText(box, Qt.AlignCenter, name.upper())
             self._hits[name] = box
         # speaker dots
         sy = max(450, h * 0.72)
         p.setPen(Qt.NoPen)
         hole = body.darker(160) if not dark else QColor("#0b0c0c")
+        dot = QColor(self._accent)
+        dot.setAlpha(235)
         for i in range(5):
             for j in range(4):
                 c = QPointF(cx + 10 + i * 14 + j * 6, sy + j * 12 - i * 5)
                 p.setBrush(QColor(255, 255, 255, 110 if not dark else 35))
-                p.drawEllipse(c + QPointF(0.6, 1.2), 3, 3)
+                p.drawEllipse(c + QPointF(0.6, 1.2), 3.6, 3.6)
                 p.setBrush(hole)
-                p.drawEllipse(c, 3, 3)
+                p.drawEllipse(c, 3.6, 3.6)
+                p.setBrush(dot)
+                p.drawEllipse(c, 2.6, 2.6)
         # select / start: raised pills in recessed slots
         by = h - 70
         f3 = p.font(); f3.setPixelSize(10); f3.setBold(False); f3.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.4); p.setFont(f3)
+        pill = self._col("select_start")
         if dark:
-            pill_top, pill_bot, pill_line = QColor("#4b4e4c"), QColor("#343735"), QColor("#000")
+            pill_top, pill_bot, pill_line = pill.lighter(115), pill.darker(120), QColor("#000")
         else:
-            pill_top, pill_bot, pill_line = QColor("#f2eedf"), QColor("#d6d1bd"), QColor("#a8a28c")
+            pill_top, pill_bot, pill_line = pill.lighter(108), pill.darker(108), pill.darker(140)
         for name, x in (("select", cx - 38), ("start", cx + 38)):
             self._well_path(p, self._xpath(x, by, 62, 24, -22), body, edge, dark)
             self._raised(p, self._xpath(x, by, 48, 16, -22), pill_top, pill_bot, pill_line, shadow=80, lit=110)

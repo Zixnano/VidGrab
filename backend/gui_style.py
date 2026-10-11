@@ -21,7 +21,7 @@ def _shade(hexc, f):
 
 def build_qss(settings_state=None):
     p = resolve_palette(settings_state)
-    return f"""
+    qss = f"""
 QMainWindow, QWidget {{
     background: {p['bg_base']};
     color: {p['text']};
@@ -195,4 +195,48 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 #Chip {{ background: {p['bg_elevated']}; border: 1px solid {p['border']}; border-radius: 10px;
     padding: 2px 10px; color: {p['text_muted']}; font-size: 11px; }}
 #Warn {{ color: {p['warning']}; font-size: 11px; }}
+
+/* ---- sidebar tools row ---- */
+#SidebarTool {{
+    background: transparent; border: 0; border-radius: {p['radius']};
+    color: {p['text_soft']}; padding: 6px 4px; font-size: 11px;
+}}
+#SidebarTool:hover {{ background: {p['bg_hover']}; color: {p['text']}; }}
+
+/* ---- download detail pane ---- */
+#DetailPane {{ background: {p['bg_panel']}; border: 1px solid {p['border']}; border-radius: {p['radius']}; }}
+#DetailTitle {{ font-size: 14px; font-weight: 700; }}
+#DetailSub, #StatCaption, #DetailKey {{ color: {p['text_muted']}; font-size: 11px; }}
+#StatValue {{ font-size: 13px; font-weight: 600; }}
+QProgressBar#DetailBar {{ min-height: 12px; max-height: 12px; }}
+"""
+    if (settings_state or {}).get("frame_cream"):
+        qss += _cream_frame_qss(p)
+    return qss
+
+
+def _cream_frame_qss(p):
+    """Cream window frame (toolbar, menu bar, status bar, margins) around the
+    theme's dark panels. Scoped to the main window's own widgets so dialogs
+    keep the normal theme."""
+    fb, fh, fe, fd = "#d9d3c0", "#e8e4d4", "#a8a28c", "#8f8a78"
+    ft, fm = "#1b1f1d", "#4a4d4b"
+    return f"""
+/* ---- cream frame ---- */
+QMainWindow, #MainRoot, #FrameArea, #Content {{ background: {fb}; }}
+QMenuBar {{ background: {fh}; color: {ft}; border-bottom: 1px solid {fe}; }}
+QMenuBar::item:selected {{ background: {fb}; color: {ft}; }}
+#Toolbar {{ background: {fb}; border-bottom: 1px solid {fe}; }}
+#ToolbarTitle {{ color: {ft}; }}
+#ToolbarButton {{
+    color: {ft};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {fh}, stop:1 {fb});
+    border: 1px solid {fe}; border-bottom: 2px solid {fd};
+    border-radius: {p['radius']}; padding: 8px 11px 7px 11px;
+}}
+#ToolbarButton:hover {{ background: {fh}; border-color: {fd}; color: {ft}; }}
+#ToolbarButton:pressed {{ background: {fe}; border-bottom: 1px solid {fd}; }}
+#Content #SectionLabel {{ color: {fm}; }}
+QStatusBar, #BottomStatus {{ background: {fb}; color: {ft}; border-top: 1px solid {fe}; }}
+QStatusBar QLabel {{ color: {ft}; }}
 """

@@ -180,6 +180,10 @@ _V5_DEFAULTS = {
     "shell_color": "cream",
     # Backlight on = normal screen. Off = dim green tint (click the power light).
     "shell_backlight": True,
+    # Per-part shell color overrides, e.g. {"dpad": "#3a0808"}. Empty string = no override.
+    "shell_colors": {},
+    # Cream window frame (toolbar, menu bar, status bar, margins) around the dark panels.
+    "frame_cream": False,
 }
 STATE.update(_V5_DEFAULTS)
 
