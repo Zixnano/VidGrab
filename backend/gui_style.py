@@ -4,6 +4,21 @@ the same tokens. Nothing in here should hardcode a color."""
 from palette import resolve_palette
 
 
+def _shade(hexc, f):
+    """Lighten (f > 0) or darken (f < 0) a #rrggbb color by that fraction.
+    Anything that is not plain #rrggbb is returned unchanged."""
+    h = str(hexc).lstrip("#")
+    if len(h) != 6:
+        return hexc
+    try:
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return hexc
+    t, a = (255, f) if f > 0 else (0, -f)
+    r, g, b = (round(c + (t - c) * a) for c in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def build_qss(settings_state=None):
     p = resolve_palette(settings_state)
     return f"""
@@ -43,7 +58,8 @@ QMenu::separator {{ height: 1px; background: {p['border']}; margin: 6px 8px; }}
 #ToolbarButton:pressed {{ background: {p['bg_sel']}; }}
 #Search {{
     background: {p['bg_input']}; border: 1px solid {p['border']};
-    border-radius: {p['radius']}; padding: 8px 12px; min-width: 200px;
+    border-top: 2px solid {_shade(p['bg_input'], -0.4)};
+    border-radius: {p['radius']}; padding: 7px 12px 8px 12px; min-width: 200px;
 }}
 #Search:focus {{ border-color: {p['accent']}; }}
 
@@ -81,12 +97,14 @@ QHeaderView::section {{
 QHeaderView::section:hover {{ color: {p['text']}; }}
 #Details {{
     background: {p['bg_input']}; border: 1px solid {p['border']}; border-radius: {p['radius']};
-    padding: 8px 12px; color: {p['text_soft']}; font-size: 12px;
+    border-top: 2px solid {_shade(p['bg_input'], -0.4)};
+    padding: 7px 12px 8px 12px; color: {p['text_soft']}; font-size: 12px;
 }}
 #EmptyState {{ color: {p['text_dim']}; font-size: 14px; background: transparent; }}
 #LogLine {{
     background: {p['bg_input']}; border: 1px solid {p['border']}; border-radius: {p['radius']};
-    padding: 8px 12px; color: {p['text_muted']}; font-family: {p['font_mono']}; font-size: 11px;
+    border-top: 2px solid {_shade(p['bg_input'], -0.4)};
+    padding: 7px 12px 8px 12px; color: {p['text_muted']}; font-family: {p['font_mono']}; font-size: 11px;
 }}
 
 /* ---- status bar ---- */
@@ -98,19 +116,25 @@ QStatusBar, #BottomStatus {{ background: {p['bg_panel']}; border-top: 1px solid 
 
 /* ---- buttons and inputs ---- */
 QPushButton {{
-    background: {p['bg_elevated']}; border: 1px solid {p['border']};
-    border-radius: {p['radius']}; padding: 8px 14px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 {_shade(p['bg_elevated'], 0.07)}, stop:1 {p['bg_elevated']});
+    border: 1px solid {p['border']}; border-bottom: 2px solid {_shade(p['border'], -0.35)};
+    border-radius: {p['radius']}; padding: 8px 14px 7px 14px;
 }}
-QPushButton:hover {{ background: {p['bg_hover']}; border-color: {p['border_hi']}; }}
-QPushButton:pressed {{ background: {p['bg_sel']}; }}
+QPushButton:hover {{ background: {p['bg_hover']}; border-color: {p['border_hi']};
+    border-bottom-color: {_shade(p['border_hi'], -0.35)}; }}
+QPushButton:pressed {{ background: {p['bg_sel']}; border-bottom: 1px solid {p['border']};
+    padding: 9px 14px 7px 14px; }}
 QPushButton:disabled {{ color: {p['text_dim']}; background: {p['bg_base']}; border-color: {p['border']}; }}
-QPushButton#primary {{ background: {p['accent']}; color: {p['text_on_accent']}; border: none; font-weight: 600; }}
+QPushButton#primary {{ background: {p['accent']}; color: {p['text_on_accent']}; border: none; border-bottom: 2px solid {_shade(p['accent'], -0.3)};
+    font-weight: 600; }}
 QPushButton#primary:hover {{ background: {p['accent_dim']}; }}
 QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: {p['radius']}; padding: 4px; }}
 QToolButton:hover {{ background: {p['bg_hover']}; border-color: {p['border']}; }}
 QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit {{
     background: {p['bg_input']}; border: 1px solid {p['border']};
-    border-radius: {p['radius']}; padding: 6px 10px;
+    border-top: 2px solid {_shade(p['bg_input'], -0.4)};
+    border-radius: {p['radius']}; padding: 5px 10px 6px 10px;
     selection-background-color: {p['accent_dim']};
 }}
 QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: {p['border_hi']}; }}

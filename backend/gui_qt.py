@@ -2194,6 +2194,7 @@ class SettingsDialog(QDialog):
             self.api.save_setting("theme_tokens", tv["theme_tokens"])
             self.api.save_setting("shell_enabled", tv["shell_enabled"])
             self.api.save_setting("shell_color", tv["shell_color"])
+            self.api.save_setting("shell_backlight", tv["shell_backlight"])
             # rebuild the stylesheet and repaint so the theme lands live
             reapply_theme()
             self.api.save_setting("animations_enabled",
@@ -3363,7 +3364,8 @@ class MainWindow(QMainWindow):
             old.deleteLater()
         if st.get("shell_enabled"):
             from gui_shell import ShellFrame
-            self.shell = ShellFrame(self._root, st.get("shell_color", "cream"))
+            self.shell = ShellFrame(self._root, st.get("shell_color", "cream"),
+                                    backlight=bool(st.get("shell_backlight", True)))
             self.shell.dpad.connect(self._shell_dpad)
             self.shell.button.connect(self._shell_button)
             self.setCentralWidget(self.shell)
@@ -3391,8 +3393,23 @@ class MainWindow(QMainWindow):
         elif name == "select":
             self.search.setFocus()
             self.search.selectAll()
+        elif name == "power":
+            self._toggle_backlight()
         elif self._selected_rows():
             self._selected("resume" if name == "a" else "pause")
+
+    def _toggle_backlight(self):
+        """Power light click: flip the shell's backlight and remember it."""
+        if not self.shell:
+            return
+        on = not self.shell.backlight
+        if self.api:
+            try:
+                self.api.save_setting("shell_backlight", on)
+            except Exception as e:
+                QMessageBox.warning(self, "Error", str(e))
+                return
+        self.shell.set_backlight(on)
 
     def toggle_queue(self):
         """Flip the dispatcher's queue_running flag via /settings."""

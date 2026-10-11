@@ -1,0 +1,22 @@
+{
+  "theme_preset": "amoled_black",
+  "accent": "#3f8f3f",
+  "shell_color": "cream",
+  "shell_enabled": false,
+  "shell_backlight": true,
+  "theme_tokens": {
+    "bg_base": "#d9d3c0",
+    "bg_panel": "#ebe7d8",
+    "bg_elevated": "#e2ddc9",
+    "text": "#1b1f1d",
+    "text_muted": "#4a4d4b",
+    "text_dim": "#6f6a58",
+    "border": "#a8a28c",
+    "border_hi": "#8f8a78",
+    "accent_dim": "#2f7a30",
+    "success": "#2e7d32",
+    "warning": "#b26a00",
+    "error": "#c62828",
+    "info": "#1565c0"
+  }
+}

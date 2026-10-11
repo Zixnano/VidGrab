@@ -18,7 +18,7 @@ from palette import (PRESET_NAMES, THEME_PRESETS, contrast, luminance, mix,
                      resolve_palette)
 
 ACCENT_SWATCHES = ["#26c6da", "#7c4dff", "#66bb6a", "#ffa726", "#ef5350",
-                   "#42a5f5", "#ec407a", "#8ccf72"]
+                   "#42a5f5", "#ec407a", "#8ccf72", "#9aa09c"]
 
 GROUPS = [
     ("Surfaces", [("bg_base", "Window background"), ("bg_panel", "Panels and table"),
@@ -283,6 +283,7 @@ class ThemePage(QWidget):
                     if v and k != "accent"}
         self._shell_on = bool(s.get("shell_enabled"))
         self._shell_color = s.get("shell_color") if s.get("shell_color") in SHELLS else "cream"
+        self._backlight = bool(s.get("shell_backlight", True))
         chrome = resolve_palette(s)
         self._ring, self._label = chrome["accent"], chrome["text"]
         self._rows = {}
@@ -350,6 +351,10 @@ class ThemePage(QWidget):
         self.shell_check.setChecked(self._shell_on)
         self.shell_check.toggled.connect(self._shell_toggled)
         l4.addWidget(self.shell_check)
+        self.backlight_check = QCheckBox("Backlight on (turn off for the dim green screen)")
+        self.backlight_check.setChecked(self._backlight)
+        self.backlight_check.toggled.connect(self._backlight_toggled)
+        l4.addWidget(self.backlight_check)
         sh_host = QWidget()
         sh_host.setObjectName("Plain")
         sh_flow = FlowLayout(sh_host, 6)
@@ -481,6 +486,7 @@ class ThemePage(QWidget):
         self.fine_toggle.setText(("\u25BE " if self.fine_toggle.isChecked() else "\u25B8 ")
                                  + "Edit individual colors")
         self.accent_label.setText(f"Current accent: {self._accent.upper()}")
+        self.backlight_check.setEnabled(self._shell_on)
         for key, b in self._shell_sw:
             b.setChecked(self._shell_on and key == self._shell_color)
             b.setEnabled(self._shell_on)
@@ -512,6 +518,10 @@ class ThemePage(QWidget):
 
     def _shell_toggled(self, on):
         self._shell_on = on
+        self._refresh()
+
+    def _backlight_toggled(self, on):
+        self._backlight = on
         self._refresh()
 
     def _pick_shell(self, key):
@@ -555,6 +565,8 @@ class ThemePage(QWidget):
         self._ov = {}
         self._shell_on = False
         self.shell_check.setChecked(False)
+        self._backlight = True
+        self.backlight_check.setChecked(True)
         self._pick_preset("amoled_black")
 
     def _export(self):
@@ -584,6 +596,8 @@ class ThemePage(QWidget):
             sc = d.get("shell_color")
             self._shell_color = sc if sc in SHELLS else self._shell_color
             self.shell_check.setChecked(self._shell_on)
+            self._backlight = bool(d.get("shell_backlight", self._backlight))
+            self.backlight_check.setChecked(self._backlight)
             self._refresh()
         except Exception as e:
             QMessageBox.warning(self, "Import failed", str(e))
@@ -591,4 +605,4 @@ class ThemePage(QWidget):
     def values(self):
         return {"theme_preset": self._preset, "accent": self._accent,
                 "theme_tokens": dict(self._ov), "shell_enabled": self._shell_on,
-                "shell_color": self._shell_color}
+                "shell_color": self._shell_color, "shell_backlight": self._backlight}

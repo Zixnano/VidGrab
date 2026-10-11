@@ -112,6 +112,91 @@
   ];
   const isOneClickSite = () => ONE_CLICK_HOSTS.some((rx) => rx.test(location.hostname));
 
+  // ---- v6: sniffed-stream fallback for blob players -----------------------
+  // On extractor sites whose players only expose a blob: URL (Reddit,
+  // Redgifs, X/Twitter feeds, TikTok), background.js has usually ALREADY
+  // captured the real media URL via webRequest sniffing — that is what the
+  // popup's Download button uses. The pill asks for the same list when its
+  // menu opens and, when a real media URL is found, offers "Download file"
+  // with it instead of only "Send page URL" / recording.
+  //
+  // Only media hosts the sniffer can trust are considered, and Reddit's
+  // tiny "dict-…" metadata blobs are filtered out — they are player
+  // internals, not video.
+  const SNIFF_MEDIA_HOSTS = [
+    /(^|\.)v\.redd\.it$/i, /(^|\.)redgifs\.com$/i,
+    /(^|\.)x\.com$/i, /(^|\.)twitter\.com$/i,
+    /(^|\.)tiktok\.com$/i,
+  ];
+  const SNIFF_FILE_REGEX = /\.(mp4|webm|m4v|mov|mkv)(\?|#|$)/i;
+
+  function looksLikeSniffedVideo(url) {
+    try {
+      const u = new URL(url);
+      if (!SNIFF_MEDIA_HOSTS.some((rx) => rx.test(u.hostname))) return false;
+      // Reddit serves small player-metadata blobs named dict-<hex>… — never
+      // media. Real candidates end in a video extension or are HLS/DASH
+      // manifests (m3u8 / mpd somewhere in the URL).
+      if (/dict-[0-9a-f]{4,}/i.test(u.href)) return false;
+      return SNIFF_FILE_REGEX.test(u.href) || /m3u8|mpd/i.test(u.href);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // GET_ALL_VIDEOS (not GET_VIDEOS): a content script can't read chrome.tabs
+  // to learn its own tabId, and background.js must stay untouched. That
+  // handler already resolves every entry's tab URL server-side, so the pill
+  // matches its own address against the list. all_frames:true means an
+  // iframe pill sees the TOP frame URL in tab.url, so an exact
+  // hostname+pathname match is tried first and a unique origin match is
+  // accepted as fallback; ambiguous matches are ignored.
+  function sniffedItemsForThisTab(tabs) {
+    const norm = (u) => {
+      try {
+        const x = new URL(u);
+        return (x.hostname.replace(/^www\./, "") + x.pathname).toLowerCase();
+      } catch (e) { return ""; }
+    };
+    const here = norm(location.href);
+    const byPath = (tabs || []).find((t) => norm(t.url) === here);
+    if (byPath) return byPath.items || [];
+    let origin = "";
+    try { origin = location.origin; } catch (e) {}
+    const sameOrigin = (tabs || []).filter((t) => {
+      try { return new URL(t.url).origin === origin; } catch (e) { return false; }
+    });
+    if (sameOrigin.length === 1) return sameOrigin[0].items || [];
+    return null;
+  }
+
+  // Pick the best candidate: a manifest (m3u8/mpd) beats a single media file
+  // (it describes the whole stream, like the popup's pick); otherwise the
+  // largest sniffed file wins, then the most recent one.
+  function bestSniffedVideo(items) {
+    const vids = (items || []).filter((it) => it && it.url && looksLikeSniffedVideo(it.url));
+    if (!vids.length) return null;
+    const manifests = vids.filter((it) => /m3u8|mpd/i.test(it.url));
+    if (manifests.length) return manifests[manifests.length - 1];
+    const sized = vids.filter((it) => it.size > 0).sort((a, b) => (b.size || 0) - (a.size || 0));
+    if (sized.length) return sized[0];
+    return vids[vids.length - 1];
+  }
+
+  // chrome.runtime.sendMessage callback pattern (content scripts can't
+  // reliably use async/await with it). cb receives the best item or null.
+  function querySniffedVideos(cb) {
+    try {
+      chrome.runtime.sendMessage({ type: "GET_ALL_VIDEOS" }, (resp) => {
+        if (chrome.runtime.lastError || !resp) return cb(null);
+        const items = sniffedItemsForThisTab(resp.tabs || []);
+        cb(items ? bestSniffedVideo(items) : null);
+      });
+    } catch (e) {
+      cb(null);
+    }
+  }
+
   function isVisible(el) {
     const r = el.getBoundingClientRect();
     return r.width > 80 && r.height > 60;
@@ -701,7 +786,8 @@
 
     function sendChoice({ format_id = null, target_format = null,
                          bypass_dialog = false, download_playlist = false,
-                         force_page_url = false, pick_playlist = false } = {}) {
+                         force_page_url = false, pick_playlist = false,
+                         url: directUrl = null } = {}) {
       closeMenu();
       const pu = pageUrlFor(video);
       if (force_page_url && !pu) {
@@ -717,13 +803,13 @@
       // if there is none, omit filename so the backend guesses it.
       let ext = "";
       try {
-        ext = (new URL(video.currentSrc).pathname.match(/(\.[A-Za-z0-9]{1,5})$/) || [""])[0];
+        ext = (new URL(directUrl || video.currentSrc).pathname.match(/(\.[A-Za-z0-9]{1,5})$/) || [""])[0];
       } catch (e) {}
       const payload = {
         // Normal picks open the app's confirmation dialog (IDM-style);
         // bypass_dialog queues directly.
         type: bypass_dialog ? "RELAY_DOWNLOAD" : "SHOW_ADD_DIALOG",
-        url: force_page_url ? pu : video.currentSrc,
+        url: force_page_url ? pu : (directUrl || video.currentSrc),
         pageUrl: pu || location.href,
         filename: ext ? base + ext : undefined,
         format_id: format_id,
@@ -774,6 +860,31 @@
         // backend to resolve the PAGE URL — that gives us the same quality
         // ladder IDM shows. On non-extractor MSE sites, only recording.
         if (isExtractorSite()) {
+          // v6: blob player, but the sniffer may already know the real URL.
+          // Ask in the background; if a candidate comes back, put
+          // "Download file" at the very top of the menu. Otherwise the
+          // placeholder is removed and the menu falls back to its current
+          // behavior (Send page URL, formats, recording).
+          if (blob || !video.currentSrc) {
+            const sniffPh = addMenuItem(menu, "Looking for sniffed stream…",
+              { dim: true, header: true });
+            querySniffedVideos((best) => {
+              if (seq !== menuSeq || !menuOpen) return;
+              if (!best) { sniffPh.remove(); return; }
+              const item = addMenuItem(menu,
+                "Download file" + (best.size ? " · " + fmtBytes(best.size) : ""), {},
+                () => {
+                  // Same choice the direct-URL branch makes: a real file is
+                  // sent as-is; anything else is normalized to mp4.
+                  const directFile = /\.(mp4|webm|mkv|mov|m4v|avi)(\?|#|$)/i.test(best.url);
+                  sendChoice(directFile
+                    ? { url: best.url }
+                    : { url: best.url, target_format: "mp4" });
+                });
+              menu.insertBefore(item, menu.firstChild);
+              sniffPh.remove();
+            });
+          }
           addMenuItem(menu, "Download with yt-dlp", {},
             () => handleSendPageUrl(video, overlay, closeMenu));
           addDivider(menu);
@@ -938,6 +1049,15 @@
 
   function scan(root = document) {
     root.querySelectorAll("video").forEach(wire);
+    // Reddit (and an increasing number of SPA players) render <video>
+    // inside shadow roots, which document.querySelectorAll can't see.
+    // Walk every element's shadow root recursively and scan inside it.
+    // Only OPEN roots are reachable (el.shadowRoot is null for closed
+    // ones) — those are invisible by design and out of scope. wire() is
+    // guarded by HANDLED, so re-walking on the 2s poll is cheap no-op.
+    root.querySelectorAll("*").forEach((el) => {
+      if (el.shadowRoot) scan(el.shadowRoot);
+    });
   }
 
   scan();
@@ -945,8 +1065,12 @@
     for (const m of mutations) {
       m.addedNodes.forEach((node) => {
         if (!(node instanceof Element)) return;
+        // Scan the added subtree — which now also descends into any
+        // shadow roots it carries, so SPA players that mount <video>
+        // inside shadow DOM (Reddit) get picked up without waiting for
+        // the 2s poll. wire() dedupes via HANDLED.
         if (node.tagName === "VIDEO") wire(node);
-        else node.querySelectorAll && node.querySelectorAll("video").forEach(wire);
+        scan(node);
       });
     }
   });

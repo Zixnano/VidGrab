@@ -178,6 +178,8 @@ _V5_DEFAULTS = {
     # shell_color is one of: cream, black, indigo, silver.
     "shell_enabled": False,
     "shell_color": "cream",
+    # Backlight on = normal screen. Off = dim green tint (click the power light).
+    "shell_backlight": True,
 }
 STATE.update(_V5_DEFAULTS)
 

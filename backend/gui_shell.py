@@ -2,8 +2,9 @@
 dark screen bezel, D-pad, A/B, speaker, Select/Start and a power light.
 The controls are real: they emit signals MainWindow connects to actions.
 Pure painting, no backend calls."""
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QCursor, QFont, QLinearGradient, QPainter, QPen, QPolygonF
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QLinearGradient, QPainter, QPainterPath,
+                           QPen, QPolygonF, QRadialGradient, QTransform)
 from PySide6.QtWidgets import QHBoxLayout, QWidget
 
 # name: (top, body, bottom, edge)
@@ -17,11 +18,36 @@ SHELL_NAMES = {"cream": "Cream", "black": "Matte black", "indigo": "Indigo", "si
 COLUMN = 210   # width of the controls column
 
 
+class _Backlight(QWidget):
+    """Sits over the screen. With the backlight off it tints the content
+    green-grey, dims it and darkens the corners. Never takes mouse input."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.dim = False
+
+    def paintEvent(self, _e):
+        if not self.dim:
+            return
+        p = QPainter(self)
+        r = self.rect()
+        p.setCompositionMode(QPainter.CompositionMode_Multiply)
+        p.fillRect(r, QColor(150, 188, 150))
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        rg = QRadialGradient(QPointF(r.center()), max(r.width(), r.height()) * 0.75)
+        rg.setColorAt(0.55, QColor(0, 0, 0, 0))
+        rg.setColorAt(1, QColor(0, 0, 0, 120))
+        p.fillRect(r, rg)
+        p.end()
+
+
 class ShellFrame(QWidget):
     dpad = Signal(str)      # "up" "down" "left" "right"
     button = Signal(str)    # "a" "b" "select" "start"
 
-    def __init__(self, inner, color="cream", parent=None):
+    def __init__(self, inner, color="cream", parent=None, backlight=True):
         super().__init__(parent)
         self.inner = inner
         self.color = color if color in SHELLS else "cream"
@@ -31,10 +57,37 @@ class ShellFrame(QWidget):
         lay.setContentsMargins(38, 62, COLUMN + 12, 40)
         lay.addWidget(inner)
         self.setMinimumSize(900, 600)
+        self.backlight = bool(backlight)
+        self.overlay = _Backlight(self)
+        self.overlay.dim = not self.backlight
+        self.overlay.setVisible(not self.backlight)
+        inner.installEventFilter(self)
 
     def set_color(self, color):
         self.color = color if color in SHELLS else "cream"
         self.update()
+
+    def set_backlight(self, on):
+        """Backlight off = dim green screen. The power light stays lit."""
+        self.backlight = bool(on)
+        self.overlay.dim = not self.backlight
+        self.overlay.setVisible(not self.backlight)
+        self._sync_overlay()
+        self.overlay.update()
+        self.update()
+
+    def _sync_overlay(self):
+        self.overlay.setGeometry(self.inner.geometry())
+        self.overlay.raise_()
+
+    def eventFilter(self, obj, e):
+        if obj is self.inner and e.type() in (QEvent.Resize, QEvent.Move, QEvent.Show):
+            self._sync_overlay()
+        return super().eventFilter(obj, e)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._sync_overlay()
 
     # ---- painting ----
     def paintEvent(self, _e):
@@ -51,87 +104,251 @@ class ShellFrame(QWidget):
         p.setPen(QPen(edge, 2))
         p.setBrush(g)
         p.drawRoundedRect(body_r, 26, 26)
-        # hinge strip with two raised tabs
-        p.setPen(QPen(edge, 1.5))
-        p.setBrush(top.darker(106) if not dark else top.lighter(115))
-        p.drawRoundedRect(QRectF(4, 14, w - 8, 26), 14, 14)
+        # rounded edge: light along the top lip, shade along the bottom
+        rim = QLinearGradient(0, 0, 0, h)
+        rim.setColorAt(0, QColor(255, 255, 255, 120 if not dark else 40))
+        rim.setColorAt(0.45, QColor(255, 255, 255, 0))
+        rim.setColorAt(0.8, QColor(0, 0, 0, 0))
+        rim.setColorAt(1, QColor(0, 0, 0, 70))
+        p.setPen(QPen(QBrush(rim), 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(body_r.adjusted(3, 3, -3, -3), 23, 23)
+        # hinge strip with two raised, rounded barrels
+        hinge_c = top.darker(106) if not dark else top.lighter(115)
+
+        def barrel(rect, rad):
+            gb = QLinearGradient(0, rect.top(), 0, rect.bottom())
+            gb.setColorAt(0, hinge_c.lighter(112))
+            gb.setColorAt(0.45, hinge_c)
+            gb.setColorAt(1, hinge_c.darker(118))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, 60))
+            p.drawRoundedRect(rect.translated(0, 2), rad, rad)
+            p.setPen(QPen(edge, 1.5))
+            p.setBrush(gb)
+            p.drawRoundedRect(rect, rad, rad)
+            p.setPen(QPen(QColor(255, 255, 255, 80 if not dark else 30), 1.2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(rect.adjusted(2, 2, -2, -2), rad - 2, rad - 2)
+
+        barrel(QRectF(4, 14, w - 8, 26), 14)
         for x in (70, w - 220):
-            p.drawRoundedRect(QRectF(x, 2, 150, 24), 9, 9)
-        # screen bezel behind the inner widget
+            barrel(QRectF(x, 2, 150, 24), 9)
+        # screen bezel behind the inner widget: sunk into the body
         r = self.inner.geometry().adjusted(-12, -12, 12, 12)
+        bez = QPainterPath()
+        bez.addRoundedRect(QRectF(r), 16, 16)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 110 if not dark else 40), 1.5))
+        p.drawPath(bez.translated(0, 1.5))
         p.setPen(Qt.NoPen)
         p.setBrush(QColor("#1b1f1d"))
-        p.drawRoundedRect(QRectF(r), 16, 16)
-        p.setBrush(QColor(255, 255, 255, 22))
-        p.drawRoundedRect(QRectF(r.x(), r.bottom() - 2, r.width(), 2), 1, 1)
+        p.drawPath(bez)
+        p.save()
+        p.setClipPath(bez)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(0, 0, 0, 140), 4))
+        p.drawPath(bez.translated(0, 3))
+        p.restore()
         self._controls(p, w, h, dark)
         p.end()
 
+    def _well(self, p, c, r, body, edge, dark):
+        """Recessed circular socket: shadowed at the top lip, catch-light at the bottom."""
+        rect = QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r)
+        g = QLinearGradient(0, c.y() - r, 0, c.y() + r)
+        g.setColorAt(0, body.darker(140 if not dark else 180))
+        g.setColorAt(1, body.lighter(108 if not dark else 130))
+        p.setPen(Qt.NoPen)
+        p.setBrush(g)
+        p.drawEllipse(rect)
+        p.setBrush(Qt.NoBrush)
+        # inner shadow along the top edge
+        p.setPen(QPen(QColor(0, 0, 0, 70), 3))
+        p.drawArc(rect.adjusted(1.5, 1.5, -1.5, -1.5), 20 * 16, 140 * 16)
+        # catch-light just outside the bottom edge
+        p.setPen(QPen(QColor(255, 255, 255, 150 if not dark else 45), 1.5))
+        p.drawArc(rect.adjusted(-1, -1, 1, 1), 200 * 16, 140 * 16)
+        ec = QColor(edge)
+        ec.setAlpha(120)
+        p.setPen(QPen(ec, 1))
+        p.drawEllipse(rect)
+
+    @staticmethod
+    def _xpath(cx, cy, w, h, ang):
+        """Rounded capsule of w x h centred on (cx, cy), rotated by ang degrees."""
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(-w / 2, -h / 2, w, h), h / 2, h / 2)
+        t = QTransform()
+        t.translate(cx, cy)
+        t.rotate(ang)
+        return t.map(path)
+
+    def _well_path(self, p, path, body, edge, dark):
+        """Recessed socket of any shape: catch-light under the bottom lip, shadow inside the top."""
+        r = path.boundingRect()
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 150 if not dark else 45), 1.5))
+        p.drawPath(path.translated(0, 1.2))
+        g = QLinearGradient(0, r.top(), 0, r.bottom())
+        g.setColorAt(0, body.darker(140 if not dark else 180))
+        g.setColorAt(1, body.lighter(108 if not dark else 130))
+        p.setPen(Qt.NoPen)
+        p.setBrush(g)
+        p.drawPath(path)
+        p.save()
+        p.setClipPath(path)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(0, 0, 0, 70), 3))
+        p.drawPath(path.translated(0, 2.5))
+        p.restore()
+        ec = QColor(edge)
+        ec.setAlpha(120)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(ec, 1))
+        p.drawPath(path)
+
+    def _raised(self, p, path, top_c, bot_c, line, shadow=90, lit=60):
+        """Raised key: drop shadow, vertical gradient, light top edge, dark bottom edge."""
+        r = path.boundingRect()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, shadow))
+        p.drawPath(path.translated(0, 3))
+        g = QLinearGradient(0, r.top(), 0, r.bottom())
+        g.setColorAt(0, top_c)
+        g.setColorAt(1, bot_c)
+        p.setPen(QPen(line, 1))
+        p.setBrush(g)
+        p.drawPath(path)
+        p.save()
+        p.setClipPath(path)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, lit), 2))
+        p.drawPath(path.translated(0, 2))
+        p.setPen(QPen(QColor(0, 0, 0, 90), 2))
+        p.drawPath(path.translated(0, -2))
+        p.restore()
+
     def _controls(self, p, w, h, dark):
         cx = w - COLUMN / 2 - 4
+        top, body, bot, edge = (QColor(c) for c in SHELLS[self.color])
         ctl = QColor("#2b2e2c") if not dark else QColor("#121413")
         ctl_hi = QColor("#4a4e4b")
         label = QColor("#6f6a58") if not dark else QColor("#8c908d")
         self._hits = {}
         # power light
+        led = QPointF(w - 44, 74)
+        halo = QRadialGradient(led, 18)
+        halo.setColorAt(0, QColor(94, 224, 122, 120))
+        halo.setColorAt(1, QColor(94, 224, 122, 0))
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#5ee07a"))
-        p.drawEllipse(QPointF(w - 44, 74), 8, 8)
+        if self.backlight:
+            p.setBrush(halo)
+            p.drawEllipse(led, 18, 18)
+        lg = QRadialGradient(QPointF(led.x() - 2, led.y() - 3), 10)
+        lg.setColorAt(0, QColor("#c8ffd3"))
+        lg.setColorAt(0.5, QColor("#5ee07a"))
+        lg.setColorAt(1, QColor("#2c9c47"))
+        p.setPen(QPen(QColor(0, 0, 0, 90), 1))
+        p.setBrush(lg)
+        p.drawEllipse(led, 8, 8)
         f = p.font(); f.setPixelSize(10); f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.4); p.setFont(f)
         p.setPen(label)
         p.drawText(QRectF(w - 130, 64, 70, 20), Qt.AlignRight | Qt.AlignVCenter, "POWER")
-        # d-pad
+        self._hits["power"] = QRectF(w - 134, 58, 106, 32)   # click: backlight on/off
+        # d-pad: recessed well, raised cross
         dy = max(190, h * 0.30)
-        arm, ln = 40, 120
-        p.setPen(QPen(QColor("#000"), 1))
-        p.setBrush(ctl)
-        p.drawRoundedRect(QRectF(cx - ln / 2, dy - arm / 2, ln, arm), 8, 8)
-        p.drawRoundedRect(QRectF(cx - arm / 2, dy - ln / 2, arm, ln), 8, 8)
+        arm, ln, well_r = 40, 120, 74
+        self._well(p, QPointF(cx, dy), well_r, body, edge, dark)
+        cross = QPainterPath()
+        cross.addRoundedRect(QRectF(cx - ln / 2, dy - arm / 2, ln, arm), 10, 10)
+        cross.addRoundedRect(QRectF(cx - arm / 2, dy - ln / 2, arm, ln), 10, 10)
+        cross = cross.simplified()
+        # shadow the cross casts into the well
         p.setPen(Qt.NoPen)
-        p.setBrush(ctl_hi)
+        p.setBrush(QColor(0, 0, 0, 90))
+        p.drawPath(cross.translated(0, 3))
+        # cross body
+        gr = QLinearGradient(0, dy - ln / 2, 0, dy + ln / 2)
+        gr.setColorAt(0, ctl_hi)
+        gr.setColorAt(0.5, ctl)
+        gr.setColorAt(1, ctl.darker(130))
+        p.setPen(QPen(QColor("#000"), 1))
+        p.setBrush(gr)
+        p.drawPath(cross)
+        # bevel: light along the top edges, dark along the bottom edges
+        p.save()
+        p.setClipPath(cross)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 60), 2))
+        p.drawPath(cross.translated(0, 2))
+        p.setPen(QPen(QColor(0, 0, 0, 110), 2))
+        p.drawPath(cross.translated(0, -2))
+        p.restore()
+        # engraved arrows + hit areas
+        p.setPen(Qt.NoPen)
         for name, (ox, oy) in {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}.items():
             c = QPointF(cx + ox * 40, dy + oy * 40)
             sz = 6
             tip = QPointF(c.x() + ox * sz, c.y() + oy * sz)
             b1 = QPointF(c.x() - ox * sz * 0.6 - oy * sz, c.y() - oy * sz * 0.6 + ox * sz)
             b2 = QPointF(c.x() - ox * sz * 0.6 + oy * sz, c.y() - oy * sz * 0.6 - ox * sz)
-            p.drawPolygon(QPolygonF([tip, b1, b2]))
+            tri = QPolygonF([tip, b1, b2])
+            p.setBrush(QColor(255, 255, 255, 45))
+            p.drawPolygon(tri.translated(QPointF(0, 1)))
+            p.setBrush(QColor(0, 0, 0, 170))
+            p.drawPolygon(tri)
             self._hits[name] = QRectF(c.x() - 20, c.y() - 20, 40, 40)
-        p.setBrush(QColor("#1d201e"))
+        # centre dimple
+        rg = QRadialGradient(QPointF(cx, dy + 2), 11)
+        rg.setColorAt(0, ctl.darker(160))
+        rg.setColorAt(1, ctl.lighter(115))
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.setBrush(rg)
         p.drawEllipse(QPointF(cx, dy), 9, 9)
-        # A / B
+        # A / B: one diagonal recessed track, two raised round keys
         ay = max(340, h * 0.55)
+        track = self._xpath(cx + 9, ay - 4, 160, 76, -26)
+        self._well_path(p, track, body, edge, dark)
         for name, (x, y) in {"a": (cx + 46, ay - 22), "b": (cx - 28, ay + 14)}.items():
-            gr = QLinearGradient(x, y - 30, x, y + 30)
-            gr.setColorAt(0, ctl_hi)
-            gr.setColorAt(1, ctl)
-            p.setPen(QPen(QColor("#000"), 1))
-            p.setBrush(gr)
-            p.drawEllipse(QPointF(x, y), 30, 30)
-            p.setPen(QColor("#9aa09c"))
+            key = QPainterPath()
+            key.addEllipse(QPointF(x, y), 30, 30)
+            self._raised(p, key, ctl_hi, ctl, QColor("#000"))
             f2 = p.font(); f2.setPixelSize(22); f2.setBold(True); f2.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0); p.setFont(f2)
-            p.drawText(QRectF(x - 30, y - 30, 60, 60), Qt.AlignCenter, name.upper())
-            self._hits[name] = QRectF(x - 30, y - 30, 60, 60)
+            box = QRectF(x - 30, y - 30, 60, 60)
+            if dark:
+                p.setPen(QColor(0, 0, 0, 200))
+                p.drawText(box.translated(0, 1), Qt.AlignCenter, name.upper())
+                p.setPen(QColor("#6b716d"))
+            else:
+                p.setPen(QColor(255, 255, 255, 55))
+                p.drawText(box.translated(0, 1), Qt.AlignCenter, name.upper())
+                p.setPen(QColor(0, 0, 0, 170))
+            p.drawText(box, Qt.AlignCenter, name.upper())
+            self._hits[name] = box
         # speaker dots
         sy = max(450, h * 0.72)
         p.setPen(Qt.NoPen)
-        p.setBrush(label if not dark else QColor("#3a3d3b"))
+        hole = body.darker(160) if not dark else QColor("#0b0c0c")
         for i in range(5):
             for j in range(4):
-                p.drawEllipse(QPointF(cx + 10 + i * 14 + j * 6, sy + j * 12 - i * 5), 3, 3)
-        # select / start
+                c = QPointF(cx + 10 + i * 14 + j * 6, sy + j * 12 - i * 5)
+                p.setBrush(QColor(255, 255, 255, 110 if not dark else 35))
+                p.drawEllipse(c + QPointF(0.6, 1.2), 3, 3)
+                p.setBrush(hole)
+                p.drawEllipse(c, 3, 3)
+        # select / start: raised pills in recessed slots
         by = h - 70
         f3 = p.font(); f3.setPixelSize(10); f3.setBold(False); f3.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.4); p.setFont(f3)
+        if dark:
+            pill_top, pill_bot, pill_line = QColor("#4b4e4c"), QColor("#343735"), QColor("#000")
+        else:
+            pill_top, pill_bot, pill_line = QColor("#f2eedf"), QColor("#d6d1bd"), QColor("#a8a28c")
         for name, x in (("select", cx - 38), ("start", cx + 38)):
-            p.setPen(QPen(QColor("#a8a28c") if not dark else QColor("#000"), 1))
-            p.setBrush(QColor("#e8e4d4") if not dark else QColor("#3f4240"))
-            p.save()
-            p.translate(x, by)
-            p.rotate(-22)
-            p.drawRoundedRect(QRectF(-24, -8, 48, 16), 8, 8)
-            p.restore()
+            self._well_path(p, self._xpath(x, by, 62, 24, -22), body, edge, dark)
+            self._raised(p, self._xpath(x, by, 48, 16, -22), pill_top, pill_bot, pill_line, shadow=80, lit=110)
             p.setPen(label)
-            p.drawText(QRectF(x - 40, by + 12, 80, 16), Qt.AlignCenter, name.upper())
+            p.drawText(QRectF(x - 40, by + 22, 80, 16), Qt.AlignCenter, name.upper())
             self._hits[name] = QRectF(x - 28, by - 14, 56, 28)
 
     # ---- input ----
