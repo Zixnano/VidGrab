@@ -310,6 +310,13 @@ def guess_ext_from_head(url):
 
 _QUERY_NAME_KEYS = ("fn", "filename", "file", "name", "file_name")
 
+# "?format=jpg" / "?f=mp4" style extension hints (pbs.twimg.com and friends).
+# Anchored on purpose: "?format=json" must NOT match.
+_QUERY_FORMAT_KEYS = ("format", "f")
+_QUERY_FORMAT_RE = re.compile(
+    r"^(?:jpg|jpeg|png|webp|gif|avif|bmp|svg|tif|tiff|heic|heif|"
+    r"mp4|webm|mov|m4v|mkv|mp3|m4a|wav|flac|opus|ogg)$", re.I)
+
 
 def _filename_from_query(url):
     """Pick a filename out of a query string (fn=, filename=, ...).
@@ -328,6 +335,17 @@ def _filename_from_query(url):
             base = os.path.basename(v.replace("\\", "/"))
             if base and os.path.splitext(base)[1] and len(base) < 200:
                 return unquote(base)
+    # No usable name key: accept "format=jpg" when the URL path itself has
+    # no extension (https://pbs.twimg.com/media/ABC?format=jpg&name=large).
+    try:
+        path_base = unquote(os.path.basename(urlparse(url).path))
+    except ValueError:
+        path_base = ""
+    if path_base and not os.path.splitext(path_base)[1]:
+        for v in qs.get("format", []):
+            v = (v or "").strip().lower()
+            if _QUERY_FORMAT_RE.match(v):
+                return safe_filename(f"{path_base}.{v}")
     return ""
 
 
@@ -345,6 +363,34 @@ def guess_filename(url, content_disposition=None):
         path = ""
     name = os.path.basename(path) or "download"
     return safe_filename(unquote(name))
+
+
+_REDDIT_CDN_HOST_RE = re.compile(r"(^|\.)(v|packaged-media)\.redd\.it$", re.I)
+
+
+def preferred_stem(job):
+    """Title-derived filename stem for Reddit CDN downloads, else None.
+
+    Reddit's CDN names files m2-res_1280p.mp4 / DASH_720.mp4. When the job
+    carries the post's page_url (".../comments/<id>/<slug>/"), the slug is a
+    better stem. NOTE: jobs do not store page_url yet (new_job only derives
+    source_site from it), so this returns None until that field exists.
+    Nothing calls it yet."""
+    try:
+        host = urlparse(job.get("url") or "").hostname or ""
+        page = job.get("page_url")
+        if not page or not _REDDIT_CDN_HOST_RE.search(host):
+            return None
+        parts = [p for p in urlparse(page).path.split("/") if p]
+        if "comments" in parts:
+            i = parts.index("comments")
+            if len(parts) > i + 2:
+                slug = unquote(parts[i + 2]).replace("_", " ").strip()
+                if slug:
+                    return safe_filename(slug)
+    except Exception:
+        pass
+    return None
 
 
 def _unique_path(path):
@@ -410,6 +456,11 @@ def detect_type(url):
                              r"exe|msi|dmg|deb|rpm|apk|"
                              r"jpg|jpeg|png|gif|webp|avif|svg|bmp|ico)$",
                              (v or "").strip(), re.I):
+                    return "generic"
+        # "?format=jpg" / "?f=mp4": value is a bare extension (anchored).
+        for key in _QUERY_FORMAT_KEYS:
+            for v in qs.get(key, []):
+                if _QUERY_FORMAT_RE.match((v or "").strip()):
                     return "generic"
     except Exception:
         pass

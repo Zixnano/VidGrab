@@ -18,6 +18,20 @@ function fileName(url) {
   }
 }
 
+// Reddit's CDN names files m2-res_1280p.mp4 / DASH_720.mp4. For those hosts
+// use the tab title instead (same sanitizing as content.js sendChoice).
+function redditCdnName(url, tab) {
+  try {
+    if (!/(^|\.)(v|packaged-media)\.redd\.it$/i.test(new URL(url).hostname)) return undefined;
+    const title = tab && tab.title;
+    const ext = (new URL(url).pathname.match(/(\.(?:mp4|m4v|mov|webm|mkv|mp3|m4a|aac))$/i) || [""])[0];
+    if (!title || !ext) return undefined;
+    return title.replace(/[\\/:*?"<>|]/g, "_").slice(0, 80) + ext;
+  } catch (e) {
+    return undefined;
+  }
+}
+
 function extOf(url) {
   const m = url.match(/\.([a-z0-9]{1,5})(\?|#|$)/i);
   return m ? m[1].toLowerCase() : "";
@@ -272,8 +286,8 @@ function rowEl(it) {
     chrome.runtime.sendMessage(
       { type: "RELAY_DOWNLOAD", url: it.url, pageUrl: tab.url,
         tabId: tab.id,
-        filename: /\.(mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|flac|m3u8|mpd|pdf|zip|rar|7z|exe|msi|dmg)(\?|#|$)/i.test(it.url)
-          ? fileName(it.url) : undefined },
+        filename: redditCdnName(it.url, tab) || (/\.(mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|flac|m3u8|mpd|pdf|zip|rar|7z|exe|msi|dmg)(\?|#|$)/i.test(it.url)
+          ? fileName(it.url) : undefined) },
       (resp) => {
         bDl.textContent = "⬇";
         setStatus(resp && resp.ok ? `Sent ${fileName(it.url)} ✓`
@@ -325,8 +339,12 @@ function sendBatch(viaMerge) {
   setStatus(`Sending ${checked.length} item(s)…`);
   chrome.runtime.sendMessage(
     { type: "RELAY_BATCH",
-      items: checked.map(({ url, format_id, target_format }) =>
-        ({ url, format_id, target_format })),
+      items: checked.map((i) => {
+        const { url, format_id, target_format } = i;
+        const filename = redditCdnName(url, i.tabRef || currentTab);
+        return filename ? { url, format_id, target_format, filename }
+                        : { url, format_id, target_format };
+      }),
       pageUrl },
     (resp) => {
       setStatus(resp && resp.ok

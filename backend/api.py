@@ -44,7 +44,7 @@ TOKEN_PROTECTED_PATHS = {
     "/upload-token", "/redownload", "/show-add-dialog",
     "/clear-failed", "/queue-status", "/dup-check", "/favicon",
     "/update-status", "/update-skip", "/ytdlp-update", "/ytdlp-rollback",
-    "/reorder", "/theme",
+    "/reorder", "/theme", "/queue-running",
 }
 
 # Random per-launch key, embedded in the LAN web UI's action links so that
@@ -196,6 +196,7 @@ def show_add_dialog():
             download_playlist=data.get("download_playlist", False),
             page_url=data.get("page_url"),
         )
+        log(f"auto-queued {data.get('filename') or url} (skip_add_dialog)")
         return jsonify({"ok": True, "auto_queued": True, "job_id": jid,
                         "duplicate_of": dup_id})
     _fire_show_dialog_hooks({
@@ -813,7 +814,7 @@ def probe_head():
 def update_settings():
     data = request.get_json(force=True, silent=True) or {}
     for k, v in data.items():
-        if k == "api_token" or k not in STATE:
+        if k in ("api_token", "queue_running") or k not in STATE:
             continue
         # Dict-valued settings (e.g. per_category_dirs) are merged key-by-key
         # rather than replaced outright, so setting one category's override
@@ -824,6 +825,17 @@ def update_settings():
             STATE[k] = v
     save_settings()
     return jsonify({"ok": True})
+
+@app.route("/queue-running", methods=["POST"])
+def set_queue_running():
+    """Pause/resume the whole queue. /settings ignores queue_running so a
+    stray settings POST can't flip it; this is the one deliberate writer."""
+    data = request.get_json(force=True, silent=True) or {}
+    if "running" not in data:
+        return jsonify({"error": "missing running"}), 400
+    STATE["queue_running"] = bool(data["running"])
+    save_settings()
+    return jsonify({"ok": True, "queue_running": STATE["queue_running"]})
 
 @app.route("/theme", methods=["GET"])
 def theme():

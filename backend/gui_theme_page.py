@@ -3,10 +3,11 @@ optional fine-tune section. Pure UI. SettingsDialog creates one ThemePage
 and reads ThemePage.values() on Save. Nothing here touches the network or
 saves settings by itself."""
 import json
+import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRect, QRectF, QSize, QPoint, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import Qt, QRect, QRectF, QSize, QPoint, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton, QCheckBox, QColorDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QLabel, QLayout, QMessageBox, QPushButton, QSizePolicy, QToolButton,
@@ -14,8 +15,9 @@ from PySide6.QtWidgets import (
 )
 
 from gui_shell import SHELL_NAMES, SHELLS
-from palette import (PRESET_NAMES, THEME_PRESETS, contrast, luminance, mix,
+from palette import (DERIVED, PRESET_NAMES, THEME_PRESETS, contrast, luminance, mix,
                      resolve_palette)
+import settings as _settings
 
 ACCENT_SWATCHES = ["#26c6da", "#7c4dff", "#66bb6a", "#ffa726", "#ef5350",
                    "#42a5f5", "#ec407a", "#8ccf72", "#9aa09c"]
@@ -199,19 +201,23 @@ class MiniPreview(QWidget):
 
 
 class PresetTile(QAbstractButton):
-    def __init__(self, key, ring, label_color, parent=None):
+    def __init__(self, key, ring, label_color, parent=None, tokens=None, title=None):
         super().__init__(parent)
         self.key = key
         self.ring = ring
         self.label_color = label_color
+        # tokens/title are for tiles built from a theme file in the themes
+        # folder; the built-in presets leave both unset.
+        self._tokens = tokens
+        self._title = title or PRESET_NAMES.get(key, key)
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedSize(132, 86)
-        self.setToolTip(PRESET_NAMES.get(key, key))
-        self.setAccessibleName(PRESET_NAMES.get(key, key))
+        self.setToolTip(self._title)
+        self.setAccessibleName(self._title)
 
     def paintEvent(self, _e):
-        t = THEME_PRESETS[self.key]
+        t = self._tokens or THEME_PRESETS[self.key]
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(1.5, 1.5, self.width() - 3, 58)
@@ -233,9 +239,52 @@ class PresetTile(QAbstractButton):
         f.setBold(self.isChecked())
         p.setFont(f)
         p.setPen(QColor(self.label_color))
-        p.drawText(QRectF(0, 62, self.width(), 22), Qt.AlignCenter,
-                   PRESET_NAMES.get(self.key, self.key))
+        p.drawText(QRectF(4, 62, self.width() - 8, 22), Qt.AlignCenter,
+                   p.fontMetrics().elidedText(self._title, Qt.ElideRight, self.width() - 8))
         p.end()
+
+
+def _theme_from_dict(d):
+    """Normalize a theme file's JSON into a dict the page can preview and
+    apply, or None when it holds nothing usable. Accepts the Export format
+    (theme_preset / accent / theme_tokens / shell_*) and a flat file that is
+    just {"bg_base": "#...", ...}. Unknown keys and invalid colors are
+    dropped, so a bad file can never put junk into theme_tokens."""
+    if not isinstance(d, dict):
+        return None
+    base = THEME_PRESETS["amoled_black"]
+    allowed = set(base) | set(DERIVED)
+    non_color = {"radius", "radius_pill", "font", "font_mono"}
+
+    def clean(toks):
+        out = {}
+        for k, v in (toks or {}).items():
+            if k == "accent" or k not in allowed or not isinstance(v, str) or not v.strip():
+                continue
+            if k in non_color or QColor(v.strip()).isValid():
+                out[k] = v.strip()
+        return out
+
+    wrapped = "theme_preset" in d or "theme_tokens" in d
+    toks = clean(d.get("theme_tokens") if isinstance(d.get("theme_tokens"), dict) else {}) \
+        if wrapped else clean(d)
+    preset = d.get("theme_preset") if d.get("theme_preset") in PRESET_NAMES else "amoled_black"
+    acc = d.get("accent")
+    accent = acc.strip() if isinstance(acc, str) and QColor(acc.strip()).isValid() else None
+    if not toks and not accent and not (wrapped and d.get("theme_preset") in PRESET_NAMES):
+        return None
+    accent = accent or THEME_PRESETS[preset]["accent"]
+    out = {"preset": preset, "accent": accent, "tokens": toks,
+           "pal": resolve_palette({"theme_preset": preset, "accent": accent,
+                                   "theme_tokens": dict(toks)})}
+    for k in ("shell_enabled", "shell_backlight", "frame_cream"):
+        if k in d:
+            out[k] = bool(d[k])
+    if d.get("shell_color") in SHELLS:
+        out["shell_color"] = d["shell_color"]
+    if isinstance(d.get("shell_colors"), dict):
+        out["shell_colors"] = ThemePage._clean_shell_colors(d["shell_colors"])
+    return out
 
 
 class Swatch(QAbstractButton):
@@ -337,6 +386,36 @@ class ThemePage(QWidget):
         l1.addWidget(flow_host)
         cl.addWidget(c1)
 
+        # Themes folder: every .json in <home>/themes shows up as a tile.
+        # Clicking a tile previews it in the Preview card only; Apply loads
+        # it into this page, and Save (as always) is what writes settings.
+        cf, lf = _card("Theme folder", "...")
+        self._folder_hint = cf.findChildren(QLabel, "CardHint")[0]
+        ff_host = QWidget()
+        ff_host.setObjectName("Plain")
+        self._ff = FlowLayout(ff_host, 10)
+        lf.addWidget(ff_host)
+        self._file_entries = []
+        self._file_tiles = []
+        self._file_sel = None
+        self._file_empty = QLabel("No themes yet. Export one, or drop .json files into the folder.")
+        self._file_empty.setObjectName("CardHint")
+        self._file_empty.setWordWrap(True)
+        lf.addWidget(self._file_empty)
+        frow = QHBoxLayout()
+        self.file_apply = QPushButton("Apply")
+        self.file_apply.setEnabled(False)
+        self.file_apply.clicked.connect(self._apply_file_theme)
+        frow.addWidget(self.file_apply)
+        for text, fn in (("Refresh", self._scan_themes), ("Open folder", self._open_themes_dir),
+                         ("Import folder\u2026", self._import_folder)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            frow.addWidget(b)
+        frow.addStretch(1)
+        lf.addLayout(frow)
+        cl.addWidget(cf)
+
         c2, l2 = _card("Accent color", "Used for buttons, progress bars and highlights.")
         sw_host = QWidget()
         sw_host.setObjectName("Plain")
@@ -437,6 +516,8 @@ class ThemePage(QWidget):
         cl.addLayout(row)
         cl.addStretch(1)
 
+        self.changed.connect(self._clear_file_selection)
+        self._scan_themes()
         self._wide = None
         self._relayout(self.width() or 600)
         self.fine_toggle.setChecked(bool(self._ov))
@@ -657,10 +738,12 @@ class ThemePage(QWidget):
         self._pick_preset("amoled_black")
 
     def _export(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export theme", "theme.json", "JSON (*.json)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export theme", str(self._themes_dir() / "theme.json"), "JSON (*.json)")
         if path:
             Path(path).write_text(json.dumps(self.values(), indent=2, sort_keys=True),
                                   encoding="utf-8")
+            self._scan_themes()
 
     def _import(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import theme", "", "JSON (*.json)")
@@ -692,6 +775,161 @@ class ThemePage(QWidget):
             self._refresh()
         except Exception as e:
             QMessageBox.warning(self, "Import failed", str(e))
+
+    # ---- themes folder (browse, preview, apply, bulk import) ----
+    @staticmethod
+    def _themes_dir():
+        return Path(_settings.HOME) / "themes"
+
+    def _scan_themes(self):
+        """(Re)build the tiles from the .json files in the themes folder."""
+        d = self._themes_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        sel_path = self._file_sel["path"] if self._file_sel else None
+        while self._ff.count():
+            it = self._ff.takeAt(0)
+            w = it.widget() if it is not None else None
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._file_entries, self._file_tiles, self._file_sel = [], [], None
+        try:
+            files = sorted((p for p in d.glob("*.json") if p.is_file()),
+                           key=lambda p: p.name.lower())[:200]
+        except OSError:
+            files = []
+        for p in files:
+            try:
+                if p.stat().st_size > 256 * 1024:
+                    continue
+                raw = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            e = _theme_from_dict(raw)
+            if e is None:
+                continue
+            nm = raw.get("name") if isinstance(raw.get("name"), str) and raw["name"].strip() else p.stem
+            e["name"], e["path"] = nm.strip(), str(p)
+            idx = len(self._file_entries)
+            tile = PresetTile("amoled_black", self._ring, self._label,
+                              tokens=e["pal"], title=e["name"])
+            tile.clicked.connect(lambda _=False, i=idx: self._select_file_tile(i))
+            self._ff.addWidget(tile)
+            self._file_entries.append(e)
+            self._file_tiles.append(tile)
+            if e["path"] == sel_path:
+                tile.setChecked(True)
+                self._file_sel = e
+        self._file_empty.setVisible(not self._file_entries)
+        self.file_apply.setEnabled(self._file_sel is not None)
+        self._folder_hint.setText(f"{d}  ({len(self._file_entries)} theme"
+                                  f"{'' if len(self._file_entries) == 1 else 's'}). "
+                                  "Click a tile to preview it, then Apply.")
+        self._ff.invalidate()
+
+    def _select_file_tile(self, idx):
+        e = self._file_entries[idx]
+        if self._file_sel is e:                      # click again = cancel the preview
+            self._clear_file_selection()
+            self._refresh()
+            return
+        self._file_sel = e
+        for i, tile in enumerate(self._file_tiles):
+            tile.setChecked(i == idx)
+            tile.update()
+        self.preview.set_tokens(e["pal"])            # preview only: nothing is stored
+        self.file_apply.setEnabled(True)
+        self._folder_hint.setText(f"Previewing {e['name']}. Press Apply to use it "
+                                  "(Save in Settings writes it), or click the tile again to cancel.")
+
+    def _clear_file_selection(self):
+        if self._file_sel is None and not any(t.isChecked() for t in self._file_tiles):
+            return
+        self._file_sel = None
+        for tile in self._file_tiles:
+            tile.setChecked(False)
+            tile.update()
+        self.file_apply.setEnabled(False)
+        self._folder_hint.setText(f"{self._themes_dir()}  ({len(self._file_entries)} theme"
+                                  f"{'' if len(self._file_entries) == 1 else 's'}). "
+                                  "Click a tile to preview it, then Apply.")
+
+    def _apply_file_theme(self):
+        e = self._file_sel
+        if not e:
+            return
+        self._preset = e["preset"]
+        self._accent = e["accent"]
+        self._ov = dict(e["tokens"])
+        for k, tile in self._tiles.items():
+            tile.setChecked(k == self._preset)
+            tile.update()
+        self.fine_toggle.setChecked(bool(self._ov))
+        if "shell_enabled" in e:
+            self._shell_on = e["shell_enabled"]
+            self.shell_check.setChecked(self._shell_on)
+        if "shell_color" in e:
+            self._shell_color = e["shell_color"]
+        if "shell_backlight" in e:
+            self._backlight = e["shell_backlight"]
+            self.backlight_check.setChecked(self._backlight)
+        if "frame_cream" in e:
+            self._frame_cream = e["frame_cream"]
+            self.frame_check.setChecked(self._frame_cream)
+        if "shell_colors" in e:
+            self._shell_ov = dict(e["shell_colors"])
+        self._refresh()
+
+    def _open_themes_dir(self):
+        d = self._themes_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(d)))
+
+    def _import_folder(self):
+        src = QFileDialog.getExistingDirectory(self, "Import themes from folder", "")
+        if not src:
+            return
+        dest = self._themes_dir()
+        added = skipped = 0
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            same = Path(src).resolve() == dest.resolve()
+            files = sorted(p for p in Path(src).glob("*.json") if p.is_file())[:500]
+        except OSError as e:
+            QMessageBox.warning(self, "Import failed", str(e))
+            return
+        if not same:
+            for p in files:
+                try:
+                    if p.stat().st_size > 256 * 1024:
+                        skipped += 1
+                        continue
+                    if _theme_from_dict(json.loads(p.read_text(encoding="utf-8"))) is None:
+                        skipped += 1
+                        continue
+                    target, n = dest / p.name, 2
+                    while target.exists():            # never overwrite an existing theme
+                        target = dest / f"{p.stem} ({n}){p.suffix}"
+                        n += 1
+                    shutil.copy2(p, target)
+                    added += 1
+                except (OSError, ValueError):
+                    skipped += 1
+        self._scan_themes()
+        if same:
+            QMessageBox.information(self, "Import folder",
+                                    "That is already the themes folder. Tiles refreshed.")
+        else:
+            QMessageBox.information(self, "Import folder",
+                                    f"Added {added} theme(s) to the themes folder"
+                                    + (f"; skipped {skipped} file(s) that were not valid themes."
+                                       if skipped else "."))
 
     def values(self):
         return {"theme_preset": self._preset, "accent": self._accent,

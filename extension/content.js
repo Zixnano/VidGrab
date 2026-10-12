@@ -609,13 +609,18 @@
     if (mode === "element") {
       try {
         stream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
-      } catch (e) { stream = null; }
+      } catch (e) { stream = null; console.debug("[VG] captureStream threw:", e); }
+      console.debug("[VG] captureStream tracks:",
+                    stream ? stream.getVideoTracks().length : "null");
       if (stream && stream.getVideoTracks().length === 0) {
         stream.getTracks().forEach((t) => t.stop());
         stream = null;
       }
       if (!stream) {
         // R.2: element capture unavailable (DRM / no tracks) -> offer tab.
+        console.debug("[VG] falling back to tab: element capture gave no usable stream;",
+                      "captureStream supported:", !!(video.captureStream || video.mozCaptureStream),
+                      "readyState:", video.readyState, "src:", String(video.currentSrc).slice(0, 60));
         recNotify("Video Grabber", "Element capture failed — falling back to tab capture.");
         return startRecording(video, overlay, "tab");
       }

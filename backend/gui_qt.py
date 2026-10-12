@@ -544,6 +544,11 @@ class ApiClient:
         # show them; swallowing here made those handlers dead code.
         self._req("POST", "/settings", json={key: value})
 
+    def set_queue_running(self, running):
+        # queue_running is ignored by /settings on purpose; this route is
+        # the only writer.
+        self._req("POST", "/queue-running", json={"running": bool(running)})
+
 
 # Which table columns each job field feeds (see DownloadModel.data). Used by
 # update_items() so a progress tick repaints only the columns that changed.
@@ -2175,8 +2180,10 @@ class SettingsDialog(QDialog):
     def _check_engine_updates(self):
         """Manual version check: reports via dialog + log; never auto-updates."""
         import json as _json
+        import shutil as _shutil
         import subprocess as _sp
         from settings import log
+        from ytdlp_update import version_key
         lines = []
         for name in ("yt-dlp", "streamlink"):
             try:
@@ -2184,6 +2191,9 @@ class SettingsDialog(QDialog):
                     import yt_dlp
                     local = yt_dlp.version.__version__
                 else:
+                    if _shutil.which("streamlink") is None:
+                        lines.append("streamlink: not found on PATH (downloads will use another engine)")
+                        continue
                     r = _sp.run(["streamlink", "--version"],
                                 capture_output=True, text=True, timeout=15)
                     local = (r.stdout or r.stderr).strip().splitlines()[0]
@@ -2194,7 +2204,7 @@ class SettingsDialog(QDialog):
                     latest = p.get("info", {}).get("version")
                 except Exception:
                     pass
-                if latest and latest != local:
+                if latest and version_key(latest) != version_key(local):
                     lines.append(f"{name}: local {local}, latest {latest} — update available")
                 else:
                     lines.append(f"{name}: {local}" + ("" if latest else " (latest unknown)"))
@@ -3392,6 +3402,18 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_new_job(self, job):
+        # Silent auto-queue (skip_add_dialog) gives no other feedback when the
+        # window is minimized or in the background: one tray toast, at most
+        # one per 3 seconds.
+        try:
+            if (self._tray and (self.isMinimized() or not self.isActiveWindow())
+                    and time.time() - getattr(self, "_last_queued_toast", 0.0) >= 3.0):
+                self._last_queued_toast = time.time()
+                name = (job or {}).get("filename") or (job or {}).get("url") or "download"
+                self._tray.showMessage("Video Grabber", f"Queued {name}",
+                                       QSystemTrayIcon.Information, 3000)
+        except Exception:
+            pass
         if not self._gui_settings.get("force_on_top", True):
             return
         # Already focused — raising would only cause a flicker.
@@ -3514,6 +3536,18 @@ class MainWindow(QMainWindow):
         """Wrap the main view in the handheld shell, or unwrap it, per the
         shell_enabled / shell_color settings. Safe to call repeatedly."""
         st = load_settings()
+        sig = None
+        if st.get("shell_enabled"):
+            # The shell bakes the theme accent in at construction, so a
+            # changed accent also counts as "no longer matches".
+            sig = (st.get("shell_color", "cream"), resolve_palette(st)["accent"])
+            if self.shell is not None and getattr(self, "_shell_sig", None) == sig:
+                # Same shell: just refresh the parts that have setters.
+                self.shell.set_overrides(st.get("shell_colors"))
+                self.shell.set_backlight(bool(st.get("shell_backlight", True)))
+                self._root.show()
+                self._apply_toolbar_text()
+                return
         old = self.takeCentralWidget()
         if old is not None and old is not self._root:
             old.layout().removeWidget(self._root)
@@ -3527,8 +3561,10 @@ class MainWindow(QMainWindow):
             self.shell.dpad.connect(self._shell_dpad)
             self.shell.button.connect(self._shell_button)
             self.setCentralWidget(self.shell)
+            self._shell_sig = sig
         else:
             self.shell = None
+            self._shell_sig = None
             self.setCentralWidget(self._root)
         self._root.show()
         self._apply_toolbar_text()
@@ -3570,11 +3606,11 @@ class MainWindow(QMainWindow):
         self.shell.set_backlight(on)
 
     def toggle_queue(self):
-        """Flip the dispatcher's queue_running flag via /settings."""
+        """Flip the dispatcher's queue_running flag via /queue-running."""
         running = not bool(load_settings().get("queue_running", True))
         if self.api:
             try:
-                self.api.save_setting("queue_running", running)
+                self.api.set_queue_running(running)
             except Exception as e:
                 QMessageBox.warning(self, "Error", str(e))
         # Pass the value we just set — re-reading from disk here can race
