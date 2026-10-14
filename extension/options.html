@@ -49,6 +49,13 @@
     </div>
     <p class="hint">Off by default. When on, clicking any downloadable link in Chrome cancels the browser's own download and hands the file to Video Grabber instead. If another download manager's extension (IDM, for example) is also installed and enabled, it may grab the download first.</p>
   </div>
+  <div class="card">
+    <div class="checkbox-row">
+      <input type="checkbox" id="blobHookEnabled" />
+      <label for="blobHookEnabled">Catch in-page (blob) downloads on claude.ai</label>
+    </div>
+    <p class="hint">On by default, and only active while the option above is on. Files the page builds itself are sent to Video Grabber instead of the browser. If the app can't take the file, the browser saves it as usual. Turning this off takes effect on the next click. After updating the extension, reload open claude.ai tabs.</p>
+  </div>
   <script src="theme.js"></script>
   <script src="options.js"></script>
 </body>

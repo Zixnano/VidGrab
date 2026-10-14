@@ -21,7 +21,7 @@ from engines import clear_youtube_cooldown
 from settings import MAX_UPLOAD_BYTES
 import queue
 import html
-from settings import APP_PORT, APP_VERSION, STATE, save_settings, safe_filename, guess_filename, _unique_path, _dest_for, stat_for, disk_usage_for
+from settings import APP_PORT, APP_VERSION, STATE, save_settings, safe_filename, guess_filename, _unique_path, _dest_for, stat_for, disk_usage_for, category_for
 from jobs import reorder_job, transition, repair_status, JobEvent, JobPhase, set_phase, JOBS, new_job, save_jobs_snapshot, _fire_new_job_hooks, _fire_show_dialog_hooks
 
 from logging_setup import log, LOG_QUEUE
@@ -290,11 +290,19 @@ def _job_action(job_id, action):
         else:
             transition(job, JobEvent.RESUME)
     elif action == "stop":
+        w = _WORKERS.get(job_id)
         if job["status"] == "queued":
             # No worker thread exists yet to observe stop_evt, and the
             # dispatcher clears it when it starts the job — so the old
             # set() was a silent no-op and the job started anyway. Flip the
             # status instead (transition() also sets stop_evt).
+            transition(job, JobEvent.STOP)
+        elif (job["status"] == "paused"
+                and not (w is not None and w.is_alive())):
+            # A paused generic job's worker already exited when it paused (and
+            # after a restart there is no worker at all), so nothing would
+            # ever observe stop_evt and the row stayed "paused" forever. Move
+            # it to stopped ourselves (transition() also sets stop_evt).
             transition(job, JobEvent.STOP)
         else:
             job["stop_evt"].set()
@@ -329,6 +337,18 @@ def redownload(job_id):
         # window to observe the signal, so the old thread can keep writing
         # to the same .part file the freshly-dispatched job also writes to.
         return jsonify({"error": "job is actively downloading — stop it first"}), 400
+    w = _WORKERS.get(job_id)
+    if (job["status"] == "paused" and job.get("type") != "generic"
+            and w is not None and w.is_alive()):
+        # A paused yt-dlp job's worker is still parked in progress_cb. The
+        # set()/clear() below gives it no window to see a stop, and the
+        # dispatcher then started a SECOND yt-dlp on the same files. Stop the
+        # parked worker and wait for it to exit before cleaning anything up.
+        job["stop_evt"].set()
+        job["pause_evt"].clear()
+        w.join(timeout=5)
+        if w.is_alive():
+            return jsonify({"error": "job is still stopping, try again in a moment"}), 409
     if job["status"] == "done":
         # RESUME isn't a legal transition from DONE: this route used to zero
         # size_done/size_total below and THEN raise (HTTP 500), leaving a
@@ -476,46 +496,84 @@ def probe_formats():
 def upload_token():
     return jsonify({"nonce": _issue_upload_nonce()})
 
+# Extensions /upload treats as media: repaired (ffmpeg) and validated
+# (ffprobe) like a screen recording. Anything else (zip, js, pdf, ...) from
+# the blob-download hook is saved to its category folder and registered as-is.
+_MEDIA_UPLOAD_EXTS = {".webm", ".mp4", ".mkv", ".mov", ".m4v", ".avi", ".flv"}
+
+
 @app.route("/upload", methods=["POST"])
 def upload():
-    """Direct handoff for extension screen recordings (multipart, one file)."""
+    """Direct handoff for extension uploads (multipart, one file): screen
+    recordings (media: repaired and validated) and arbitrary files from the
+    blob-download hook (registered as-is, no ffmpeg/ffprobe)."""
     if request.content_length and request.content_length > MAX_UPLOAD_BYTES:
-        return jsonify({"error": "file too large (max 500 MB)"}), 413
+        return jsonify({"error": f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)"}), 413
     f = request.files.get("file")
     if not f:
         return jsonify({"error": "missing 'file' field"}), 400
+    # An upload with no name at all is a recording. A NAMED upload keeps its
+    # name as-is: a blob download called "README" must not become .webm, it
+    # would then be probed as media and fail.
     filename = safe_filename(f.filename or "recording.webm")
-    if not os.path.splitext(filename)[1]:
-        filename += ".webm"
-    dest_dir = Path(STATE["output_dir"]) / "Video"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / filename
-    f.save(str(dest))
+    ext = os.path.splitext(filename)[1].lower()
+    _is_media = ext in _MEDIA_UPLOAD_EXTS
+    category = "Video" if _is_media else category_for(filename)
+    # _dest_for resolves the folder exactly like downloads do (per-category
+    # folders, sanitised names, path-length cap).
+    dest = _dest_for({"category": category, "filename": filename})
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dest = _unique_path(dest)   # never overwrite an existing file
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 409
+    try:
+        f.save(str(dest))
+    except Exception as e:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        log(f"upload save failed: {dest.name}: {e}")
+        return jsonify({"error": f"couldn't save upload: {e}"}), 500
     log(f"recording upload: {dest.name} ({dest.stat().st_size} bytes)")
 
-    dest = _repair_recording(dest)
+    if _is_media:
+        dest = _repair_recording(dest)
 
     jid = new_job(url=f"upload:///{dest.name}", filename=dest.name,
-                  category="Video", job_type="generic", defer=True)
+                  category=category, job_type="generic", defer=True)
     job = JOBS[jid]
+    # The file is already on disk under this name in this folder: new_job's
+    # naming cleanup and per-site rules must not point the job anywhere else.
+    job["filename"] = dest.name
+    job["category"] = category
+    if job.get("status") == "skipped":
+        # File type disabled in Options: the file is already saved, so keep
+        # it. A skipped job has no COMPLETE transition; reopen it first.
+        repair_status(job, "held")
 
-    ok, reason = _probe_recording(dest)
-    if not ok:
-        transition(job, JobEvent.FAIL)
-        job["error"] = f"corrupt recording: {reason}"
-        log(f"uploaded recording is corrupt: {reason}")
-        save_jobs_snapshot()
-        _fire_new_job_hooks(job)
-        return jsonify({"ok": False, "error": f"corrupt recording: {reason}"}), 400
-
-    log(f"recording validated: {dest.name} ({dest.stat().st_size} bytes)")
+    if _is_media:
+        ok, reason = _probe_recording(dest)
+        if not ok:
+            transition(job, JobEvent.FAIL)
+            job["error"] = f"corrupt recording: {reason}"
+            log(f"uploaded recording is corrupt: {reason}")
+            save_jobs_snapshot()
+            _fire_new_job_hooks(job)
+            return jsonify({"ok": False, "error": f"corrupt recording: {reason}"}), 400
+        log(f"recording validated: {dest.name} ({dest.stat().st_size} bytes)")
+    else:
+        log(f"upload registered as-is: {dest.name} ({category}, {dest.stat().st_size} bytes)")
     transition(job, JobEvent.COMPLETE)
     job["size_total"] = job["size_done"] = dest.stat().st_size
-    dest = maybe_convert_to_mp4(job, dest)  # .webm → .mp4 when auto_mp4 is on
+    if _is_media:
+        dest = maybe_convert_to_mp4(job, dest)  # .webm → .mp4 when auto_mp4 is on
     job["completed_ts"] = time.time()
     save_jobs_snapshot()
     _fire_new_job_hooks(job)
-    return jsonify({"ok": True, "job_id": jid})
+    # "category" lets the extension say where the file went ("Sent to Compressed").
+    return jsonify({"ok": True, "job_id": jid, "category": category})
 
 @app.route("/stats", methods=["GET"])
 def stats():
@@ -814,6 +872,10 @@ def probe_head():
 def update_settings():
     data = request.get_json(force=True, silent=True) or {}
     for k, v in data.items():
+        if k == "queue_running":
+            # Deliberately ignored here (see /queue-running); logged so the
+            # log shows if anything tries to flip it through this route.
+            log("settings: ignoring queue_running write (use /queue-running)")
         if k in ("api_token", "queue_running") or k not in STATE:
             continue
         # Dict-valued settings (e.g. per_category_dirs) are merged key-by-key

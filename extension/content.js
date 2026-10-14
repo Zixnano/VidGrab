@@ -11,6 +11,17 @@
 //     it live with MediaRecorder. The button switches to "Record" for those.
 
 (() => {
+  // v4.1.1: never run on the browser's own internal pages (Vivaldi's
+  // startpage/welcome/sync, extension pages, devtools). all_frames:true
+  // matches some of these as about:blank/data: iframes, and scanning them
+  // every 2s froze Vivaldi's UI on startup.
+  if (location.protocol === "chrome-extension:" ||
+      location.protocol === "vivaldi:" ||
+      location.protocol === "about:" ||
+      location.protocol === "devtools:") {
+    return;
+  }
+
   // Theme colors copied from the app (see background.js refreshTheme).
   let TH = { bg_base: "#0a0a0f", bg_elevated: "#1a1a24", border_hi: "#33333f", text: "#e6e6eb",
              text_muted: "#8a8a95", accent: "#26c6da", success: "#4caf50", error: "#ef5350",
@@ -29,7 +40,7 @@
   // ---- v5: per-site on/off switch and per-site quality memory -------------
   const SITE = location.hostname.replace(/^www\./, "").toLowerCase();
   let siteDisabled = false;
-  const LIVE = [];            // {video, wrap} for every pill we created
+  const LIVE = [];            // {video, overlay} for every pill we created
   let lastQuality = {};       // host -> {res: "1920x1080"}
 
   try {
@@ -52,11 +63,12 @@
   } catch (e) { /* extension context gone: pills simply stay enabled */ }
 
   function removeAllPills() {
-    while (LIVE.length) {
-      const { video, wrap } = LIVE.pop();
-      try { wrap.remove(); } catch (e) {}
-      HANDLED.delete(video);
+    // v4.1.1: full teardown via each pill's cleanup() — wrap.remove() alone
+    // leaked the pill's scroll/resize listeners and its ResizeObserver.
+    for (const entry of LIVE.slice()) {
+      try { entry.overlay.cleanup(); } catch (e) {}
     }
+    LIVE.length = 0;
   }
 
   function rememberQuality(f) {
@@ -271,7 +283,7 @@
       DISMISSED.add(video);
       // 12.4: fade out, then remove (close).
       wrap.style.opacity = "0";
-      setTimeout(() => wrap.remove(), 150);
+      setTimeout(() => cleanup(), 150);
     });
 
     const menu = document.createElement("div");
@@ -319,6 +331,20 @@
     const ro = new ResizeObserver(reposition);
     ro.observe(video);
 
+    // v4.1.1: full teardown — remove the pill's scroll/resize listeners,
+    // disconnect its ResizeObserver, detach the DOM node, and unregister
+    // it from HANDLED/LIVE. Invoked from the close button, removeAllPills,
+    // and the detached-video sweep. Safe to call twice.
+    function cleanup() {
+      window.removeEventListener("scroll", reposition, true);
+      window.removeEventListener("resize", reposition);
+      try { ro.disconnect(); } catch (e) {}
+      HANDLED.delete(video);
+      const idx = LIVE.findIndex((entry) => entry.video === video);
+      if (idx >= 0) LIVE.splice(idx, 1);
+      wrap.remove();
+    }
+
     // ---- drag to reposition (module-level delegated handlers; see _drag) ----
     wrap.style.cursor = "grab";
     wrap.addEventListener("mousedown", (e) => {
@@ -341,7 +367,7 @@
       position();
     });
 
-    return { wrap, btn, label, icon, menu, position };
+    return { wrap, btn, label, icon, menu, position, cleanup };
   }
 
   // v5: tell the user when a send was a repeat of something already queued.
@@ -349,9 +375,33 @@
     return resp && resp.duplicate_of ? "Sent ✓ (already in your list)" : fallback;
   }
 
+  // Maps a failed relay response (or a chrome.runtime.lastError message) to a
+  // pill label that says what actually went wrong.
+  function failLabel(resp, lastErrMsg) {
+    if (lastErrMsg) {
+      if (/could not establish connection|receiving end does not exist|context invalidated|message port closed/i.test(lastErrMsg)) {
+        return "Extension reloading — try again";
+      }
+      return "Extension error";
+    }
+    const err = resp && resp.error ? String(resp.error) : "";
+    if (!err) return "Failed — no response";
+    if (/not paired/i.test(err)) return "Not paired — open extension Options";
+    if (/isn't running|failed to fetch|networkerror|econnrefused|load failed|network request failed/i.test(err)) {
+      return "App not running";
+    }
+    return err.length > 40 ? err.slice(0, 39) + "…" : err;
+  }
+
   function setLabel(overlay, text, color) {
     overlay.label.textContent = text;
     if (color) overlay.icon.style.color = color;
+  }
+
+  // E1: put the pill back to its default label. wire() gives each overlay a
+  // defaultLabel() that adds the cached best quality ("Download 1080p ▾").
+  function restoreLabel(overlay) {
+    setLabel(overlay, overlay.defaultLabel ? overlay.defaultLabel() : "Download ▾", TH.accent);
   }
 
   // ---------- format-picker helpers ----------
@@ -388,6 +438,27 @@
 
   // Probe results cached per URL so reopening the menu doesn't re-hit the app.
   const FORMAT_CACHE = new Map();
+  // E1: the resolved (successful) probe response per URL, so the pill label
+  // can read it synchronously. Filled by probeFormatsCached; never filled by
+  // anything that starts a probe just for the label.
+  const FORMAT_RESULTS = new Map();
+
+  // Best quality in a cached probe: "1080p" for video, the extension in caps
+  // ("MP3") when the list is audio-only, "" when nothing is cached.
+  function qualityHint(url) {
+    const data = url && FORMAT_RESULTS.get(url);
+    const formats = data && data.formats;
+    if (!formats || !formats.length) return "";
+    let best = 0;
+    for (const f of formats) {
+      const m = /(\d+)\s*x\s*(\d+)/.exec(f.resolution || "");
+      // Short side: a 1080x1920 portrait clip is still "1080p".
+      if (m) best = Math.max(best, Math.min(+m[1], +m[2]));
+    }
+    if (best) return best + "p";
+    const audio = formats.find((f) => f.ext);
+    return audio ? String(audio.ext).toUpperCase() : "";
+  }
   function probeFormatsCached(url, pageUrl) {
     if (!url) return Promise.resolve(null);
     if (!FORMAT_CACHE.has(url)) {
@@ -397,6 +468,8 @@
             // Don't cache failures — the app may just be starting up.
             if (chrome.runtime.lastError || !resp || resp.ok === false) {
               FORMAT_CACHE.delete(url);
+            } else if (resp.formats && resp.formats.length) {
+              FORMAT_RESULTS.set(url, resp);
             }
             resolve(chrome.runtime.lastError ? null : resp);
           });
@@ -482,14 +555,14 @@
       },
       (resp) => {
         if (chrome.runtime.lastError) {
-          setLabel(overlay, "Extension error", TH.error);
+          setLabel(overlay, failLabel(null, chrome.runtime.lastError.message), TH.error);
           return;
         }
         if (resp && resp.ok) {
           setLabel(overlay, sentLabel(resp, "Sent to app ✓"), TH.accent);
           setTimeout(() => setLabel(overlay, "Send page URL to Grabber", TH.info), 2500);
         } else {
-          setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", TH.error);
+          setLabel(overlay, failLabel(resp), TH.error);
         }
       }
     );
@@ -752,8 +825,14 @@
     HANDLED.add(video);
 
     const overlay = makeOverlay(video);
-    LIVE.push({ video, wrap: overlay.wrap });
+    LIVE.push({ video, overlay });
     const isBlob = () => (video.currentSrc || "").startsWith("blob:");
+    // E1: "Download 1080p ▾" once a format probe for this source is cached.
+    // Read-only: this never starts a probe to fill the label.
+    overlay.defaultLabel = () => {
+      const hint = (isBlob() || isMseOnlySite()) ? "" : qualityHint(video.currentSrc);
+      return hint ? `Download ${hint} ▾` : "Download ▾";
+    };
     let menuOpen = false;
     let menuSeq = 0;
 
@@ -824,16 +903,40 @@
       };
       chrome.runtime.sendMessage(payload, (resp) => {
         if (chrome.runtime.lastError) {
-          setLabel(overlay, "Extension error", TH.error);
+          setLabel(overlay, failLabel(null, chrome.runtime.lastError.message), TH.error);
           return;
         }
         if (resp && resp.ok) {
           setLabel(overlay, sentLabel(resp, resp.auto_queued ? "Queued ✓" : "Sent to app ✓"), TH.accent);
-          setTimeout(() => setLabel(overlay, "Download ▾", TH.accent), 2500);
+          setTimeout(() => restoreLabel(overlay), 2500);
         } else {
-          setLabel(overlay, (resp && resp.error) || "Failed — is the app running?", TH.error);
+          setLabel(overlay, failLabel(resp), TH.error);
         }
       });
+    }
+
+    // E2: copy to the clipboard, falling back to execCommand where a page's
+    // permissions policy blocks navigator.clipboard.
+    function copyText(text) {
+      const legacy = () => {
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0;";
+          document.documentElement.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand("copy");
+          ta.remove();
+          return Promise.resolve(ok);
+        } catch (e) {
+          return Promise.resolve(false);
+        }
+      };
+      try {
+        return navigator.clipboard.writeText(text).then(() => true, legacy);
+      } catch (e) {
+        return legacy();
+      }
     }
 
     function toggleMenu() {
@@ -846,6 +949,20 @@
       const blob = isBlob();
       const mse = isMseOnlySite();
       addMenuItem(menu, streamInfo(video), { header: true });
+
+      // E2: "Copy direct URL" appears only when the sniffer has a candidate
+      // for this tab. Added right under the stream info once it answers.
+      querySniffedVideos((best) => {
+        if (!best || !best.url || seq !== menuSeq || !menuOpen) return;
+        const copyItem = addMenuItem(menu, "Copy direct URL", {}, () => {
+          copyText(best.url).then((ok) => {
+            copyItem.textContent = ok ? "Copied ✓" : "Copy failed";
+            setTimeout(() => { copyItem.textContent = "Copy direct URL"; }, 2000);
+          });
+        });
+        menu.insertBefore(copyItem, menu.children[1] || null);
+        placeMenu();
+      });
 
     if (isPlaylistUrl(location.href)) {
       // On YouTube (and any extractor site), video.currentSrc is a blob:
@@ -931,17 +1048,16 @@
                       target_format: tf,
                     }, (resp) => {
                       if (chrome.runtime.lastError) {
-                        setLabel(overlay, "Extension error", TH.error);
+                        setLabel(overlay, failLabel(null, chrome.runtime.lastError.message), TH.error);
                         return;
                       }
                       if (resp && resp.ok) {
                         setLabel(overlay,
                           sentLabel(resp, resp.auto_queued ? "Queued ✓" : "Sent to app ✓"),
                           TH.accent);
-                        setTimeout(() => setLabel(overlay, "Download ▾", TH.accent), 2500);
+                        setTimeout(() => restoreLabel(overlay), 2500);
                       } else {
-                        setLabel(overlay,
-                          (resp && resp.error) || "Failed", TH.error);
+                        setLabel(overlay, failLabel(resp), TH.error);
                       }
                     });
                   });
@@ -989,6 +1105,9 @@
       document.addEventListener("click", onDocClick, true);
 
       probeFormatsCached(video.currentSrc).then((data) => {
+        // E1: the result is cached now, so the pill can show the best quality
+        // (only if the label is still the default one, not mid-send).
+        if (/^Download/.test(overlay.label.textContent)) restoreLabel(overlay);
         if (seq !== menuSeq || !menuOpen) return; // stale probe or menu closed
         loadingEl.remove();
         // Best quality first: direct files stay as-is, page URLs default mp4.
@@ -1025,7 +1144,7 @@
       if (isBlob()) {
         setLabel(overlay, "Record this video ▾", TH.error);
       } else {
-        setLabel(overlay, "Download ▾", TH.accent);
+        restoreLabel(overlay);
       }
     };
     refresh();
@@ -1052,6 +1171,20 @@
     });
   }
 
+  // v4.1.1: light scan — <video> elements only, no shadow-root walk.
+  // The interval calls this; the MutationObserver calls the full scan().
+  function scanLight(root = document) {
+    root.querySelectorAll("video").forEach(wire);
+    // SPA players (X/Twitter, Reddit feeds) rebuild <video> elements on
+    // every clip transition: drop pills whose video left the DOM so their
+    // listeners and ResizeObservers don't accumulate forever.
+    for (const entry of LIVE.slice()) {
+      if (!entry.video.isConnected) {
+        try { entry.overlay.cleanup(); } catch (e) {}
+      }
+    }
+  }
+
   function scan(root = document) {
     root.querySelectorAll("video").forEach(wire);
     // Reddit (and an increasing number of SPA players) render <video>
@@ -1059,7 +1192,7 @@
     // Walk every element's shadow root recursively and scan inside it.
     // Only OPEN roots are reachable (el.shadowRoot is null for closed
     // ones) — those are invisible by design and out of scope. wire() is
-    // guarded by HANDLED, so re-walking on the 2s poll is cheap no-op.
+    // guarded by HANDLED, so re-walking on the 5s poll is cheap no-op.
     root.querySelectorAll("*").forEach((el) => {
       if (el.shadowRoot) scan(el.shadowRoot);
     });
@@ -1067,13 +1200,19 @@
 
   scan();
   const mo = new MutationObserver((mutations) => {
+    // v4.1.1: new nodes may bring a player — snap the poll back to fast.
+    if (scanInterval !== SCAN_FAST) {
+      scanInterval = SCAN_FAST;
+      emptyScans = 0;
+      scheduleScan();
+    }
     for (const m of mutations) {
       m.addedNodes.forEach((node) => {
         if (!(node instanceof Element)) return;
         // Scan the added subtree — which now also descends into any
         // shadow roots it carries, so SPA players that mount <video>
         // inside shadow DOM (Reddit) get picked up without waiting for
-        // the 2s poll. wire() dedupes via HANDLED.
+        // the 5s poll. wire() dedupes via HANDLED.
         if (node.tagName === "VIDEO") wire(node);
         scan(node);
       });
@@ -1081,6 +1220,184 @@
   });
   mo.observe(document.documentElement, { childList: true, subtree: true });
 
+  // v4.1.1: adaptive scan interval. A frame with no <video> at all doesn't
+  // need a 5s DOM walk: after five consecutive empty light scans, back off
+  // to 30s. Any DOM mutation or user interaction snaps it back to 5s. This
+  // is what stops hundreds of ad/analytics iframes from pinning a core.
+  const SCAN_FAST = 5000, SCAN_SLOW = 30000, EMPTY_LIMIT = 5;
+  let scanInterval = SCAN_FAST;
+  let emptyScans = 0;
+  let scanTimer = null;
+
+  function scheduleScan() {
+    if (scanTimer) clearInterval(scanTimer);
+    scanTimer = setInterval(runScanTick, scanInterval);
+  }
+
+  function runScanTick() {
+    const hasVideo = document.querySelector("video") !== null;
+    if (hasVideo) {
+      emptyScans = 0;
+      if (scanInterval !== SCAN_FAST) {
+        scanInterval = SCAN_FAST;
+        scheduleScan();
+      }
+    } else {
+      emptyScans++;
+      if (emptyScans >= EMPTY_LIMIT && scanInterval !== SCAN_SLOW) {
+        scanInterval = SCAN_SLOW;
+        scheduleScan();
+      }
+    }
+    scanLight();
+  }
+
+  // User interaction can reveal a player without a mutation we care about
+  // (lazy loaders on click/hover) — wake the poll back up.
+  for (const ev of ["pointerdown", "keydown", "scroll"]) {
+    window.addEventListener(ev, () => {
+      if (scanInterval !== SCAN_FAST) {
+        scanInterval = SCAN_FAST;
+        emptyScans = 0;
+        scheduleScan();
+      }
+    }, { passive: true, capture: true });
+  }
+
   // Some SPA players swap currentSrc without any mutation nearby — poll lightly.
-  setInterval(scan, 2000);
+  scheduleScan();
+
+  // ---- v6: blob-anchor download bridge (pairs with mainhook.js) -----------
+  // mainhook.js (MAIN world, claude.ai only) swallows <a download href=blob:>
+  // clicks while armed and posts the Blob here by reference. We upload it to
+  // the app's /upload endpoint (same nonce pattern as the recorder). Any
+  // failure posts vg-blob-replay so the page re-fires the original click and
+  // the browser saves the file as usual. The channel is untrusted: only real
+  // Blob objects are accepted, never URLs. The secret is a nuisance barrier,
+  // not a security boundary (page scripts can read window messages too).
+  (() => {
+    const HOOK_HOSTS = ["claude.ai"];   // keep in sync with manifest.json
+    if (!HOOK_HOSTS.includes(location.hostname.toLowerCase())) return;
+
+    const BLOB_DEBUG = false;
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    const SECRET = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+
+    let hookEnabled = true;    // blobHookEnabled option, default on
+    let lastSync = 0;
+    let syncing = false;
+
+    const dbg = (...a) => { if (BLOB_DEBUG) console.debug("[VG] blob bridge:", ...a); };
+
+    function post(msg) {
+      try { window.postMessage({ ...msg, source: SECRET }, "*"); } catch (e) {}
+    }
+
+    function queryState() {
+      return new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: "VG_STATE" }, (r) => {
+            resolve(chrome.runtime.lastError || !r ? null : r);
+          });
+        } catch (e) { resolve(null); }
+      });
+    }
+
+    async function syncArmed(force) {
+      const now = Date.now();
+      if (syncing || (!force && now - lastSync < 2000)) return;
+      syncing = true;
+      lastSync = now;
+      try {
+        const st = await queryState();
+        const armed = !!(hookEnabled && st && st.alive && st.paired && st.intercept);
+        post({ type: "vg-armed", armed, debug: BLOB_DEBUG });
+      } finally {
+        syncing = false;
+      }
+    }
+
+    function cleanName(name) {
+      const n = String(name || "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").trim().slice(0, 200);
+      return n || "download";
+    }
+
+    async function uploadBlob(blob, filename) {
+      const st = await queryState();
+      if (!hookEnabled || !st || !st.alive || !st.paired || !st.intercept) {
+        dbg("not ready", st);
+        return false;
+      }
+      const nresp = await new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({ type: "GET_UPLOAD_NONCE" }, (r) => {
+            resolve(chrome.runtime.lastError ? null : r);
+          });
+        } catch (e) { resolve(null); }
+      });
+      if (!nresp || !nresp.ok || !nresp.nonce) { dbg("no nonce", nresp); return false; }
+      const form = new FormData();
+      form.append("file", blob, cleanName(filename));
+      const res = await fetch("http://127.0.0.1:5757/upload", {
+        method: "POST",
+        headers: { "X-Upload-Nonce": nresp.nonce },
+        body: form,
+      });
+      if (!res.ok) { dbg("upload status", res.status); return null; }
+      // E7: the app says which category folder it filed the upload under.
+      let category = "";
+      try {
+        const j = await res.json();
+        category = typeof j.category === "string" ? j.category : "";
+      } catch (e) {}
+      return { category };
+    }
+
+    window.addEventListener("message", async (e) => {
+      if (e.source !== window) return;
+      let type, src, id, blob, filename;
+      try {
+        const d = e.data;
+        if (!d || typeof d !== "object") return;
+        type = d.type; src = d.source; id = d.id; blob = d.blob; filename = d.filename;
+      } catch (err) { return; }
+      if (type !== "vg-blob-download" || src !== SECRET) return;
+      if (typeof id !== "string" || !(blob instanceof Blob)) return;
+
+      // Ack first, before any async work: stops the page-side watchdog.
+      post({ type: "vg-blob-ack", id });
+      let ok = false;
+      try {
+        ok = await uploadBlob(blob, typeof filename === "string" ? filename : "");
+      } catch (err) {
+        dbg("upload failed", err);
+        ok = false;
+      }
+      if (ok) {
+        post({ type: "vg-blob-done", id });
+        recNotify("Video Grabber", ok.category ? `Sent to ${ok.category} ✓` : "Sent to app ✓");
+      } else {
+        post({ type: "vg-blob-replay", id });
+      }
+    });
+
+    // Armed state can't be observed (the app can start or stop at any time),
+    // so refresh on user input, tab focus, option changes and a slow timer.
+    document.addEventListener("pointerdown", () => syncArmed(false), true);
+    document.addEventListener("keydown", () => syncArmed(false), true);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) syncArmed(true); });
+    setInterval(() => { if (!document.hidden) syncArmed(true); }, 15000);
+
+    try {
+      chrome.storage.onChanged.addListener((c, area) => {
+        if (area !== "local") return;
+        if (c.blobHookEnabled) hookEnabled = c.blobHookEnabled.newValue !== false;
+        if (c.blobHookEnabled || c.interceptDownloads || c.apiToken) syncArmed(true);
+      });
+      chrome.storage.local.get("blobHookEnabled").then((st) => {
+        hookEnabled = st.blobHookEnabled !== false;
+      }).catch(() => {}).finally(() => syncArmed(true));
+    } catch (e) { syncArmed(true); }
+  })();
 })();

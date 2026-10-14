@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Universal Video Grabber",
   "version": "4.1.0",
+  "minimum_chrome_version": "111",
   "description": "Detects video streams (mp4/HLS/DASH) on any page and sends them to the local Video Grabber app for full-speed download via yt-dlp. Includes a blob/MediaRecorder fallback for in-page-only streams.",
   "permissions": [
     "webRequest",
@@ -38,6 +39,20 @@
     "page": "options.html",
     "open_in_tab": false
   },
+  "commands": {
+    "download-media": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+D"
+      },
+      "description": "Download this page's largest detected media with Video Grabber"
+    },
+    "open-add-dialog": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+A"
+      },
+      "description": "Open the Video Grabber add dialog for this page"
+    }
+  },
   "content_scripts": [
     {
       "matches": [
@@ -48,6 +63,18 @@
       ],
       "run_at": "document_idle",
       "all_frames": true
+    },
+    {
+      "matches": [
+        "*://claude.ai/*"
+      ],
+      "js": [
+        "mainhook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
   "icons": {

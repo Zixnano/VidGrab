@@ -22,10 +22,14 @@
   .ok:before { content: "\25CF  "; font-size: 10px; }
   .bad { background: color-mix(in srgb, var(--err) 14%, var(--panel)); color: var(--err); }
 
-  .tabs { display: flex; gap: 3px; margin-bottom: 8px; padding: 3px; background: var(--elev); border-radius: var(--r); }
-  .tab { flex: 1; padding: 7px; font-size: 12px; border: 0; background: transparent; color: var(--mu); }
+  /* 7.1: the active tab is an accent underline with accent text and no fill,
+     so it no longer looks like the filled Download button. */
+  .tabs { display: flex; gap: 3px; margin-bottom: 8px; padding: 0; border-bottom: 1px solid var(--bd); }
+  .tab { flex: 1; padding: 7px; font-size: 12px; border: 0; border-bottom: 2px solid transparent;
+         border-radius: 0; background: transparent; color: var(--mu); }
   .tab:hover:not(:disabled) { background: transparent; color: var(--tx); }
-  .tab.active { background: var(--ac); color: var(--on-ac); font-weight: 600; }
+  .tab.active { background: transparent; color: var(--ac); border-bottom-color: var(--ac); font-weight: 600; }
+  .tab.active:hover:not(:disabled) { color: var(--ac); }
 
   #otherTabs { margin-bottom: 6px; }
   .otab { display: flex; justify-content: space-between; padding: 6px 10px; border: 1px solid var(--bd);
@@ -34,12 +38,20 @@
   .otab.sel { border-color: var(--ac); background: var(--sel); }
 
   .mrow { display: flex; align-items: center; gap: 8px; border: 1px solid var(--bd); background: var(--panel);
-          border-radius: var(--r); padding: 6px 9px; margin-bottom: 5px; }
+          border-radius: var(--r); padding: 6px 9px; margin-bottom: 5px; min-height: 42px; }
   .mrow:hover { border-color: var(--bd-hi); }
   .mrow input[type=checkbox] { flex-shrink: 0; accent-color: var(--ac); }
   .mrow .mname { font-size: 12px; word-break: break-all; flex: 1; }
-  .mrow .macts { flex-shrink: 0; white-space: nowrap; }
-  .mrow .macts button { font-size: 12px; padding: 2px 7px; }
+  /* E4: 16x16 favicon; a letter tile stands in until it loads (or if it can't). */
+  .mrow .fav { flex-shrink: 0; width: 16px; height: 16px; border-radius: 4px; background: var(--elev);
+               color: var(--mu); font-size: 10px; font-weight: 600; line-height: 16px; text-align: center; overflow: hidden; }
+  .mrow .fav.has-img { background: none; }
+  .mrow .fav img { display: block; width: 16px; height: 16px; }
+  /* 7.3: buttons at least 24x24, 4px apart, right-aligned behind a divider. */
+  .mrow .macts { flex-shrink: 0; white-space: nowrap; display: flex; gap: 4px; align-items: center;
+                 margin-left: auto; padding-left: 8px; border-left: 1px solid var(--bd); }
+  .mrow .macts button { font-size: 12px; padding: 2px 6px; min-width: 24px; min-height: 24px;
+                        display: inline-flex; align-items: center; justify-content: center; }
 
   .toolbar { display: flex; flex-wrap: wrap; gap: 5px; margin: 10px 0 4px; }
   .toolbar button { flex: 1 1 auto; font-size: 11px; padding: 6px 8px; }
@@ -49,10 +61,14 @@
 
   #filterPanel { border: 1px solid var(--bd); background: var(--panel); border-radius: var(--r);
                  padding: 8px; margin-bottom: 8px; font-size: 12px; display: block; }
-  #filterPanel label { position: relative; display: inline-block; margin: 0 4px 5px 0; padding: 3px 10px;
-                       border: 1px solid var(--bd); border-radius: 999px; color: var(--mu); cursor: pointer; white-space: nowrap; }
+  /* 7.1: chips keep a 2px border so checking one doesn't shift the layout;
+     a checked chip is a 2px accent border with a ~15% accent fill. The
+     "Hide files under 100 KB" row (.tiny) is a plain checkbox row, never a chip. */
+  #filterPanel label { position: relative; display: inline-block; margin: 0 4px 5px 0; padding: 2px 9px;
+                       border: 2px solid var(--bd); border-radius: 999px; color: var(--mu); cursor: pointer; white-space: nowrap; }
   #filterPanel label input { position: absolute; opacity: 0; width: 0; height: 0; }
-  #filterPanel label:has(input:checked) { border-color: var(--ac); color: var(--ac); background: var(--sel); }
+  #filterPanel label:not(.tiny):has(input:checked) { border-color: var(--ac); color: var(--ac);
+                       background: color-mix(in srgb, var(--ac) 15%, transparent); }
   #filterPanel label:has(input:focus-visible) { outline: 2px solid var(--ac); outline-offset: 2px; }
   #filterPanel .tiny { display: block; margin: 6px 0 0; padding: 0; border: 0; border-radius: 0; background: none;
                        color: var(--mu); cursor: pointer; }
@@ -62,6 +78,7 @@
   #searchInput:focus { border-color: var(--ac); outline: none; }
 
   .empty { color: var(--dim); font-size: 12px; padding: 14px 0; text-align: center; }
+  .empty .linkbtn { background: none; border: 0; padding: 0; color: var(--ac); text-decoration: underline; cursor: pointer; font: inherit; }
   #mediaStatus { font-size: 11px; color: var(--mu); min-height: 14px; margin-bottom: 4px; }
 
   .grab-item { display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--bd); background: var(--panel);
@@ -119,6 +136,7 @@
     <button id="btnDownload" title="Download checked items">Download</button>
     <button id="btnCopy" title="Copy checked URLs">Copy</button>
     <button id="btnToggle" title="Check/uncheck all">Toggle</button>
+    <button id="btnSort" title="Cycle the sort order: Time, Size, Name">Sort: Time</button>
     <button id="btnFilter" title="Filter by type">Filter</button>
     <button id="btnClear" title="Clear this tab's detected list">Clear</button>
     <button id="btnSearch" title="Search">Search</button>

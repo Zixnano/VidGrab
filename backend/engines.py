@@ -53,6 +53,63 @@ class FormatInfo:
         return asdict(self)
 
 
+# url -> {format_id: has_audio}, filled by YtDlpEngine.probe so a later
+# download of the same URL knows whether the picked format needs bestaudio
+# paired with it. Small and bounded; a miss just means "pair it, as before".
+_FORMAT_AUDIO = {}
+_FORMAT_AUDIO_MAX = 200
+
+
+def _remember_format_audio(url, formats):
+    try:
+        _FORMAT_AUDIO.pop(url, None)
+        _FORMAT_AUDIO[url] = {
+            fi.format_id: bool(fi.acodec) and fi.acodec != "none" for fi in formats}
+        while len(_FORMAT_AUDIO) > _FORMAT_AUDIO_MAX:
+            _FORMAT_AUDIO.pop(next(iter(_FORMAT_AUDIO)))
+    except Exception:
+        pass
+
+
+def _format_has_audio(url, format_id):
+    """True only when a probe of this URL said the format has an audio track."""
+    return bool(_FORMAT_AUDIO.get(url, {}).get(str(format_id)))
+
+
+def _binary_search_dirs():
+    """Folders searched for bundled helper binaries (ffmpeg, deno, node), in
+    priority order. One list so find_ffmpeg_dir() and find_js_runtime() can
+    never drift apart again (the JS search used to miss bin/).
+
+      0. Split layout (restructure): runtime/ via VG_RUNTIME, exe-parent,
+         or app-sibling fallback. The launcher exports VG_RUNTIME pointing
+         at the runtime folder before app code imports; the exe-parent and
+         app-sibling entries are fallbacks for frozen/source runs where that export is
+         missing.
+      1. _MEIPASS (PyInstaller --onedir's _internal/ folder) and next to
+         sys.executable (frozen), or
+      2. <repo>/bin/, backend/ and backend/bin/ (source runs)
+    """
+    dirs = []
+    vg_runtime = os.environ.get("VG_RUNTIME")
+    if vg_runtime:
+        dirs.append(Path(vg_runtime))
+    dirs.append(Path(sys.executable).parent / "runtime")
+    dirs.append(Path(__file__).resolve().parent.parent / "runtime")
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            dirs.append(Path(meipass))
+        dirs.append(Path(sys.executable).parent)
+    else:
+        # engines.py lives in backend/; repo root is one up.
+        here = Path(__file__).resolve().parent
+        dirs.append(here.parent / "bin")
+        dirs.append(here)
+        dirs.append(here / "bin")
+    return dirs
+
+
 def find_ffmpeg_dir():
     """Return the directory containing ffmpeg(.exe), or None if not found.
 
@@ -76,39 +133,10 @@ def find_ffmpeg_dir():
     if _FFMPEG_DIR_CACHE != "_unresolved":
         return _FFMPEG_DIR_CACHE
 
-    # Split-layout search first: the launcher exports VG_RUNTIME pointing
-    # at runtime\ before app code imports; the exe-parent and app-sibling
-    # entries are fallbacks for frozen/source runs where that export is
-    # missing. ffmpeg.exe/deno.exe live there in the new layout.
-    runtime_candidates = []
-    vg_runtime = os.environ.get("VG_RUNTIME")
-    if vg_runtime:
-        runtime_candidates.append(Path(vg_runtime))
-    runtime_candidates.append(Path(sys.executable).parent / "runtime")
-    runtime_candidates.append(Path(__file__).resolve().parent.parent / "runtime")
-    for d in runtime_candidates:
-        try:
-            if (d / "ffmpeg.exe").is_file() or (d / "ffmpeg").is_file():
-                _FFMPEG_DIR_CACHE = str(d)
-                log(f"ffmpeg_location resolved: {d}")
-                return _FFMPEG_DIR_CACHE
-        except OSError:
-            continue
-
-    candidates = []
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            candidates.append(Path(meipass))
-        candidates.append(Path(sys.executable).parent)
-    else:
-        # engines.py lives in backend/; repo root is one up.
-        here = Path(__file__).resolve().parent
-        candidates.append(here.parent / "bin")
-        candidates.append(here)
-        candidates.append(here / "bin")
-
-    for d in candidates:
+    # Candidate folders come from _binary_search_dirs(), shared with
+    # find_js_runtime(), so both tools are looked up in the same places
+    # (including bin/).
+    for d in _binary_search_dirs():
         try:
             if (d / "ffmpeg.exe").is_file() or (d / "ffmpeg").is_file():
                 _FFMPEG_DIR_CACHE = str(d)
@@ -148,38 +176,11 @@ def find_js_runtime():
     if _YTDLP_JS_RUNTIME_CACHE is not None:
         return _YTDLP_JS_RUNTIME_CACHE
 
-    # Split-layout search first: the launcher exports VG_RUNTIME pointing
-    # at runtime\ before app code imports; the exe-parent and app-sibling
-    # entries are fallbacks for frozen/source runs where that export is
-    # missing. deno.exe/node.exe live there in the new layout.
-    runtime_dirs = []
-    vg_runtime = os.environ.get("VG_RUNTIME")
-    if vg_runtime:
-        runtime_dirs.append(Path(vg_runtime))
-    runtime_dirs.append(Path(sys.executable).parent / "runtime")
-    runtime_dirs.append(Path(__file__).resolve().parent.parent / "runtime")
-    for d in runtime_dirs:
-        for fname, key in (("deno.exe", "deno"), ("deno", "deno"),
-                           ("node.exe", "node"), ("node", "node")):
-            p = d / fname
-            try:
-                if p.is_file():
-                    _YTDLP_JS_RUNTIME_CACHE = {key: {"path": str(p)}}
-                    log(f"yt-dlp JS runtime: {key} at {p}")
-                    return _YTDLP_JS_RUNTIME_CACHE
-            except OSError:
-                continue
-
+    # Candidate folders come from _binary_search_dirs(), shared with
+    # find_ffmpeg_dir(): deno.exe/node.exe are found in runtime\, next to
+    # the exe, in bin/ and in the backend folder alike.
     candidates = []
-    if getattr(sys, "frozen", False):
-        bases = [Path(sys.executable).parent]
-        meipass = getattr(sys, "_MEIPASS", None)
-        if meipass:
-            bases.append(Path(meipass))
-    else:
-        bases = [Path(__file__).parent]
-
-    for base in bases:
+    for base in _binary_search_dirs():
         candidates += [
             (base / "deno.exe", "deno"),
             (base / "deno", "deno"),
@@ -276,8 +277,10 @@ def pace_before_start(url, cancel_check=None):
         return
     with _PACE_LOCK:
         now = time.time()
+        prev_next_ok = _PACE_NEXT_OK
         start_at = max(now, _PACE_NEXT_OK)
-        _PACE_NEXT_OK = start_at + random.uniform(lo, hi)
+        reserved = start_at + random.uniform(lo, hi)
+        _PACE_NEXT_OK = reserved
     wait = start_at - time.time()
     if wait > 0.5:
         log(f"pacing: waiting {wait:.0f}s before this YouTube request")
@@ -286,7 +289,16 @@ def pace_before_start(url, cancel_check=None):
         if remaining <= 0:
             return
         if cancel_check:
-            cancel_check()
+            try:
+                cancel_check()
+            except Exception:
+                # Cancelled while waiting: give the slot back, or every later
+                # YouTube job is pushed back for a download that never ran.
+                # Only roll back when nobody has reserved a slot after ours.
+                with _PACE_LOCK:
+                    if _PACE_NEXT_OK == reserved:
+                        _PACE_NEXT_OK = prev_next_ok
+                raise
         time.sleep(min(0.5, remaining))
 
 
@@ -437,6 +449,7 @@ class YtDlpEngine:
             return (1 if is_audio_only else 0, -height, 0 if muxed else 1, prefer_mp4_h264)
 
         formats.sort(key=_sort_key)
+        _remember_format_audio(url, formats)
         return formats
 
     # --- download (core of downloader.run_ytdlp, moved verbatim) ---
@@ -527,6 +540,11 @@ class YtDlpEngine:
             # specifies audio (or is an audio-only pick), leave it alone.
             fid = str(format_id)
             if "+" in fid or fid.startswith("audio:"):
+                ydl_opts["format"] = fid
+            elif _format_has_audio(url, fid):
+                # The probe saw an audio track in this format (muxed, or an
+                # audio-only pick): pairing bestaudio would add a second
+                # audio stream or force a needless merge.
                 ydl_opts["format"] = fid
             else:
                 # "137+bestaudio" — yt-dlp merges the two, needs ffmpeg.
@@ -655,8 +673,13 @@ class YtDlpEngine:
             archive_add(seen.get("ek") or "youtube", seen["id"])
 
         # v5: title-named jobs report the real final path from post_hooks.
-        if opts.get("use_title") and final_paths:
-            return Path(final_paths[-1])
+        # Now used for every non-playlist job: the glob below can pick up an
+        # unrelated bigger file that happens to share the stem. The glob is
+        # only the fallback when yt-dlp reported no path or the file is gone.
+        if final_paths and not is_playlist:
+            _reported = Path(final_paths[-1])
+            if _reported.is_file():
+                return _reported
 
         # Playlist mode: yt-dlp already wrote one file per item using the
         # %(playlist_index)s-%(title)s template; dest.stem glob won't match

@@ -26,12 +26,18 @@ def _cleanup_stale_parts(max_age_hours=24):
     """Delete .part files older than max_age_hours with no active job."""
     cutoff = time.time() - max_age_hours * 3600
     active = set()
+    # Stems of every existing job's destination: an in-progress download also
+    # leaves intermediates such as "Title.f137.mp4.part" or "Title.mp4.part-Frag3"
+    # that an exact-name match would miss, so anything under "<stem>." is kept.
+    active_stems = []
     for j in list(JOBS.values()):
         try:
             p = _dest_for(j)
             active.add(str(p.with_suffix(p.suffix + ".part")))
+            active_stems.append(str(p.with_suffix("")).lower() + ".")
         except Exception:
             pass
+    active_stems = tuple(active_stems)
     count = 0
     roots = {Path(STATE["output_dir"])}
     try:
@@ -44,6 +50,8 @@ def _cleanup_stale_parts(max_age_hours=24):
         for root in roots:
           for part in root.rglob("*.part*"):
             if str(part) in active:
+                continue
+            if active_stems and str(part).lower().startswith(active_stems):
                 continue
             try:
                 if part.stat().st_mtime < cutoff:

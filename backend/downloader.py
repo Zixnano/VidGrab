@@ -2,6 +2,7 @@
 from pathlib import Path
 import glob
 import os
+import re
 import requests
 
 # v5: must run before yt_dlp is imported so a staged/override yt-dlp wins.
@@ -46,6 +47,13 @@ def _try_transition(job, event):
     except ValueError as e:
         log(f"job {job.get('id')}: {e} (ignored)")
         return False
+
+
+class _RestartFromZero(Exception):
+    """Raised inside _run_generic_single when the server answers 416 and the
+    .part file is not the whole file: discard it and start over."""
+
+
 # --- yt-dlp YouTube runtime helpers -----------------------------------------
 
 
@@ -196,14 +204,53 @@ def maybe_convert_target(job, dest):
     return dest
 
 
+# Destinations reserved by jobs that have resolved one (lower-cased path ->
+# job id). stat_for/_unique_path only see files on disk, so two queued jobs
+# with the same name both resolved to the same path and wrote the same .part.
+# A reservation is ignored once its job is done, failed or deleted (see
+# _prune_reservations), so nothing needs to release it explicitly.
+_INFLIGHT_DESTS = {}
+_DEST_LOCK = threading.Lock()
+
+
+def _prune_reservations():
+    """Drop reservations whose job is gone or finished. Caller holds _DEST_LOCK."""
+    for key, jid in list(_INFLIGHT_DESTS.items()):
+        j = JOBS.get(jid)
+        if j is None or j.get("status") in ("done", "error"):
+            _INFLIGHT_DESTS.pop(key, None)
+
+
 def _job_dest(job):
     """Registry filename -> on-disk destination, disambiguated against files
     that already exist (two jobs can queue with the same name — e.g. the
-    multi-quality checklist's same-resolution double-check). Keeps
+    multi-quality checklist's same-resolution double-check) and against
+    destinations other in-flight jobs have reserved. Keeps
     job["filename"] in sync with the real file."""
-    dest = _unique_path(stat_for(job))
-    if dest.name != job["filename"]:
-        job["filename"] = dest.name
+    jid = job.get("id")
+    failure = None
+    with _DEST_LOCK:
+        _prune_reservations()
+        # Forget what this job reserved last time: resume/retry re-resolves.
+        for key, owner in list(_INFLIGHT_DESTS.items()):
+            if owner == jid:
+                _INFLIGHT_DESTS.pop(key, None)
+        try:
+            dest = _unique_path(stat_for(job), set(_INFLIGHT_DESTS))
+        except RuntimeError as e:
+            failure = e
+        else:
+            if dest.name != job["filename"]:
+                job["filename"] = dest.name
+            _INFLIGHT_DESTS[str(dest).lower()] = jid
+    if failure is not None:
+        # _unique_path gave up (1000 name collisions): fail the job instead of
+        # overwriting a file that already exists.
+        job["error"] = str(failure)
+        _try_transition(job, JobEvent.FAIL)
+        log(f"job {jid}: FAILED — {failure}")
+        save_jobs_snapshot()
+        raise failure
     return dest
 
 
@@ -445,10 +492,14 @@ def _probe_ranges(url, headers):
         return 0, False
 
 
-def _download_segment(job, url, idx, start, end, headers, part_path):
+def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None):
     h = dict(headers)
     h["Range"] = f"bytes={start}-{end}"
     try:
+        # `cancel` is shared by all segments of one job: the first failure
+        # sets it so the others stop instead of downloading to the end.
+        if cancel is not None and cancel.is_set():
+            return
         with requests.get(url, headers=h, stream=True,
                            timeout=STATE["connection_timeout"],
                            proxies=settings.proxies_for(url)) as r:
@@ -456,6 +507,8 @@ def _download_segment(job, url, idx, start, end, headers, part_path):
                 raise RuntimeError(f"segment {idx} got HTTP {r.status_code}, expected 206")
             with open(part_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
+                    if cancel is not None and cancel.is_set():
+                        return
                     if job["stop_evt"].is_set():
                         return
                     if job["pause_evt"].is_set():
@@ -468,6 +521,8 @@ def _download_segment(job, url, idx, start, end, headers, part_path):
                         job["size_done"] += len(chunk)
     except Exception as e:
         job["error"] = str(e)
+        if cancel is not None:
+            cancel.set()
         raise
 
 
@@ -482,18 +537,21 @@ def _generic_headers(job):
     return headers
 
 
-def run_generic_segmented(job_id):
+def run_generic_segmented(job_id, probe=None):
+    """`probe` is an optional (size, ranges_ok) tuple from a caller that has
+    already HEADed the URL (run_generic), so it is not probed twice."""
     job = JOBS[job_id]
     dest = _job_dest(job)
     headers = _generic_headers(job)
 
-    total, ranges_ok = _probe_ranges(job["url"], headers)
+    total, ranges_ok = probe if probe is not None else _probe_ranges(job["url"], headers)
     if not ranges_ok or total < SEGMENT_THRESHOLD:
         return _run_generic_single(job_id)
 
     seg_size = total // SEGMENT_COUNT
     parts = []
     threads = []
+    cancel = threading.Event()
     job["size_total"] = total
     job["size_done"] = 0
     transition(job, JobEvent.START)
@@ -503,7 +561,7 @@ def run_generic_segmented(job_id):
         part = dest.with_suffix(dest.suffix + f".part{i}")
         parts.append(part)
         t = threading.Thread(target=_download_segment,
-                             args=(job, job["url"], i, start, end, headers, part),
+                             args=(job, job["url"], i, start, end, headers, part, cancel),
                              daemon=True)
         threads.append(t)
         t.start()
@@ -541,18 +599,45 @@ def run_generic_segmented(job_id):
         log(f"job {job_id}: paused (segmented downloads restart on resume)")
         save_jobs_snapshot()
         return
-    with open(dest, "wb") as out:
-        for p in parts:
-            with open(p, "rb") as inp:
-                shutil.copyfileobj(inp, out)
+    # Merge into a side file and swap it in: a crash or full disk mid-merge
+    # used to leave a truncated file at the final name and no parts. The
+    # parts are only deleted once the merged file is safely in place.
+    merge_path = dest.with_suffix(dest.suffix + ".merge")
+    try:
+        with open(merge_path, "wb") as out:
+            for p in parts:
+                with open(p, "rb") as inp:
+                    shutil.copyfileobj(inp, out)
+        os.replace(merge_path, dest)
+    except Exception as e:
+        # Segments always restart from byte 0, so the parts are no use to a
+        # retry: free their disk space along with the half-written merge.
+        for p in [merge_path] + parts:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        job["error"] = f"merge failed: {e}"
+        _try_transition(job, JobEvent.FAIL)
+        log(f"job {job_id}: FAILED (merge) — {e}")
+        save_jobs_snapshot()
+        return
+    for p in parts:
+        try:
             p.unlink()
+        except OSError:
+            pass
     # Many CDNs misreport Content-Length — warn, don't fail.
     actual = dest.stat().st_size
     if total and actual < total - 1:
         log(f"job {job_id}: WARNING — size mismatch (got {actual}, expected {total})")
         job["error"] = f"size mismatch: {actual}/{total}"
     dest = maybe_convert_target(job, dest)
-    _try_transition(job, JobEvent.COMPLETE)
+    if not _try_transition(job, JobEvent.COMPLETE):
+        # Paused/stopped while merging or converting: the job is not done, so
+        # skip the completion side effects (stats, open folder, sound, shutdown).
+        save_jobs_snapshot()
+        return
     job["completed_ts"] = time.time()
     job["speed"] = ""
     record_stat(job["size_done"])
@@ -576,10 +661,41 @@ def run_generic(job_id):
         try:
             total, ok = _probe_ranges(job["url"], _generic_headers(job))
             if ok and total >= SEGMENT_THRESHOLD:
-                return run_generic_segmented(job_id)
+                return run_generic_segmented(job_id, probe=(total, ok))
         except Exception:
             pass
     return _run_generic_single(job_id)
+
+
+def _finalize_single(job_id, job, part, dest):
+    """Move the finished .part into place and run the completion steps.
+    Shared by the normal path and the 416 "already complete" path."""
+    try:
+        os.replace(part, dest)
+    except OSError:
+        # Per-category overrides can point at a different drive,
+        # where os.replace fails across filesystems.
+        import shutil as _sh
+        _sh.move(str(part), str(dest))
+    # Many CDNs misreport Content-Length — warn, don't fail.
+    actual = dest.stat().st_size
+    if job["size_total"] and actual < job["size_total"] - 1:
+        log(f"job {job_id}: WARNING — size mismatch (got {actual}, "
+            f"expected {job['size_total']})")
+        job["error"] = f"size mismatch: {actual}/{job['size_total']}"
+    dest = maybe_convert_target(job, dest)
+    if not _try_transition(job, JobEvent.COMPLETE):
+        # Paused/stopped while converting: not done, so no completion side effects.
+        return
+    job["completed_ts"] = time.time()
+    job["speed"] = ""
+    record_stat(job["size_done"])
+    log(f"job {job_id}: complete ✓ ({dest.name})")
+    scan_file(dest)
+    maybe_extract_archive(job, dest)
+    maybe_open_folder(dest)
+    maybe_play_sound()
+    maybe_shutdown_if_idle()
 
 
 def _run_generic_single(job_id):
@@ -596,6 +712,19 @@ def _run_generic_single(job_id):
         with requests.get(job["url"], headers=headers, stream=True,
                           timeout=STATE["connection_timeout"],
                           proxies=settings.proxies_for(job["url"])) as r:
+            if r.status_code == 416 and existing:
+                # Range not satisfiable. "Content-Range: bytes */N" tells the
+                # real size: when the .part already has N bytes the download
+                # was finished, so complete it; otherwise it is stale or too
+                # big, so throw it away and start from 0.
+                m = re.match(r"\s*bytes\s+\*/(\d+)", r.headers.get("Content-Range") or "")
+                if m and int(m.group(1)) == existing:
+                    log(f"job {job_id}: HTTP 416, .part is already complete")
+                    job["size_total"] = job["size_done"] = existing
+                    _finalize_single(job_id, job, part, dest)
+                    return
+                log(f"job {job_id}: HTTP 416, discarding stale .part and restarting")
+                raise _RestartFromZero()
             if r.status_code not in (200, 206):
                 _try_transition(job, JobEvent.FAIL)
                 job["error"] = f"HTTP {r.status_code}"
@@ -630,30 +759,26 @@ def _run_generic_single(job_id):
                         rate = (job["size_done"] - last_bytes) / (now - last_report)
                         job["speed"] = f"{rate/1024:.0f} KB/s"
                         last_report, last_bytes = now, job["size_done"]
-            try:
-                os.replace(part, dest)
-            except OSError:
-                # Per-category overrides can point at a different drive,
-                # where os.replace fails across filesystems.
-                import shutil as _sh
-                _sh.move(str(part), str(dest))
-            # Many CDNs misreport Content-Length — warn, don't fail.
-            actual = dest.stat().st_size
-            if job["size_total"] and actual < job["size_total"] - 1:
-                log(f"job {job_id}: WARNING — size mismatch (got {actual}, "
+            # Short body: this size came from the SAME GET (not a HEAD probe), so
+            # fewer bytes than Content-Length is a truncated download. Fail it
+            # (the .part stays, so Resume continues) instead of marking it done.
+            part_size = part.stat().st_size
+            if (r.headers.get("Content-Length") is not None and job["size_total"]
+                    and part_size < job["size_total"] - 1):
+                job["size_done"] = part_size
+                job["error"] = (f"size mismatch: {part_size}/{job['size_total']} "
+                                f"(incomplete download)")
+                _try_transition(job, JobEvent.FAIL)
+                log(f"job {job_id}: FAILED — short download (got {part_size}, "
                     f"expected {job['size_total']})")
-                job["error"] = f"size mismatch: {actual}/{job['size_total']}"
-            dest = maybe_convert_target(job, dest)
-            _try_transition(job, JobEvent.COMPLETE)
-            job["completed_ts"] = time.time()
-            job["speed"] = ""
-            record_stat(job["size_done"])
-            log(f"job {job_id}: complete ✓ ({dest.name})")
-            scan_file(dest)
-            maybe_extract_archive(job, dest)
-            maybe_open_folder(dest)
-            maybe_play_sound()
-            maybe_shutdown_if_idle()
+                return
+            _finalize_single(job_id, job, part, dest)
+    except _RestartFromZero:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        return _run_generic_single(job_id)
     except Exception as e:
         _try_transition(job, JobEvent.FAIL)
         job["error"] = str(e)
@@ -738,6 +863,13 @@ def run_ytdlp(job_id):
         if is_unsupported and detect_type(job["url"]) == "generic":
             log(f"job {job_id}: yt-dlp has no extractor, falling through "
                 f"to generic HTTP ({raw[:120]})")
+            # A Stop that arrived while yt-dlp was failing must win: clearing
+            # stop_evt below would silently throw it away.
+            if job["stop_evt"].is_set():
+                _try_transition(job, JobEvent.STOP)
+                log(f"job {job_id}: stopped")
+                save_jobs_snapshot()
+                return
             # Reset state: engine.download may have touched counters.
             job["error_kind"] = None
             job["error"] = None

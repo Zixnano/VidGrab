@@ -70,8 +70,12 @@ def save_jobs_snapshot():
         try:
             snap = {}
             for jid, j in list(JOBS.items()):
+                # referer and user_agent are persisted so a queued/downloading
+                # job that reloads as "stopped" can still be resumed against
+                # hosts that check them. The cookie stays out on purpose:
+                # session cookies on disk are a privacy tradeoff not taken.
                 snap[jid] = {k: v for k, v in list(j.items())
-                             if k not in ("pause_evt", "stop_evt", "cookie", "referer", "user_agent", "error")}
+                             if k not in ("pause_evt", "stop_evt", "cookie", "error")}
             # Cap history at MAX_HISTORY jobs — always keep non-done jobs,
             # fill the rest with the newest done ones.
             MAX_HISTORY = 2000
@@ -176,7 +180,8 @@ def reorder_job(jid, action):
     job = JOBS[jid]
     if job.get("status") != "queued":
         return None
-    queued = sorted((x for x in JOBS.values() if x.get("status") == "queued"),
+    # list(): a concurrent new_job() must not resize JOBS mid-iteration.
+    queued = sorted((x for x in list(JOBS.values()) if x.get("status") == "queued"),
                     key=start_order_key)
     values = [start_order_key(x) for x in queued]
     i = next(n for n, x in enumerate(queued) if x is job)
@@ -310,7 +315,10 @@ def load_jobs_snapshot():
             if migrated:
                 save_jobs_snapshot()
             global JOB_COUNTER
-            JOB_COUNTER = max([int(k) for k in JOBS.keys()] + [0])
+            # Ignore non-numeric keys: int() on one used to raise, leave the
+            # counter at 0, and let the next job reuse "1" and overwrite it.
+            JOB_COUNTER = max([int(k) for k in JOBS.keys()
+                               if str(k).isascii() and str(k).isdigit()] + [0])
         except Exception as e:
             log(f"couldn't load job history: {e}")
 
@@ -320,6 +328,10 @@ def next_job_id():
     global JOB_COUNTER
     with JOB_LOCK:
         JOB_COUNTER += 1
+        # Never hand out an id that is already taken (a counter that fell
+        # behind the loaded history would otherwise overwrite that job).
+        while str(JOB_COUNTER) in JOBS:
+            JOB_COUNTER += 1
         return str(JOB_COUNTER)
 
 
@@ -411,6 +423,11 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
     # Session D: per-item playlist jobs get their own folder under the
     # category dir (consumed only by settings._dest_for).
     subdir = _playlist_subdir(playlist_title) if playlist_title else None
+    # new_job is the one place (besides repair_status at load time) that
+    # seeds a job's status directly instead of going through transition():
+    # a brand-new job has no prior state to transition from. It starts as
+    # "queued" or "held" here, and becomes "skipped" below when its file
+    # type is disabled. Every later change goes through transition().
     JOBS[jid] = {
         "id": jid, "url": url, "filename": fname,
         "category": job_cat,
@@ -436,6 +453,8 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
             f"-> subdir {subdir!r}")
     ext = os.path.splitext(fname)[1].lstrip(".").lower()
     if ext and STATE.get("file_types_overrides", {}).get(ext) is False:
+        # Seeded directly (see the note above JOBS[jid]): there is no
+        # SKIP transition because a skipped job never started.
         JOBS[jid]["status"] = "skipped"
         log(f"job {jid}: skipped — '.{ext}' is disabled in Options → File Types")
         if snapshot:

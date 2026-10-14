@@ -12,6 +12,13 @@
     await chrome.storage.local.set({ interceptDownloads: interceptCheckbox.checked });
   });
 
+  const blobHookCheckbox = document.getElementById("blobHookEnabled");
+  const { blobHookEnabled } = await chrome.storage.local.get("blobHookEnabled");
+  blobHookCheckbox.checked = blobHookEnabled !== false;
+  blobHookCheckbox.addEventListener("change", async () => {
+    await chrome.storage.local.set({ blobHookEnabled: blobHookCheckbox.checked });
+  });
+
   document.getElementById("test").addEventListener("click", async () => {
     statusEl.textContent = "Contacting app…";
     statusEl.className = "";

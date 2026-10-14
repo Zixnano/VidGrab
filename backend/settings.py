@@ -252,18 +252,64 @@ def save_settings():
 ILLEGAL_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
+# Windows device names: a file called CON, NUL.txt or com1.tar.gz cannot be
+# created (or opened) on NTFS, with or without an extension.
+_WIN_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)])
+
+
 def safe_filename(name):
     """Strip Windows-illegal characters, collapse whitespace, trim trailing
-    dots/spaces, and cap the length so the resulting file can be created."""
+    dots/spaces, and cap the length so the resulting file can be created.
+    Reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) get a "_"
+    prefix; the extension is preserved."""
     name = ILLEGAL_FILENAME_CHARS_RE.sub("_", name)
     name = re.sub(r"\s+", " ", name).strip()
     name = name.rstrip(". ")
     if not name:
         name = "download"
+    # Windows matches the device name before the FIRST dot, so "con.tar.gz"
+    # is reserved too, not just a bare "con".
+    if name.split(".", 1)[0].rstrip(" ").upper() in _WIN_RESERVED_NAMES:
+        name = "_" + name
     if len(name) > 180:
         stem, ext = os.path.splitext(name)
         name = stem[: 180 - len(ext)] + ext
     return name
+
+
+# Whole destination paths stay under this many characters (Windows
+# MAX_PATH is 260). The reserve leaves room for the suffixes added around
+# a file name: ".part7", ".merge", " (12)".
+_PATH_BUDGET = 240
+_PATH_SUFFIX_RESERVE = 16
+
+
+def truncate_for_dir(base_dir, category, subdir, name):
+    """Shorten `name` so base_dir/category/subdir/name (plus the suffix
+    reserve) stays inside _PATH_BUDGET. Keeps the extension. Pass "" for a
+    category or subdir that is not part of the path. A name that already
+    fits is returned unchanged."""
+    try:
+        d = Path(base_dir)
+        if category:
+            d = d / category
+        if subdir:
+            d = d / subdir
+        room = _PATH_BUDGET - _PATH_SUFFIX_RESERVE - len(str(d)) - 1
+    except Exception:
+        return name
+    if len(name) <= room:
+        return name
+    # A directory this deep is the user's problem; never shrink to nothing.
+    room = max(room, 24)
+    stem, ext = os.path.splitext(name)
+    if len(ext) > 16:
+        stem, ext = name, ""
+    keep = max(room - len(ext), 8)
+    return (stem[:keep].rstrip(". ") or "download") + ext
 
 
 _CT_EXT_MAP = [
@@ -308,7 +354,7 @@ def guess_ext_from_head(url):
     return ext
 
 
-_QUERY_NAME_KEYS = ("fn", "filename", "file", "name", "file_name")
+_QUERY_NAME_KEYS = ("fn", "filename", "file", "name", "file_name", "path")
 
 # "?format=jpg" / "?f=mp4" style extension hints (pbs.twimg.com and friends).
 # Anchored on purpose: "?format=json" must NOT match.
@@ -329,6 +375,14 @@ def _filename_from_query(url):
         for v in qs.get(key, []):
             v = (v or "").strip()
             if not v:
+                continue
+            if key == "path":
+                # "?path=/mnt/user-data/outputs/report.zip" (claude.ai) or a
+                # Windows-style path: normalise separators, decode again
+                # (the value is often double-encoded), keep the basename.
+                base = os.path.basename(unquote(v).replace("\\", "/"))
+                if base and os.path.splitext(base)[1] and len(base) < 200:
+                    return base
                 continue
             # Only accept values that look like a filename with an
             # extension: "report.pdf" yes, "abc123" no, "a/b" no.
@@ -393,22 +447,32 @@ def preferred_stem(job):
     return None
 
 
-def _unique_path(path):
-    """If path exists, append ' (2)', ' (3)', ... before the extension."""
-    if not path.exists():
+# Only suffixes _unique_path itself would have added: " (2)" to " (999)".
+# A year or other real number ("Report (2019).pdf") is part of the name.
+_UNIQUE_SUFFIX_RE = re.compile(r"(?: \((?:[2-9]|[1-9]\d{1,2})\))+$")
+
+
+def _unique_path(path, taken=None):
+    """If path exists, append ' (2)', ' (3)', ... before the extension.
+
+    `taken` is an optional collection of lower-cased path strings that count
+    as occupied even though no file exists yet (in-flight reservations, see
+    downloader._job_dest). Raises RuntimeError after 1000 collisions: the
+    old behaviour of returning the existing path made callers overwrite it."""
+    def _busy(p):
+        return p.exists() or (taken is not None and str(p).lower() in taken)
+
+    if not _busy(path):
         return path
     stem, ext = os.path.splitext(path.name)
     # Collapse existing " (N)" suffixes first so repeats never stack into
     # "name (2) (2).mp4".
-    stem = re.sub(r"(?: \(\d+\))+$", "", stem) or stem
-    i = 2
-    while True:
+    stem = _UNIQUE_SUFFIX_RE.sub("", stem) or stem
+    for i in range(2, 1001):
         candidate = path.with_name(f"{stem} ({i}){ext}")
-        if not candidate.exists():
+        if not _busy(candidate):
             return candidate
-        i += 1
-        if i > 1000:
-            return path  # give up, unlikely
+    raise RuntimeError(f"no free file name for {path.name} after 1000 tries")
 
 
 def category_for(filename):
@@ -420,13 +484,16 @@ def category_for(filename):
 # fetch, not something yt-dlp should extract. Covers media files the
 # user might want, AND arbitrary files (scripts, archives, docs) that
 # shouldn't be pushed through yt-dlp's extractor pipeline at all.
+# html/htm/php are deliberately NOT listed: a page URL such as
+# https://site.com/v/123.html should try yt-dlp first (it is usually a video
+# page), not be saved as an HTML file. It is matched against the URL PATH only.
 _PLAIN_FILE_EXT_RE = re.compile(
     r"\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpg|mpeg|ts|"
     r"mp3|wav|flac|m4a|aac|ogg|opus|"
     r"zip|rar|7z|tar|gz|bz2|xz|"
     r"pdf|docx?|xlsx?|pptx?|txt|md|csv|json|xml|yaml|yml|"
-    r"html?|css|"
-    r"py|js|ts|java|c|cpp|h|hpp|rs|go|rb|php|sh|bat|ps1|"
+    r"css|"
+    r"py|js|ts|java|c|cpp|h|hpp|rs|go|rb|sh|bat|ps1|"
     r"exe|msi|dmg|deb|rpm|apk|"
     r"jpg|jpeg|png|gif|webp|avif|svg|bmp|ico)(\?|#|$)", re.I)
 
@@ -438,7 +505,14 @@ _FILENAME_QUERY_KEYS = ("fn", "filename", "file", "name", "file_name")
 def detect_type(url):
     if ".m3u8" in url.lower() or ".mpd" in url.lower():
         return "ytdlp"
-    if _PLAIN_FILE_EXT_RE.search(url):
+    # Path only: an extension-looking string in a query value or host must
+    # not route a page URL to the generic downloader (the query-value check
+    # below handles fn=/filename=/format= on its own terms).
+    try:
+        _url_path = urlparse(url).path
+    except ValueError:
+        _url_path = ""
+    if _PLAIN_FILE_EXT_RE.search(_url_path):
         return "generic"
     # Filename in the query string? (fn=..., filename=..., file=...)
     # Match the extension regex against each value; anchor it so
@@ -584,18 +658,27 @@ def _dest_for(job):
     # NOTE: gui_qt._path_for mirrors this logic - keep the two in sync.
     override = STATE.get("per_category_dirs", {}).get(job["category"])
     base = Path(override) if override else Path(STATE["output_dir"])
-    cat_dir = base if override else base / job["category"]
+    # The category comes from rules, /category and the API, so it is
+    # sanitised before it is joined: "..\\x" or "D:\\x" must not escape the
+    # output folder. (The per_category_dirs lookup above uses the raw name.)
+    cat = "" if override else safe_filename(job["category"] or "Other")
+    cat_dir = base / cat if cat else base
     # Session D: per-item playlist jobs land in <category>/<subdir>/. subdir
     # is a real path component (not the legacy playlist_dir display hint).
-    sub = job.get("subdir")
+    sub = safe_filename(job["subdir"]) if job.get("subdir") else ""
     if sub:
-        cat_dir = cat_dir / safe_filename(sub)
-    return cat_dir / safe_filename(job["filename"])
+        cat_dir = cat_dir / sub
+    # The name is shortened when the whole path would pass the Windows limit.
+    return cat_dir / truncate_for_dir(base, cat, sub, safe_filename(job["filename"]))
 
 
 def stat_for(job):
     dest = _dest_for(job)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # _dest_for shortened an over-long name: keep job["filename"] in sync
+    # (the GUI builds its own path from it).
+    if dest.name != safe_filename(job["filename"]):
+        job["filename"] = dest.name
     # Collision handling: "name (2).ext" — but ONLY when the job hasn't
     # started yet (no .part file, no bytes downloaded), otherwise we'd
     # rename a file mid-resume. Side effect on job["filename"] is

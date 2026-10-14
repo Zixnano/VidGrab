@@ -32,6 +32,22 @@ function redditCdnName(url, tab) {
   }
 }
 
+// 7.7: CDN chunk URLs end in a long random ID ("AbC123...xyz.mp4"), which says
+// nothing. Show what the item is and how big instead; the full URL goes in
+// the tooltip. Normal file names are shown as before.
+const CHUNK_ID_RE = /^[A-Za-z0-9_-]{16,}\./;
+
+function chunkLabel(it) {
+  const name = fileName(it.url);
+  if (!CHUNK_ID_RE.test(name)) return null;
+  const ct = (it.contentType || "").toLowerCase();
+  const e = extOf(it.url);
+  let kind = "Stream";
+  if (ct.startsWith("video/") || ["mp4", "m4v", "mov", "webm", "mkv", "avi"].includes(e)) kind = "Video";
+  else if (ct.startsWith("audio/") || ["mp3", "m4a", "aac", "wav", "flac", "opus", "ogg"].includes(e)) kind = "Audio";
+  return `${kind} \u00b7 ${fmtBytes(it.size) || "unknown"}`;
+}
+
 function extOf(url) {
   const m = url.match(/\.([a-z0-9]{1,5})(\?|#|$)/i);
   return m ? m[1].toLowerCase() : "";
@@ -59,6 +75,7 @@ let otherSelId = null;
 let mediaItems = [];           // rows: {url, size, timestamp, checked, ...}
 let filterSet = null;          // null = all visible; else Set of categories
 let searchText = "";
+let sortMode = "time";         // E5: "time" | "size" | "name" (saved as popupSort)
 
 async function checkBackend() {
   const statusEl = document.getElementById("status");
@@ -101,12 +118,28 @@ async function checkBackend() {
 
 // ---------------- media list ----------------
 
+// E5: Time is newest first (the original behaviour), Size is largest first
+// (unknown sizes last), Name is A to Z.
+function compareItems(a, b) {
+  const byTime = (b.timestamp || 0) - (a.timestamp || 0);
+  if (sortMode === "size") return (b.size || 0) - (a.size || 0) || byTime;
+  if (sortMode === "name") {
+    return fileName(a.url).toLowerCase().localeCompare(fileName(b.url).toLowerCase()) || byTime;
+  }
+  return byTime;
+}
+
+function updateSortButton() {
+  const btn = document.getElementById("btnSort");
+  if (btn) btn.textContent = "Sort: " + { time: "Time", size: "Size", name: "Name" }[sortMode];
+}
+
 function setItems(items, tabRef) {
   // Preserve checkbox state across reloads, keyed by URL.
   const prev = new Map(mediaItems.map((i) => [i.url, i.checked]));
   mediaItems = (items || [])
     .slice()
-    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+    .sort(compareItems)
     .map((i) => ({
       ...i,
       size: i.size || 0,
@@ -220,17 +253,36 @@ function renderMedia() {
   const list = document.getElementById("mediaList");
   const statusEl = document.getElementById("mediaStatus");
   list.innerHTML = "";
+  // Sizes arrive later (HEAD probes), so the order is re-applied every render.
+  mediaItems.sort(compareItems);
+  updateSortButton();
   const visible = visibleItems();
+  const hidden = mediaItems.length - visible.length;
   if (!visible.length) {
-    list.innerHTML = '<div class="empty">No media detected yet. Play a video first, or use the on-page button.</div>';
+    // 7.4: say why the list is empty. Nothing detected vs. all filtered out.
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    if (!hidden) {
+      empty.textContent = "No media on this page.";
+    } else {
+      empty.append(`${hidden} item(s) hidden by filter \u2014 `);
+      const showAll = document.createElement("button");
+      showAll.type = "button";
+      showAll.className = "linkbtn";
+      showAll.textContent = "Show all";
+      showAll.addEventListener("click", showAllItems);
+      empty.appendChild(showAll);
+    }
+    list.appendChild(empty);
   } else {
     for (const it of visible) list.appendChild(rowEl(it));
   }
   const checked = visible.filter((i) => i.checked);
-  const hidden = mediaItems.length - visible.length;
   statusEl.textContent = mediaItems.length
     ? `${checked.length} of ${visible.length} selected` + (hidden ? ` (${hidden} hidden by filter)` : "")
     : "";
+  // 7.5: nothing visible and nothing hidden: no status line at all.
+  statusEl.style.display = (!visible.length && !hidden) ? "none" : "";
   updateToolbar();
   probeUnknownSizes(visible);
 }
@@ -260,6 +312,37 @@ async function probeUnknownSizes(items) {
   if (changed) renderMedia();
 }
 
+// E4: 16x16 favicon of the page the item came from, from the browser's own
+// favicon cache (needs the "favicon" permission, already declared). The
+// letter tile shows until the image loads and stays if it never does.
+function faviconEl(it) {
+  const tab = it.tabRef || currentTab || {};
+  const pageUrl = tab.url || "";
+  let host = "";
+  try { host = new URL(pageUrl || it.url).hostname.replace(/^www\./, ""); } catch (e) {}
+  const tile = document.createElement("span");
+  tile.className = "fav";
+  tile.textContent = (host[0] || "?").toUpperCase();
+  if (/^https?:/i.test(pageUrl)) {
+    try {
+      const u = new URL(chrome.runtime.getURL("/_favicon/"));
+      u.searchParams.set("pageUrl", pageUrl);
+      u.searchParams.set("size", "16");
+      const img = document.createElement("img");
+      img.alt = "";
+      img.width = 16;
+      img.height = 16;
+      img.addEventListener("load", () => {
+        tile.textContent = "";
+        tile.classList.add("has-img");
+        tile.appendChild(img);
+      });
+      img.src = u.toString();
+    } catch (e) { /* keep the letter tile */ }
+  }
+  return tile;
+}
+
 function rowEl(it) {
   const row = document.createElement("div");
   row.className = "mrow";
@@ -271,7 +354,9 @@ function rowEl(it) {
 
   const name = document.createElement("span");
   name.className = "mname";
-  name.textContent = `${fileName(it.url)} — ${fmtBytes(it.size) || "unknown"}`;
+  name.textContent = chunkLabel(it)
+    || `${fileName(it.url)} — ${fmtBytes(it.size) || "unknown"}`;
+  name.title = it.url;   // full URL on hover
 
   const acts = document.createElement("span");
   acts.className = "macts";
@@ -309,12 +394,28 @@ function rowEl(it) {
   });
 
   acts.append(bDl, bOpen, bCopy);
-  row.append(cb, name, acts);
+  row.append(cb, faviconEl(it), name, acts);
   return row;
 }
 
 function setStatus(text) {
-  document.getElementById("mediaStatus").textContent = text;
+  const el = document.getElementById("mediaStatus");
+  el.textContent = text;
+  el.style.display = "";   // a message must show even when the list is empty
+}
+
+// "Show all" in the hidden-by-filter message: every type on, small files
+// shown, search cleared.
+function showAllItems() {
+  document.querySelectorAll("#filterPanel input[value]").forEach((b) => {
+    if (b.id !== "hideTiny") b.checked = true;
+  });
+  const tiny = document.getElementById("hideTiny");
+  if (tiny) tiny.checked = false;
+  const s = document.getElementById("searchInput");
+  if (s) s.value = "";
+  searchText = "";
+  rebuildFilterSet();
 }
 
 // ---------------- toolbar ----------------
@@ -374,9 +475,24 @@ async function loadCurrent() {
   });
 }
 
-function loadOther() {
+// 7.6: "Other Pages (N)" once other tabs have detected media. The current tab
+// is not "other", so it is left out of the list and the count.
+function setOtherLabel() {
+  document.getElementById("tabOther").textContent =
+    otherTabs.length > 0 ? `Other Pages (${otherTabs.length})` : "Other Pages";
+}
+
+function fetchOtherTabs(cb) {
   chrome.runtime.sendMessage({ type: "GET_ALL_VIDEOS" }, (resp) => {
-    otherTabs = (resp && resp.tabs) || [];
+    const curId = currentTab && currentTab.id;
+    otherTabs = ((resp && resp.tabs) || []).filter((t) => t.id !== curId);
+    setOtherLabel();
+    if (cb) cb();
+  });
+}
+
+function loadOther() {
+  fetchOtherTabs(() => {
     renderOtherTabs();
     if (otherTabs.length) selectOtherTab(otherTabs[0].id, false);
     else setItems([], null);
@@ -572,6 +688,17 @@ async function grabAll(tab) {
     p.style.display = getComputedStyle(p).display === "none" ? "block" : "none";
   });
   await restoreFilter();
+  // E5: restore the saved sort order and let the button cycle it.
+  try {
+    const { popupSort } = await chrome.storage.local.get("popupSort");
+    if (["time", "size", "name"].includes(popupSort)) sortMode = popupSort;
+  } catch (e) {}
+  updateSortButton();
+  document.getElementById("btnSort").addEventListener("click", () => {
+    sortMode = sortMode === "time" ? "size" : sortMode === "size" ? "name" : "time";
+    chrome.storage.local.set({ popupSort: sortMode });
+    renderMedia();
+  });
   document.querySelectorAll("#filterPanel input[type=checkbox]")
     .forEach((b) => b.addEventListener("change", rebuildFilterSet));
   rebuildFilterSet();
@@ -596,6 +723,7 @@ async function grabAll(tab) {
   // grab-all section
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentTab = tab || null;
+  fetchOtherTabs();   // fills in the "Other Pages (N)" label up front
   if (tab) {
     document.getElementById("grabAllBtn").addEventListener("click", () => grabAll(tab));
   }

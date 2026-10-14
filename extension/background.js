@@ -11,26 +11,108 @@ const BACKEND_BASE = "http://127.0.0.1:5757";
 const MEDIA_EXT_REGEX = /\.(mp4|m4v|mov|webm|mkv|avi|m3u8|mpd|mp3|m4a|aac|wav|flac|opus|ogg|jpg|jpeg|png|gif|webp|avif|svg|bmp|ico|pdf|zip|rar|7z|tar|gz|exe|msi|dmg|doc|docx|xls|xlsx|ppt|pptx|csv|txt|epub)(\?|#|$)/i;
 const MEDIA_CT_REGEX = /^(video\/|audio\/|image\/|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml|pdf|zip|x-7z-compressed|x-rar-compressed|x-tar|x-gzip|x-msdownload|x-msi|vnd\.openxmlformats-officedocument|vnd\.ms-excel|vnd\.ms-powerpoint|msword|epub\+zip)|application\/octet-stream)/i;
 
-// tabId -> Map(url -> item)
+// tabId -> Map(dedupKey -> item). The key is the URL minus chunk-range
+// query params (see dedupKey); item.url / item.originalUrl keep the URL as it
+// was first detected.
 const videoMap = new Map();
+
+// 6.4: a chunked stream (e.g. googlevideo) is requested as many URLs that
+// differ only in these params. They must not each become a list entry.
+const CHUNK_PARAMS = new Set(["range", "rn", "rbum"]);
+const MAX_ITEMS_PER_TAB = 200;
+
+function dedupKey(url) {
+  try {
+    const u = new URL(url);
+    const kept = [];
+    for (const [k, v] of u.searchParams) {
+      if (!CHUNK_PARAMS.has(k.toLowerCase())) kept.push([k, v]);
+    }
+    const q = new URLSearchParams(kept).toString();
+    return u.origin + u.pathname + (q ? "?" + q : "");
+  } catch (e) {
+    return url;
+  }
+}
+
+// 6.2: the service worker is torn down after ~30 s idle and the in-memory Map
+// goes with it, so the per-tab list is mirrored into chrome.storage.session
+// (cleared when the browser closes) and hydrated again on startup.
+const VIDEO_MAP_KEY = "videoMapState";
+let _persistTimer = null;
+
+function writeVideoMap() {
+  try {
+    const out = {};
+    for (const [tabId, m] of videoMap) {
+      if (m.size) out[tabId] = Array.from(m.values());
+    }
+    return chrome.storage.session.set({ [VIDEO_MAP_KEY]: out }).catch(() => {});
+  } catch (e) {
+    return Promise.resolve();
+  }
+}
+
+// Debounced: webRequest can fire hundreds of times a second on a busy page.
+function persistVideoMap(immediate) {
+  if (immediate) {
+    clearTimeout(_persistTimer);
+    _persistTimer = null;
+    return writeVideoMap();
+  }
+  if (_persistTimer) return;
+  _persistTimer = setTimeout(() => { _persistTimer = null; writeVideoMap(); }, 300);
+}
+
+// Resolves once the saved list has been merged in. Message handlers that
+// read the list wait on it so a popup opened right after a worker restart
+// doesn't see an empty list.
+const videoMapReady = (async () => {
+  try {
+    const st = await chrome.storage.session.get(VIDEO_MAP_KEY);
+    const saved = st[VIDEO_MAP_KEY] || {};
+    let openTabs = null;
+    try { openTabs = new Set((await chrome.tabs.query({})).map((t) => t.id)); } catch (e) {}
+    for (const [tabKey, items] of Object.entries(saved)) {
+      const tabId = Number(tabKey);
+      if (openTabs && !openTabs.has(tabId)) continue;   // tab closed meanwhile
+      if (!videoMap.has(tabId)) videoMap.set(tabId, new Map());
+      const m = videoMap.get(tabId);
+      for (const it of items || []) {
+        if (!it || !it.url) continue;
+        const key = dedupKey(it.url);
+        if (!m.has(key)) m.set(key, it);   // never clobber what was sniffed since startup
+      }
+      while (m.size > MAX_ITEMS_PER_TAB) m.delete(m.keys().next().value);
+    }
+  } catch (e) { /* session storage unavailable: start empty */ }
+})();
 
 function addItem(tabId, item) {
   if (tabId === undefined || tabId < 0) return;
   if (!videoMap.has(tabId)) videoMap.set(tabId, new Map());
   const m = videoMap.get(tabId);
-  if (m.has(item.url)) {
+  const key = dedupKey(item.url);
+  if (m.has(key)) {
     // Don't overwrite real data with empty data: keep the existing size /
     // content-type when the new entry lacks them.
-    const ex = m.get(item.url);
+    const ex = m.get(key);
     if (!item.size && ex.size) item.size = ex.size;
     if (!item.contentType && ex.contentType) item.contentType = ex.contentType;
     item.timestamp = ex.timestamp;
+    // The first-detected URL stays the item's URL (and the original).
+    item.url = ex.url;
+    item.originalUrl = ex.originalUrl || ex.url;
   } else {
     item.timestamp = Date.now();
+    item.originalUrl = item.url;
   }
-  m.set(item.url, item);
+  m.set(key, item);
+  // Cap the per-tab list: Map keeps insertion order, so the oldest go first.
+  while (m.size > MAX_ITEMS_PER_TAB) m.delete(m.keys().next().value);
   chrome.action.setBadgeText({ tabId, text: String(m.size) }).catch(() => {});
   chrome.action.setBadgeBackgroundColor({ tabId, color: "#2e7d32" }).catch(() => {});
+  persistVideoMap();
 }
 
 chrome.webRequest.onBeforeRequest.addListener(
@@ -64,10 +146,24 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId === 0) {
     videoMap.delete(details.tabId);
     chrome.action.setBadgeText({ tabId: details.tabId, text: "" }).catch(() => {});
+    persistVideoMap(true);
   }
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => videoMap.delete(tabId));
+// 6.3: single-page apps change the URL with pushState/replaceState and never
+// fire onBeforeNavigate, so the previous "page"'s media piled up in the list.
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  if (details.frameId === 0) {
+    videoMap.delete(details.tabId);
+    chrome.action.setBadgeText({ tabId: details.tabId, text: "" }).catch(() => {});
+    persistVideoMap(true);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  videoMap.delete(tabId);
+  persistVideoMap();
+});
 
 async function cookieHeaderFor(url) {
   try {
@@ -76,6 +172,27 @@ async function cookieHeaderFor(url) {
   } catch (e) {
     return "";
   }
+}
+
+// Same-host check used to decide whether page cookies may accompany an item.
+function sameHost(a, b) {
+  try {
+    return new URL(a).hostname.toLowerCase() === new URL(b).hostname.toLowerCase();
+  } catch (e) {
+    return false;
+  }
+}
+
+// Cookies for an item: always the item's own URL first. The page's cookies
+// are only a fallback when the item lives on the page's own host, so session
+// cookies never travel to a third-party CDN.
+async function cookieHeaderForItem(url, pageUrl) {
+  const own = await cookieHeaderFor(url).catch(() => "");
+  if (own) return own;
+  if (pageUrl && sameHost(url, pageUrl)) {
+    return await cookieHeaderFor(pageUrl).catch(() => "");
+  }
+  return "";
 }
 
 async function checkBackend() {
@@ -195,8 +312,7 @@ async function showAddDialogFor(msg) {
   if (!alive) {
     return { ok: false, error: "Video Grabber app isn't running." };
   }
-  const cookie = await cookieHeaderFor(msg.url).catch(() => "");
-  const pageCookie = await cookieHeaderFor(msg.pageUrl).catch(() => "");
+  const cookie = await cookieHeaderForItem(msg.url, msg.pageUrl);
   try {
     const { res, unpaired } = await authedFetch("/show-add-dialog", {
       method: "POST",
@@ -206,7 +322,7 @@ async function showAddDialogFor(msg) {
         filename: msg.filename || null,
         referer: msg.pageUrl,
         page_url: msg.pageUrl,
-        cookie: cookie || pageCookie,
+        cookie: cookie,
         user_agent: navigator.userAgent,
         format_id: msg.format_id || null,
         target_format: msg.target_format || null,
@@ -260,13 +376,79 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 });
 
+// ---- E6: keyboard shortcuts (manifest "commands") --------------------------
+// download-media (Ctrl+Shift+D): send the active tab's largest detected media
+// through the same path as RELAY_DOWNLOAD. open-add-dialog (Ctrl+Shift+A):
+// open the app's Add dialog for the tab's page, same path as SHOW_ADD_DIALOG.
+// Both read the per-tab list directly: a service worker can't message itself,
+// and this is the same data GET_VIDEOS returns.
+function commandNotify(message) {
+  try {
+    chrome.notifications.create("", {
+      type: "basic",
+      iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+      title: "Video Grabber",
+      message: String(message || ""),
+    });
+  } catch (e) {}
+}
+
+const MEDIA_ITEM_REGEX = /\.(mp4|m4v|mov|webm|mkv|avi|m3u8|mpd|mp3|m4a|aac|wav|flac|opus|ogg)(\?|#|$)/i;
+
+// Largest item wins (unknown sizes count as 0), newest breaks ties. Pictures,
+// fonts and documents only compete when the tab has no audio/video at all.
+function pickLargestItem(items) {
+  const isMedia = (it) => MEDIA_ITEM_REGEX.test(it.url)
+    || /^(video|audio)\//i.test(it.contentType || "")
+    || /mpegurl|dash\+xml/i.test(it.contentType || "");
+  const media = items.filter(isMedia);
+  const pool = media.length ? media : items;
+  let best = null;
+  for (const it of pool) {
+    if (!best
+        || (it.size || 0) > (best.size || 0)
+        || ((it.size || 0) === (best.size || 0) && (it.timestamp || 0) >= (best.timestamp || 0))) {
+      best = it;
+    }
+  }
+  return best;
+}
+
+chrome.commands.onCommand.addListener(async (command, tab) => {
+  try {
+    let t = tab;
+    if (!t || !t.id || !t.url) {
+      [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    }
+    if (!t || !/^https?:/i.test(t.url || "")) {
+      commandNotify("Open a web page first.");
+      return;
+    }
+    if (command === "download-media") {
+      await videoMapReady;
+      const m = videoMap.get(t.id);
+      const best = pickLargestItem(m ? Array.from(m.values()) : []);
+      if (!best) {
+        commandNotify("No media detected on this page yet. Play it first.");
+        return;
+      }
+      const resp = await sendToBackend({ url: best.url, pageUrl: t.url });
+      commandNotify(resp.ok ? "Sent to Video Grabber \u2713" : (resp.error || "Couldn't send that to the app."));
+    } else if (command === "open-add-dialog") {
+      const resp = await showAddDialogFor({ url: t.url, pageUrl: t.url });
+      if (!resp.ok) commandNotify(resp.error || "Couldn't open the app's Add dialog.");
+    }
+  } catch (e) {
+    commandNotify("Shortcut failed: " + String(e));
+  }
+});
+
 async function sendToBackend({ url, pageUrl, filename, format_id, target_format }) {
   const alive = await checkBackend();
   if (!alive) {
     return { ok: false, error: "Video Grabber app isn't running. Launch the desktop app, then try again." };
   }
-  const cookie = await cookieHeaderFor(url).catch(() => "");
-  const pageCookie = await cookieHeaderFor(pageUrl).catch(() => "");
+  const cookie = await cookieHeaderForItem(url, pageUrl);
   try {
     const { res, unpaired } = await authedFetch("/download", {
       method: "POST",
@@ -275,7 +457,7 @@ async function sendToBackend({ url, pageUrl, filename, format_id, target_format 
         url,
         referer: pageUrl,
         page_url: pageUrl,
-        cookie: cookie || pageCookie,
+        cookie: cookie,
         user_agent: navigator.userAgent,
         filename: filename || null,
         format_id: format_id || null,
@@ -294,9 +476,29 @@ async function sendToBackend({ url, pageUrl, filename, format_id, target_format 
   }
 }
 
+// Mirror of the interceptDownloads option so the downloads listener never has
+// to await storage before it can cancel. Loaded once per service-worker start
+// and kept current by storage.onChanged.
+let interceptDownloads = false;
+let interceptLoaded = false;
+const interceptReady = chrome.storage.local.get("interceptDownloads").then(
+  (v) => { interceptDownloads = !!v.interceptDownloads; interceptLoaded = true; },
+  () => { interceptLoaded = true; }
+);
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.interceptDownloads) {
+    interceptDownloads = !!changes.interceptDownloads.newValue;
+    interceptLoaded = true;
+  }
+});
+
 chrome.downloads.onCreated.addListener(async (item) => {
+  console.debug("[VG] onCreated fired:", (item.url || "").slice(0, 120),
+                "byExtensionId:", item.byExtensionId);
   const t0 = Date.now();
-  const { interceptDownloads } = await chrome.storage.local.get("interceptDownloads");
+  // Only true on the very first event after a cold service-worker wake,
+  // before the startup read above has landed. Normally skipped (no await).
+  if (!interceptLoaded) await interceptReady;
   if (!interceptDownloads) return;
 
   if (!item.url) return;
@@ -315,10 +517,14 @@ chrome.downloads.onCreated.addListener(async (item) => {
   // this runs. Note Chrome only creates the download item once the server
   // has answered, so a slow server delays this event no matter what we do;
   // browserLag below shows how much of any delay happened before we ran.
+  // The cancel is the first await. If it fails the download has already
+  // finished (the browser won the race), so it must never be re-issued below.
+  let cancelled = false;
   try {
-    chrome.downloads.cancel(item.id);
+    await chrome.downloads.cancel(item.id);
+    cancelled = true;
   } catch (e) {
-    return;
+    cancelled = false;
   }
   const browserLag = item.startTime ? t0 - Date.parse(item.startTime) : -1;
 
@@ -352,12 +558,14 @@ chrome.downloads.onCreated.addListener(async (item) => {
   } catch (e) {
     handedOff = false;
   }
-  console.debug(`[VG] intercept: browser lag ${browserLag}ms, handoff ${Date.now() - t0}ms, ok=${handedOff}`);
+  console.debug(`[VG] intercept: browser lag ${browserLag}ms, handoff ${Date.now() - t0}ms, ok=${handedOff} cancelled=${cancelled}`);
   if (handedOff) {
     noteFavicon(item.referrer || item.url);
-  } else {
+  } else if (cancelled) {
     // The browser download was already cancelled: give it back if the app
-    // rejected the handoff so the user's click never just vanishes.
+    // rejected the handoff so the user's click never just vanishes. When the
+    // cancel failed the browser's copy is complete, so re-issuing would only
+    // create a duplicate.
     try {
       chrome.downloads.download({ url: item.url, filename: filename || undefined });
     } catch (_) {}
@@ -397,13 +605,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "Video Grabber app isn't running." });
         return;
       }
-      const cookie = await cookieHeaderFor(msg.pageUrl).catch(() => "");
+      // Page cookies go in the top-level field only when every item is on the
+      // page's own host. Otherwise the top-level cookie is empty and each
+      // item carries cookies fetched for its own URL, so nothing reaches a
+      // third-party host.
+      const allSameHost = items.every((it) => it && it.url && sameHost(it.url, msg.pageUrl));
+      let cookie = "";
+      let sendItems = items;
+      if (allSameHost) {
+        cookie = await cookieHeaderFor(msg.pageUrl).catch(() => "");
+      } else {
+        sendItems = await Promise.all(items.map(async (it) => ({
+          ...it,
+          cookie: it && it.url ? await cookieHeaderFor(it.url).catch(() => "") : "",
+        })));
+      }
       try {
         const { res, unpaired } = await authedFetch("/batch", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            items,
+            items: sendItems,
             referer: msg.pageUrl,
             page_url: msg.pageUrl,
             cookie,
@@ -426,22 +648,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "GET_VIDEOS") {
-    const m = videoMap.get(msg.tabId);
-    sendResponse({ videos: m ? Array.from(m.values()) : [] });
-    return false;
+    // Waits for the session-storage hydration (see videoMapReady).
+    videoMapReady.then(() => {
+      const m = videoMap.get(msg.tabId);
+      sendResponse({ videos: m ? Array.from(m.values()) : [] });
+    });
+    return true; // async
   }
 
   if (msg.type === "CLEAR_VIDEOS") {
-    videoMap.delete(msg.tabId);
-    chrome.action.setBadgeText({ tabId: msg.tabId, text: "" }).catch(() => {});
-    sendResponse({ ok: true });
-    return false;
+    videoMapReady.then(() => {
+      videoMap.delete(msg.tabId);
+      chrome.action.setBadgeText({ tabId: msg.tabId, text: "" }).catch(() => {});
+      persistVideoMap(true);
+      sendResponse({ ok: true });
+    });
+    return true; // async
   }
 
   if (msg.type === "GET_ALL_VIDEOS") {
     // Every tab with detected media: [{id, url, title, items}]. Tabs that
     // have been closed since detection are skipped.
     (async () => {
+      await videoMapReady;
       const out = [];
       for (const [tabId, m] of videoMap) {
         if (!m.size) continue;
@@ -466,10 +695,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       // Forward the site's own cookies (url's origin first, page as
-      // fallback), plus referer and UA, so restricted tweets probe the
-      // same way they download.
-      const cookie = await cookieHeaderFor(msg.url).catch(() => "");
-      const pageCookie = cookie ? "" : await cookieHeaderFor(msg.pageUrl).catch(() => "");
+      // fallback only when the url is on the page's own host), plus
+      // referer and UA, so restricted tweets probe the same way they download.
+      const cookie = await cookieHeaderForItem(msg.url, msg.pageUrl);
       try {
         const { res, unpaired } = await authedFetch("/probe-formats", {
           method: "POST",
@@ -477,7 +705,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           body: JSON.stringify({
             url: msg.url,
             referer: msg.pageUrl || msg.url,
-            cookie: cookie || pageCookie,
+            cookie: cookie,
             user_agent: navigator.userAgent,
           }),
         });
@@ -494,6 +722,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "SHOW_ADD_DIALOG") {
     // Pill -> pre-download confirmation dialog in the desktop app.
     showAddDialogFor(msg).then(sendResponse);
+    return true; // async
+  }
+
+  if (msg.type === "VG_STATE") {
+    // Armed-state query for the blob-download hook (content.js). "intercept"
+    // is the mirrored interceptDownloads flag; awaiting interceptReady keeps
+    // a cold service-worker wake from reporting false before the read lands.
+    (async () => {
+      try {
+        const [alive, token] = await Promise.all([checkBackend(), getApiToken(), interceptReady]);
+        sendResponse({ alive: !!alive, paired: !!token, intercept: !!interceptDownloads });
+      } catch (e) {
+        sendResponse({ alive: false, paired: false, intercept: false });
+      }
+    })();
     return true; // async
   }
 
