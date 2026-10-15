@@ -55,14 +55,15 @@ function extOf(url) {
 
 function categoryOf(url) {
   const e = extOf(url);
-  if (["mp4", "m4v", "mov", "avi"].includes(e)) return "mp4";
+  if (["mp4", "m4v", "mov", "avi", "flv", "wmv", "mpg", "mpeg", "ts", "3gp", "3g2", "m2ts", "mts", "vob", "ogv", "rm", "rmvb", "asf", "mxf", "divx"].includes(e)) return "mp4";
   if (e === "webm" || e === "mkv") return "webm";
   if (e === "m3u8" || e === "mpd") return "m3u8";
-  if (["mp3", "m4a", "aac", "wav", "flac", "opus", "ogg"].includes(e)) return "mp3";
-  if (["jpg", "jpeg", "png", "gif", "webp", "avif", "svg", "bmp", "ico"].includes(e)) return "image";
-  if (["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "txt", "epub"].includes(e)) return "doc";
-  if (["zip", "rar", "7z", "tar", "gz"].includes(e)) return "archive";
-  if (["exe", "msi", "dmg"].includes(e)) return "programs";
+  if (["mp3", "m4a", "aac", "wav", "flac", "opus", "ogg", "wma", "aiff", "aif", "alac", "ape", "m4b", "mid", "midi", "amr"].includes(e)) return "mp3";
+  if (["jpg", "jpeg", "jpe", "png", "gif", "webp", "avif", "heic", "heif", "bmp", "ico", "tif", "tiff", "jxl", "psd", "raw", "dng", "cr2", "nef", "xcf", "svg"].includes(e)) return "image";
+  if (["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "tsv", "txt", "md", "rtf", "odt", "ods", "odp", "json", "xml", "yaml", "yml", "epub", "mobi", "azw3"].includes(e)) return "doc";
+  if (["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "lz", "lzma", "zst", "cab", "iso", "img"].includes(e)) return "archive";
+  if (["exe", "msi", "dmg", "deb", "rpm", "apk", "appimage", "appx", "bat", "cmd", "sh", "ps1", "jar", "py", "js"].includes(e)) return "programs";
+  if (["ttf", "otf", "woff", "woff2", "eot"].includes(e)) return "font";
   return "other";
 }
 
@@ -371,7 +372,7 @@ function rowEl(it) {
     chrome.runtime.sendMessage(
       { type: "RELAY_DOWNLOAD", url: it.url, pageUrl: tab.url,
         tabId: tab.id,
-        filename: redditCdnName(it.url, tab) || (/\.(mp4|m4v|mov|webm|mkv|avi|mp3|m4a|aac|wav|flac|m3u8|mpd|pdf|zip|rar|7z|exe|msi|dmg)(\?|#|$)/i.test(it.url)
+        filename: redditCdnName(it.url, tab) || (/\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpg|mpeg|mp3|m4a|aac|wav|flac|ogg|opus|wma|aiff|m4b|m3u8|mpd|pdf|zip|rar|7z|tar|gz|tgz|bz2|xz|zst|cab|iso|epub|mobi|azw3|docx?|xlsx?|pptx?|txt|md|rtf|odt|ods|odp|csv|tsv|json|xml|yaml|yml|exe|msi|dmg|deb|rpm|apk|appimage|bat|cmd|sh|ps1|jar|jpe?g|png|gif|webp|avif|heic|heif|bmp|ico|tif|tiff|jxl|psd|raw|woff2?|eot|ttf|otf|3g2|3gp|aif|alac|amr|ape|appx|asf|cr2|divx|dng|img|jpe|js|lz|lzma|m2ts|mid|midi|mts|mxf|nef|ogv|py|rm|rmvb|svg|ts|vob|xcf)(\?|#|$)/i.test(it.url)
           ? fileName(it.url) : undefined) },
       (resp) => {
         bDl.textContent = "⬇";

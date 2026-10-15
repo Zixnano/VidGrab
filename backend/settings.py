@@ -62,15 +62,49 @@ JOBS_PATH = HOME / "jobs.json"
 # Canonical category list (single source of truth — gui_qt.py used to keep
 # its own duplicate copy of this; category_for() below always falls back
 # to "Other" for unmapped extensions, so it's included here too).
-CATEGORIES = ("Video", "Music", "Compressed", "Documents", "Programs", "Other")
+CATEGORIES = ("Video", "Music", "Images", "Compressed", "Documents", "Programs", "Fonts", "Other")
 
-CATEGORY_MAP = {
-    ".mp4": "Video", ".mkv": "Video", ".webm": "Video", ".avi": "Video", ".mov": "Video", ".m4v": "Video",
-    ".mp3": "Music", ".wav": "Music", ".flac": "Music", ".m4a": "Music", ".aac": "Music",
-    ".zip": "Compressed", ".rar": "Compressed", ".7z": "Compressed", ".tar": "Compressed", ".gz": "Compressed",
-    ".pdf": "Documents", ".doc": "Documents", ".docx": "Documents", ".txt": "Documents", ".ppt": "Documents", ".pptx": "Documents",
-    ".exe": "Programs", ".msi": "Programs", ".dmg": "Programs",
+# Category -> extensions, kept as sets and derived into the lookup dict so
+# the two can never drift apart. Anything not listed lands in "Other".
+# "Images" and "Fonts" are real sidebar categories: the app is a general
+# download manager, not just video. (If the GUI sidebar keeps its own copy
+# of the category list, add the two new names there too.)
+_CATEGORY_EXTS = {
+    "Video": {"mp4", "m4v", "mov", "webm", "mkv", "avi", "flv", "wmv", "mpg", "mpeg",
+              "ts", "m2ts", "mts", "vob", "ogv", "divx", "rm", "rmvb", "asf", "mxf",
+              "3gp", "3g2"},
+    "Music": {"mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "aif",
+              "alac", "ape", "m4b", "mid", "midi", "amr"},
+    "Images": {"jpg", "jpeg", "jpe", "png", "gif", "webp", "avif", "heic", "heif", "bmp",
+               "svg", "ico", "tif", "tiff", "jxl", "dng", "cr2", "nef", "raw", "psd",
+               "xcf"},
+    "Compressed": {"zip", "rar", "7z", "tar", "gz", "bz2", "xz", "lz", "lzma", "zst",
+                   "cab", "iso", "img", "tgz",
+                   # compound forms, matched longest-first by split_ext():
+                   "tar.gz", "tar.bz2", "tar.xz"},
+    "Documents": {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md",
+                  "rtf", "odt", "ods", "odp", "csv", "tsv", "json", "xml", "yaml",
+                  "yml", "epub", "mobi", "azw3"},
+    "Programs": {"exe", "msi", "dmg", "deb", "rpm", "apk", "appimage", "bat", "cmd",
+                 "sh", "ps1", "jar", "py", "js", "appx"},
+    "Fonts": {"ttf", "otf", "woff", "woff2", "eot"},
 }
+CATEGORY_MAP = {("." + ext): cat for cat, exts in _CATEGORY_EXTS.items()
+                for ext in exts}
+
+# Compound suffixes matched longest-first: os.path.splitext("file.tar.gz")
+# returns ".gz", hiding the real archive type. ".tgz" is tar+gzip too.
+_COMPOUND_EXTS = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")
+
+
+def split_ext(name):
+    """file.tar.gz -> (stem, '.tar.gz'); everything else defers to
+    os.path.splitext. Longest compound suffix wins."""
+    low = (name or "").lower()
+    for ext in _COMPOUND_EXTS:
+        if low.endswith(ext):
+            return name[:-len(ext)], ext
+    return os.path.splitext(name)
 DIRECT_EXT_RE = re.compile(r"\.(mp4|m4v|mov|webm|mkv|avi|mp3|wav|flac|m4a|aac|zip|rar|7z|tar|gz|pdf|docx?|pptx?|txt|exe|msi|dmg)(\?|#|$)", re.I)
 
 
@@ -317,10 +351,20 @@ _CT_EXT_MAP = [
     ("video/quicktime", ".mov"), ("video/x-msvideo", ".avi"), ("video/mp2t", ".ts"),
     ("audio/mpeg", ".mp3"), ("audio/mp4", ".m4a"), ("audio/x-m4a", ".m4a"),
     ("audio/wav", ".wav"), ("audio/x-wav", ".wav"), ("audio/flac", ".flac"),
-    ("audio/aac", ".aac"), ("application/zip", ".zip"),
+    ("audio/aac", ".aac"), ("audio/ogg", ".ogg"), ("audio/opus", ".opus"),
+    ("application/zip", ".zip"),
     ("application/x-zip-compressed", ".zip"), ("application/x-7z-compressed", ".7z"),
     ("application/x-rar-compressed", ".rar"), ("application/pdf", ".pdf"),
+    ("application/epub+zip", ".epub"), ("application/x-mobipocket-ebook", ".mobi"),
+    ("application/json", ".json"), ("text/markdown", ".md"),
+    ("application/x-tar", ".tar"), ("application/gzip", ".gz"),
+    ("application/x-bzip2", ".bz2"), ("application/x-xz", ".xz"),
+    ("application/zstd", ".zst"), ("application/x-iso9660-image", ".iso"),
     ("image/jpeg", ".jpg"), ("image/png", ".png"), ("image/gif", ".gif"),
+    ("image/webp", ".webp"), ("image/avif", ".avif"), ("image/heic", ".heic"),
+    ("image/tiff", ".tiff"), ("image/bmp", ".bmp"), ("image/svg+xml", ".svg"),
+    ("font/woff2", ".woff2"), ("font/woff", ".woff"),
+    ("application/font-woff", ".woff"), ("application/vnd.ms-fontobject", ".eot"),
 ]
 _HEAD_EXT_CACHE = {}
 
@@ -476,8 +520,8 @@ def _unique_path(path, taken=None):
 
 
 def category_for(filename):
-    ext = os.path.splitext(filename)[1].lower()
-    return CATEGORY_MAP.get(ext, "Other")
+    _, ext = split_ext(filename)
+    return CATEGORY_MAP.get(ext.lower(), "Other")
 
 
 # Any URL whose path ends in one of these extensions is a plain file
@@ -487,15 +531,35 @@ def category_for(filename):
 # html/htm/php are deliberately NOT listed: a page URL such as
 # https://site.com/v/123.html should try yt-dlp first (it is usually a video
 # page), not be saved as an HTML file. It is matched against the URL PATH only.
-_PLAIN_FILE_EXT_RE = re.compile(
-    r"\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpg|mpeg|ts|"
-    r"mp3|wav|flac|m4a|aac|ogg|opus|"
-    r"zip|rar|7z|tar|gz|bz2|xz|"
-    r"pdf|docx?|xlsx?|pptx?|txt|md|csv|json|xml|yaml|yml|"
-    r"css|"
-    r"py|js|ts|java|c|cpp|h|hpp|rs|go|rb|sh|bat|ps1|"
-    r"exe|msi|dmg|deb|rpm|apk|"
-    r"jpg|jpeg|png|gif|webp|avif|svg|bmp|ico)(\?|#|$)", re.I)
+# One tuple drives BOTH the path check and the query-value check below, so
+# they can never drift. Covers every family _CATEGORY_EXTS knows about (the
+# app is a general download manager) plus code files.
+# html/htm/php are deliberately NOT listed: a page URL such as
+# https://site.com/v/123.html should try yt-dlp first (it is usually a video
+# page), not be saved as an HTML file. It is matched against the URL PATH only.
+_PLAIN_FILE_EXTS = (
+    "mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpg|mpeg|ts|m2ts|mts|vob|ogv|divx|rm|rmvb|asf|mxf|3gp|3g2|"
+    "mp3|wav|flac|m4a|aac|ogg|opus|wma|aiff|aif|alac|ape|m4b|mid|midi|amr|"
+    "zip|rar|7z|tar|gz|bz2|xz|lz|lzma|zst|cab|iso|img|tgz|"
+    "pdf|docx?|xlsx?|pptx?|txt|md|rtf|csv|tsv|json|xml|yaml|yml|odt|ods|odp|epub|mobi|azw3|"
+    "css|"
+    "py|js|ts|java|c|cpp|h|hpp|rs|go|rb|sh|bat|cmd|ps1|"
+    "exe|msi|dmg|deb|rpm|apk|appimage|appx|jar|"
+    "jpg|jpeg|jpe|png|gif|webp|avif|svg|bmp|ico|tif|tiff|heic|heif|jxl|psd|raw|dng|cr2|nef|xcf|"
+    "ttf|otf|woff2?|eot"
+)
+_PLAIN_FILE_EXT_RE = re.compile(r"\.(" + _PLAIN_FILE_EXTS + r")(\?|#|$)", re.I)
+
+# Page extensions: a URL ending in one of these is a document page, not a
+# file — yt-dlp gets first crack at it (its generic extractor can still pull
+# a player out of the page).
+_PAGE_EXT_RE = re.compile(r"\.(html?|php|aspx?|jsp|do)(\?|#|$)", re.I)
+# ANY other dotted suffix on the path means "some file", even an extension
+# we don't know: the generic engine just copies bytes and names it from the
+# URL, while yt-dlp would download it and name the result the infamous
+# "UNKNOWN_VIDEO" (an .epub URL used to land that way before .epub was in
+# _PLAIN_FILE_EXTS). At least one letter required, so "/v/1.5" is not a file.
+_EXT_LIKE_RE = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,7}(\?|#|$)")
 
 # Query params that commonly carry the filename (Dropbox, ChatGPT,
 # S3 presigned URLs, Google Drive, generic file hosts).
@@ -521,14 +585,7 @@ def detect_type(url):
         qs = parse_qs(urlparse(url).query)
         for key in _FILENAME_QUERY_KEYS:
             for v in qs.get(key, []):
-                if re.search(r"\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpg|mpeg|ts|"
-                             r"mp3|wav|flac|m4a|aac|ogg|opus|"
-                             r"zip|rar|7z|tar|gz|bz2|xz|"
-                             r"pdf|docx?|xlsx?|pptx?|txt|md|csv|json|xml|yaml|yml|"
-                             r"html?|css|"
-                             r"py|js|ts|java|c|cpp|h|hpp|rs|go|rb|php|sh|bat|ps1|"
-                             r"exe|msi|dmg|deb|rpm|apk|"
-                             r"jpg|jpeg|png|gif|webp|avif|svg|bmp|ico)$",
+                if re.search(r"\.(" + _PLAIN_FILE_EXTS + r"|html?|php)$",
                              (v or "").strip(), re.I):
                     return "generic"
         # "?format=jpg" / "?f=mp4": value is a bare extension (anchored).
@@ -538,6 +595,17 @@ def detect_type(url):
                     return "generic"
     except Exception:
         pass
+    # No filename signal at all from here on. Page-like addresses keep the
+    # yt-dlp default (embedded-player extraction is still worth a try), but
+    # any other dotted suffix is a plain file even when we don't know the
+    # extension — see _EXT_LIKE_RE above for why.
+    if _PAGE_EXT_RE.search(_url_path):
+        return "ytdlp"
+    # An "@handle" last segment (youtube.com/@some.handle, tiktok.com/@john.doe)
+    # is a channel or profile page, not a file, even though handles may hold dots.
+    _last_seg = _url_path.rstrip("/").rsplit("/", 1)[-1]
+    if _EXT_LIKE_RE.search(_url_path) and not _last_seg.startswith("@"):
+        return "generic"
     return "ytdlp"
 
 

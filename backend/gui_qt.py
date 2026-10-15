@@ -2028,7 +2028,7 @@ class SettingsDialog(QDialog):
         self.output_dir = QLineEdit(s.get("output_dir", ""))
         stl.addRow("Default folder", self.output_dir)
         self.percat_edits = {}
-        for cat in ["Video", "Music", "Compressed", "Documents", "Programs", "Other"]:
+        for cat in CATEGORIES:  # single source of truth (settings.py); includes Images and Fonts
             e = QLineEdit(s.get("per_category_dirs", {}).get(cat, ""))
             e.setPlaceholderText("(use default folder)")
             self.percat_edits[cat] = e

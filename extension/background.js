@@ -8,7 +8,7 @@
 
 const BACKEND_BASE = "http://127.0.0.1:5757";
 
-const MEDIA_EXT_REGEX = /\.(mp4|m4v|mov|webm|mkv|avi|m3u8|mpd|mp3|m4a|aac|wav|flac|opus|ogg|jpg|jpeg|png|gif|webp|avif|svg|bmp|ico|pdf|zip|rar|7z|tar|gz|exe|msi|dmg|doc|docx|xls|xlsx|ppt|pptx|csv|txt|epub)(\?|#|$)/i;
+const MEDIA_EXT_REGEX = /\.(mp4|m4v|mov|webm|mkv|avi|divx|flv|wmv|mpg|mpeg|ts|m2ts|mts|vob|ogv|rm|rmvb|asf|mxf|3gp|3g2|m3u8|mpd|mp3|m4a|aac|wav|flac|opus|ogg|wma|aiff|aif|alac|ape|m4b|mid|midi|amr|jpe?g|png|gif|webp|avif|heic|heif|bmp|svg|ico|tif|tiff|jxl|psd|raw|dng|cr2|nef|xcf|pdf|epub|mobi|azw3|docx?|xlsx?|pptx?|txt|md|rtf|odt|ods|odp|csv|tsv|json|xml|yaml|yml|zip|rar|7z|tar|gz|tgz|bz2|xz|lz|lzma|zst|cab|iso|img|exe|msi|dmg|deb|rpm|apk|appimage|appx|bat|cmd|sh|ps1|jar|ttf|otf|woff2?|eot)(\?|#|$)/i;
 const MEDIA_CT_REGEX = /^(video\/|audio\/|image\/|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml|pdf|zip|x-7z-compressed|x-rar-compressed|x-tar|x-gzip|x-msdownload|x-msi|vnd\.openxmlformats-officedocument|vnd\.ms-excel|vnd\.ms-powerpoint|msword|epub\+zip)|application\/octet-stream)/i;
 
 // tabId -> Map(dedupKey -> item). The key is the URL minus chunk-range
