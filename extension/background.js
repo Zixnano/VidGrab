@@ -110,13 +110,26 @@ function addItem(tabId, item) {
   m.set(key, item);
   // Cap the per-tab list: Map keeps insertion order, so the oldest go first.
   while (m.size > MAX_ITEMS_PER_TAB) m.delete(m.keys().next().value);
-  chrome.action.setBadgeText({ tabId, text: String(m.size) }).catch(() => {});
+  setBadge(tabId, String(m.size));
   chrome.action.setBadgeBackgroundColor({ tabId, color: "#2e7d32" }).catch(() => {});
   persistVideoMap();
 }
 
+// Chrome reports tabId -1 for requests and navigations that have no tab (prerender,
+// some extension and service-worker requests). setBadgeText throws SYNCHRONOUSLY on a
+// negative tabId, so a .catch() never runs; check the id and wrap the call instead.
+function setBadge(tabId, text) {
+  if (typeof tabId !== "number" || tabId < 0) return;
+  try {
+    chrome.action.setBadgeText({ tabId, text }).catch(() => {});
+  } catch (e) {
+    // Tab closed or id invalid: nothing to badge.
+  }
+}
+
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
+    if (details.tabId < 0) return;
     if (MEDIA_EXT_REGEX.test(details.url)) {
       addItem(details.tabId, { url: details.url, source: "url-pattern", contentType: null });
     }
@@ -126,6 +139,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
+    if (details.tabId < 0) return;
     const headers = details.responseHeaders || [];
     const ct = headers.find((h) => h.name.toLowerCase() === "content-type");
     const cl = headers.find((h) => h.name.toLowerCase() === "content-length");
@@ -145,7 +159,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId === 0) {
     videoMap.delete(details.tabId);
-    chrome.action.setBadgeText({ tabId: details.tabId, text: "" }).catch(() => {});
+    setBadge(details.tabId, "");
     persistVideoMap(true);
   }
 });
@@ -155,7 +169,7 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (details.frameId === 0) {
     videoMap.delete(details.tabId);
-    chrome.action.setBadgeText({ tabId: details.tabId, text: "" }).catch(() => {});
+    setBadge(details.tabId, "");
     persistVideoMap(true);
   }
 });
@@ -659,7 +673,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "CLEAR_VIDEOS") {
     videoMapReady.then(() => {
       videoMap.delete(msg.tabId);
-      chrome.action.setBadgeText({ tabId: msg.tabId, text: "" }).catch(() => {});
+      setBadge(msg.tabId, "");
       persistVideoMap(true);
       sendResponse({ ok: true });
     });

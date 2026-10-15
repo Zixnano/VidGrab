@@ -503,6 +503,17 @@ def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None
         with requests.get(url, headers=h, stream=True,
                            timeout=STATE["connection_timeout"],
                            proxies=settings.proxies_for(url)) as r:
+            if r.status_code == 200:
+                # Server ignored the Range header and returned the whole
+                # file. This happens on CDNs whose edge nodes disagree about
+                # Range support — the same URL works via curl, but a
+                # particular node here answers 200 instead of 206. Not a
+                # failure: set a flag so run_generic_segmented can fall
+                # back to single-stream, then abort this segment.
+                job["_segments_range_fail"] = True
+                if cancel is not None:
+                    cancel.set()
+                return
             if r.status_code != 206:
                 raise RuntimeError(f"segment {idx} got HTTP {r.status_code}, expected 206")
             with open(part_path, "wb") as f:
@@ -552,6 +563,7 @@ def run_generic_segmented(job_id, probe=None):
     parts = []
     threads = []
     cancel = threading.Event()
+    job.pop("_segments_range_fail", None)
     job["size_total"] = total
     job["size_done"] = 0
     transition(job, JobEvent.START)
@@ -577,6 +589,18 @@ def run_generic_segmented(job_id, probe=None):
         log(f"job {job_id}: stopped")
         save_jobs_snapshot()
         return
+    # Server refused Range support mid-flight: fall back to single-stream.
+    # Must be checked BEFORE the job["error"] branch below so the flag
+    # case doesn't also trip the generic error path.
+    if job.pop("_segments_range_fail", False):
+        for p in parts:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        log(f"job {job_id}: server ignored Range on a segment, "
+            f"falling back to single-stream download")
+        return _run_generic_single(job_id)
     if job.get("error"):
         _try_transition(job, JobEvent.FAIL)
         log(f"job {job_id}: FAILED (segmented) — {job['error']}")
@@ -1171,4 +1195,3 @@ def _probe_recording(path):
         return True, ""
     except Exception as e:
         return False, str(e)
-
