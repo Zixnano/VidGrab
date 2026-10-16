@@ -25,6 +25,44 @@ from typing import Callable, Optional, Protocol
 from logging_setup import log
 
 
+# ---------------------------------------------------------------------------
+# yt-dlp extension guard workaround.
+#
+# yt-dlp refuses to download a resolved media URL whose filename extension
+# is a script extension (".php", ".asp", etc.) — it treats that as a sign
+# the URL isn't really media and skips it "for safety reasons". Some sites
+# (e.g. camstreams.tv) serve real MP4s from a ".php" endpoint: the URL
+# extension is the handler name, not the payload type. For those, yt-dlp
+# errors out with "The extracted extension ('php') is unusual and will be
+# skipped for safety reasons" and the download can't proceed.
+#
+# InfoExtractor._check_ext is the guard. Wrapping it here to allow a small
+# whitelist of script extensions lets those downloads through, while every
+# other extension still goes through the original check unchanged.
+#
+# Installed at import time so it's active before any YoutubeDL instance is
+# constructed (YoutubeDL is imported lazily inside download()/probe()).
+# Wrapped in try/except so a future yt-dlp internal rename can't break the
+# whole backend — worst case the patch is a no-op and behavior is unchanged.
+try:
+    from yt_dlp.extractor.common import InfoExtractor as _VG_InfoExtractor
+    _VG_EXT_WHITELIST = {"php", "asp", "aspx", "jsp"}
+    _vg_orig_check_ext = _VG_InfoExtractor._check_ext
+
+    def _vg_check_ext(self, ext):
+        if ext and ext.lower() in _VG_EXT_WHITELIST:
+            return ext
+        return _vg_orig_check_ext(self, ext)
+
+    _VG_InfoExtractor._check_ext = _vg_check_ext
+except Exception:
+    # If this ever fails (yt-dlp refactor, missing module), leave the
+    # original guard in place. Downloads from .php endpoints will fail as
+    # before; everything else is unaffected.
+    pass
+# ---------------------------------------------------------------------------
+
+
 # Initialized at module level: find_js_runtime() reads this global BEFORE
 # first assignment — without the init the first call raises NameError.
 _YTDLP_JS_RUNTIME_CACHE = None
@@ -673,8 +711,7 @@ class YtDlpEngine:
             archive_add(seen.get("ek") or "youtube", seen["id"])
 
         # v5: title-named jobs report the real final path from post_hooks.
-        # Now used for every non-playlist job: the glob below can pick up an
-        # unrelated bigger file that happens to share the stem. The glob is
+        # Now used for every non-playlist job: the glob below can pick up an        # unrelated bigger file that happens to share the stem. The glob is
         # only the fallback when yt-dlp reported no path or the file is gone.
         if final_paths and not is_playlist:
             _reported = Path(final_paths[-1])
