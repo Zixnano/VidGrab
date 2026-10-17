@@ -145,11 +145,15 @@
   function looksLikeSniffedVideo(url) {
     try {
       const u = new URL(url);
+      if (/dict-[0-9a-f]{4,}/i.test(u.href)) return false;
+      // HLS/DASH manifests are trusted on any host: background.js already
+      // reduced them to the top-level master, and they are the only usable
+      // handle on a blob/MSE player outside the extractor sites.
+      if (/\.(m3u8|mpd)(\?|#|$)/i.test(u.pathname + u.search)) return true;
       if (!SNIFF_MEDIA_HOSTS.some((rx) => rx.test(u.hostname))) return false;
       // Reddit serves small player-metadata blobs named dict-<hex>… — never
       // media. Real candidates end in a video extension or are HLS/DASH
       // manifests (m3u8 / mpd somewhere in the URL).
-      if (/dict-[0-9a-f]{4,}/i.test(u.href)) return false;
       return SNIFF_FILE_REGEX.test(u.href) || /m3u8|mpd/i.test(u.href);
     } catch (e) {
       return false;
@@ -1069,7 +1073,19 @@
           return;
         }
 
-        // Non-extractor MSE: only recording is possible.
+        // Non-extractor MSE/blob player: prefer the sniffed HLS/DASH manifest
+        // over MediaRecorder. Recording stays below as the last resort.
+        const sniffPh2 = addMenuItem(menu, "Looking for sniffed stream…",
+          { dim: true, header: true });
+        querySniffedVideos((best) => {
+          if (seq !== menuSeq || !menuOpen) return;
+          if (!best) { sniffPh2.remove(); return; }
+          const item = addMenuItem(menu, "Download stream (HLS/DASH)", {},
+            () => sendChoice({ url: best.url, target_format: "mp4" }));
+          menu.insertBefore(item, menu.children[1] || null);
+          sniffPh2.remove();
+          placeMenu();
+        });
         addRecordItems(menu, video, overlay, closeMenu);
         menu.style.display = "flex";
         placeMenu();

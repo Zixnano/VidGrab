@@ -492,6 +492,44 @@ def _probe_ranges(url, headers):
         return 0, False
 
 
+class _SegAbort(Exception):
+    """Segment fetch abandoned (stop/pause/sibling failure) while backing off."""
+
+
+_SEG_RETRY_BACKOFF = (2, 5, 12)   # seconds before retry 1, 2, 3
+
+
+def _open_segment(job, url, idx, h, cancel):
+    """GET one segment, treating HTTP 503 like 429: back off and retry up to
+    3 times (honouring Retry-After, capped at 60s). Any other status is
+    returned for the caller to judge."""
+    attempt = 0
+    while True:
+        r = requests.get(url, headers=h, stream=True,
+                         timeout=STATE["connection_timeout"],
+                         proxies=settings.proxies_for(url))
+        if r.status_code not in (429, 503):
+            return r
+        retry_after = r.headers.get("Retry-After", "")
+        code = r.status_code
+        r.close()
+        if attempt >= len(_SEG_RETRY_BACKOFF):
+            raise RuntimeError(f"segment {idx} got HTTP {code} after "
+                               f"{len(_SEG_RETRY_BACKOFF)} retries")
+        delay = _SEG_RETRY_BACKOFF[attempt]
+        if retry_after.isdigit():
+            delay = max(delay, min(int(retry_after), 60))
+        attempt += 1
+        log(f"job {job.get('id')}: segment {idx} HTTP {code}, "
+            f"retry {attempt}/{len(_SEG_RETRY_BACKOFF)} in {delay}s")
+        end_at = time.time() + delay
+        while time.time() < end_at:
+            if ((cancel is not None and cancel.is_set())
+                    or job["stop_evt"].is_set() or job["pause_evt"].is_set()):
+                raise _SegAbort()
+            time.sleep(0.25)
+
+
 def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None):
     h = dict(headers)
     h["Range"] = f"bytes={start}-{end}"
@@ -500,9 +538,7 @@ def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None
         # sets it so the others stop instead of downloading to the end.
         if cancel is not None and cancel.is_set():
             return
-        with requests.get(url, headers=h, stream=True,
-                           timeout=STATE["connection_timeout"],
-                           proxies=settings.proxies_for(url)) as r:
+        with _open_segment(job, url, idx, h, cancel) as r:
             if r.status_code == 200:
                 # Server ignored the Range header and returned the whole
                 # file. This happens on CDNs whose edge nodes disagree about
@@ -516,20 +552,38 @@ def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None
                 return
             if r.status_code != 206:
                 raise RuntimeError(f"segment {idx} got HTTP {r.status_code}, expected 206")
-            with open(part_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if cancel is not None and cancel.is_set():
-                        return
-                    if job["stop_evt"].is_set():
-                        return
-                    if job["pause_evt"].is_set():
-                        return
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    LIMITER.consume(len(chunk))
+            # Byte counts are folded into job["size_done"] at most every
+            # 250 ms per segment (and once more on exit) instead of per
+            # 64 KB chunk: the lock and the shared dict were hit thousands of
+            # times a second across segments, which stuttered the UI.
+            pending = 0
+            last_flush = time.monotonic()
+            try:
+                with open(part_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if cancel is not None and cancel.is_set():
+                            return
+                        if job["stop_evt"].is_set():
+                            return
+                        if job["pause_evt"].is_set():
+                            return
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        LIMITER.consume(len(chunk))
+                        pending += len(chunk)
+                        now = time.monotonic()
+                        if now - last_flush >= 0.25:
+                            with _segment_lock:
+                                job["size_done"] += pending
+                            pending = 0
+                            last_flush = now
+            finally:
+                if pending:
                     with _segment_lock:
-                        job["size_done"] += len(chunk)
+                        job["size_done"] += pending
+    except _SegAbort:
+        return
     except Exception as e:
         job["error"] = str(e)
         if cancel is not None:
@@ -657,6 +711,7 @@ def run_generic_segmented(job_id, probe=None):
         log(f"job {job_id}: WARNING — size mismatch (got {actual}, expected {total})")
         job["error"] = f"size mismatch: {actual}/{total}"
     dest = maybe_convert_target(job, dest)
+    job["dest"] = str(dest)
     if not _try_transition(job, JobEvent.COMPLETE):
         # Paused/stopped while merging or converting: the job is not done, so
         # skip the completion side effects (stats, open folder, sound, shutdown).
@@ -830,6 +885,8 @@ def run_ytdlp(job_id):
         headers["User-Agent"] = job["user_agent"]
     dest = _job_dest(job)
 
+    _last_ui = [0.0]
+
     def progress_cb(d):
         while job["pause_evt"].is_set():
             transition(job, JobEvent.PAUSE)
@@ -839,6 +896,13 @@ def run_ytdlp(job_id):
         if job["stop_evt"].is_set():
             raise DownloadCancelled()
         if d["status"] == "downloading":
+            # Throttle: yt-dlp fires this many times a second; the UI only
+            # needs a fresh number every 250 ms. Pause/stop checks above
+            # still run on every call.
+            _now = time.monotonic()
+            if _now - _last_ui[0] < 0.25:
+                return
+            _last_ui[0] = _now
             transition(job, JobEvent.START)
             job["size_total"] = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             job["size_done"] = d.get("downloaded_bytes", 0)
@@ -916,10 +980,15 @@ def run_ytdlp(job_id):
         _handle_ytdlp_failure(job_id, job, e)
         return
     try:
+        # Record where yt-dlp really put the file (post_hooks path) so Open
+        # Folder / Open File point at it even when the name differs from the
+        # registry filename.
+        job["dest"] = str(real)
         job["filename"] = real.name
         # maybe_convert_target falls back to auto-mp4 when the job has no
         # explicit target, and honors target_format even when auto_mp4 is off.
         real = maybe_convert_target(job, real)
+        job["dest"] = str(real)
         job["filename"] = real.name
         job["size_total"] = job["size_done"] = real.stat().st_size
     except Exception as e:

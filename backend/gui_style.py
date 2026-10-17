@@ -1,7 +1,7 @@
 """QSS generation from the palette. Applied app-wide (launch_gui and after
 every Settings save), so the main window, dialogs and settings all follow
 the same tokens. Nothing in here should hardcode a color."""
-from palette import resolve_palette
+from palette import resolve_palette, mix, contrast, luminance
 
 
 def _shade(hexc, f):
@@ -216,11 +216,18 @@ QProgressBar#DetailBar {{ min-height: 12px; max-height: 12px; }}
 
 
 def _cream_frame_qss(p):
-    """Cream window frame (toolbar, menu bar, status bar, margins) around the
-    theme's dark panels. Scoped to the main window's own widgets so dialogs
-    keep the normal theme."""
-    fb, fh, fe, fd = "#d9d3c0", "#e8e4d4", "#a8a28c", "#8f8a78"
-    ft, fm = "#1b1f1d", "#4a4d4b"
+    """Window frame (toolbar, menu bar, status bar, margins) around the
+    theme's dark panels, painted in the palette's "frame" token (cream by
+    default). Scoped to the main window's own widgets so dialogs keep the
+    normal theme. Highlight, edge and text colors are derived from the token,
+    so one color picker drives all of them."""
+    fb = p["frame"]
+    fh = mix(fb, "#ffffff", 0.35)          # light top / hover
+    fe = mix(fb, "#000000", 0.22)          # edges
+    fd = mix(fb, "#000000", 0.34)          # bottom bevel
+    ft = p["bg_base"] if contrast(fb, p["bg_base"]) >= 4.5 else (
+        "#000000" if luminance(fb) > 0.4 else "#ffffff")
+    fm = mix(ft, fb, 0.35)                 # secondary text
     return f"""
 /* ---- cream frame ---- */
 QMainWindow, #MainRoot, #FrameArea, #Content {{ background: {fb}; }}

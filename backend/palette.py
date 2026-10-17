@@ -25,6 +25,10 @@ def build_palette():
         "text_muted":  "#8a8a95",
         "text_dim":    "#5a5a65",
 
+        # Window frame (toolbar, menu bar, status bar, margins) when the
+        # colored frame is on. gui_style derives its highlight/edge shades.
+        "frame":       "#d9d3c0",
+
         # Accent
         "accent":      "#26c6da",
         "accent_dim":  "#1a8a99",

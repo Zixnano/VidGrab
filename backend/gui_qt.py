@@ -464,6 +464,29 @@ class ApiClient:
     def convert(self, jid, fmt):
         return self._req("POST", f"/convert/{jid}", json={"format": fmt})
 
+    @staticmethod
+    def _error_text(e):
+        """Backend error message from a failed response, else the exception text."""
+        try:
+            return e.response.json().get("error") or str(e)
+        except Exception:
+            return str(e)
+
+    def delete_file(self, jid):
+        """Remove the job and its file (backend refuses paths outside the
+        VideoGrabber / download folders)."""
+        try:
+            return self._req("POST", f"/delete-file/{jid}", timeout=30)
+        except requests.HTTPError as e:
+            raise RuntimeError(self._error_text(e)) from None
+
+    def toolkit(self, kind, body):
+        """Run /toolkit/<compress|trim|gif>. Encodes are slow: long timeout."""
+        try:
+            return self._req("POST", f"/toolkit/{kind}", json=body, timeout=7500)
+        except requests.HTTPError as e:
+            raise RuntimeError(self._error_text(e)) from None
+
     def probe_head(self, url):
         return self._req("POST", "/probe-head", json={"url": url})
 
@@ -734,6 +757,15 @@ class DownloadModel(QAbstractTableModel):
 
 
 def _path_for(job):
+    # Reconciled path reported by the engine (yt-dlp post_hooks): wins when
+    # the file is really there, so Open Folder works for renamed outputs.
+    _d = job.get("dest")
+    if _d:
+        try:
+            if Path(_d).exists():
+                return Path(_d)
+        except (OSError, ValueError):
+            pass
     settings = load_settings()
     category = job.get("category", "Other")
     override = settings.get("per_category_dirs", {}).get(category)
@@ -1863,6 +1895,8 @@ class SettingsDialog(QDialog):
         # ---- Theme tab (gui_theme_page.py) ----
         from gui_theme_page import ThemePage
         self.theme_page = ThemePage(s)
+        # Double-clicking a theme tile applies it: save and close the dialog.
+        self.theme_page.applied.connect(self._save)
         tabs.addTab(self.theme_page, "Theme")
 
         # ---- Downloads ----
@@ -2602,13 +2636,15 @@ class MainWindow(QMainWindow):
         # 12.2: ~30 fps viewport repaint while a download is active so
         # progress interpolation actually renders. Self-guarding no-op.
         self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(33)
+        # 8: ~15 fps is plenty for the progress interpolation; 30 fps
+        # repainting the whole table viewport was a source of UI stutter.
+        self._anim_timer.setInterval(66)
         self._anim_timer.timeout.connect(self._tick_animations)
         self._anim_timer.start()
         self._sort_ascending = True
         self.setWindowTitle(f"Video Grabber v{DISPLAY_VERSION}")
         self.resize(1200, 760)
-        self.setMinimumSize(880, 560)
+        self.setMinimumSize(720, 480)
         self._build_ui()
         self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
         self._show_dialog_signal.connect(self._on_show_dialog, Qt.QueuedConnection)
@@ -2640,6 +2676,10 @@ class MainWindow(QMainWindow):
         self.fade_timer = QTimer(self)
         self.fade_timer.timeout.connect(self._tick_fade)
         self.fade_timer.start(50)
+        # 6: periodic silent memory trim (Tools > Trim UI memory does it on demand).
+        self._trim_timer = QTimer(self)
+        self._trim_timer.timeout.connect(lambda: self.trim_ui_memory(silent=True))
+        self._trim_timer.start(10 * 60 * 1000)
         self.select_category("All")
         self.refresh()
         self.refresh_diskspace()
@@ -3030,6 +3070,10 @@ class MainWindow(QMainWindow):
         a = QAction("Clear failed downloads", self); a.triggered.connect(self.clear_failed); t.addAction(a)
         a = QAction("Open logs folder", self); a.triggered.connect(self._open_logs_folder); t.addAction(a)
         t.addSeparator()
+        a = QAction("Media Toolkit\u2026", self); a.triggered.connect(lambda: self.open_toolkit()); t.addAction(a)
+        a = QAction("Toggle handheld shell", self); a.setShortcut("Ctrl+Shift+S"); a.triggered.connect(self.toggle_shell); t.addAction(a)
+        a = QAction("Trim UI memory", self); a.triggered.connect(lambda: self.trim_ui_memory()); t.addAction(a)
+        t.addSeparator()
         a = QAction("About Video Grabber…", self); a.triggered.connect(self.show_about); t.addAction(a)
 
     def _apply_styles(self):
@@ -3274,6 +3318,46 @@ class MainWindow(QMainWindow):
                 self.table.viewport().update()
         except RuntimeError:
             self._anim_timer.stop()  # widgets torn down during exit
+
+    def trim_ui_memory(self, silent=False):
+        """Drop caches that only grow: favicon pixmaps, done/fade bookkeeping
+        for jobs that no longer exist, the yt-dlp format-audio map, and any
+        stale QTableWidget rows left in closed dialogs. Safe to run any time;
+        everything is rebuilt on demand."""
+        import gc
+        freed = {}
+        try:
+            live = {j.get("id") for j in getattr(self, "all_items", [])}
+            freed["icons"] = len(_SITE_ICONS)
+            _SITE_ICONS.clear()
+            before = len(self._done_seen)
+            self._done_seen &= live
+            freed["done"] = before - len(self._done_seen)
+            for jid in [k for k in self._recently_done if k not in live]:
+                self._recently_done.pop(jid, None)
+            try:
+                import engines
+                freed["formats"] = len(engines._FORMAT_AUDIO)
+                engines._FORMAT_AUDIO.clear()
+            except Exception:
+                pass
+            # Orphaned QTableWidgets (batch/playlist pickers that were closed
+            # but not yet garbage collected) keep every cell item alive.
+            for tw in self.findChildren(QTableWidget):
+                try:
+                    if not tw.isVisible():
+                        tw.clearContents()
+                        tw.setRowCount(0)
+                except RuntimeError:
+                    pass
+            self.table.viewport().update()
+        except Exception as e:
+            print(f"trim_ui_memory failed: {e}")
+        gc.collect()
+        if not silent:
+            self.statusBar().showMessage(
+                f"UI memory trimmed ({freed.get('icons', 0)} icons, "
+                f"{freed.get('formats', 0)} format maps cleared)", 4000)
 
     def refresh(self):
         # 11.1: HTTP off the GUI thread. If a fetch is still in flight
@@ -3866,10 +3950,13 @@ class MainWindow(QMainWindow):
         conv_menu = m.addMenu("Convert to")
         conv_actions = {conv_menu.addAction(f): f for f in ["mp4", "mkv", "mp3", "wav", "m4a", "flac", "opus"]}
         m.addSeparator()
-        a_remove = m.addAction("Remove")
+        a_remove = m.addAction("Remove from Queue")
+        a_delete_file = m.addAction("Delete Job && File")
+        a_toolkit = m.addAction("Media Toolkit\u2026")
         a_copy_file = m.addAction("Copy file")
         a_copy_url = m.addAction("Copy URL")
         a_props = m.addAction("Properties")
+        a_toolkit.setEnabled(j["status"] == "done")
         a_open.setEnabled(j["status"] == "done")
         a_open_folder.setEnabled(j["status"] == "done")
         a_open_location.setEnabled(j["status"] == "done")
@@ -3912,6 +3999,10 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Convert", str(e))
         elif chosen == a_remove:
             self._ctx_remove()
+        elif chosen == a_delete_file:
+            self._ctx_delete_file()
+        elif chosen == a_toolkit:
+            self.open_toolkit(job_id=self._current_ctx)
         elif chosen == a_copy_file:
             # Right-clicked row is part of a multi-selection -> copy all the
             # selected finished files; otherwise just this one.
@@ -4001,6 +4092,50 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Error", str(e))
         self.refresh()
+
+    def _ctx_delete_file(self):
+        """Delete the job AND its file. The backend only deletes inside the
+        VideoGrabber / download folders and refuses anything else."""
+        jid = getattr(self, "_current_ctx", None)
+        if not jid:
+            return
+        j = next((x for x in self.model.items if x["id"] == jid), {})
+        if QMessageBox.warning(
+                self, "Delete job & file",
+                f"Delete this job AND its file from disk?\n\n{j.get('filename', '')}\n\n"
+                "This cannot be undone.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            self.api.delete_file(jid)
+        except Exception as e:
+            QMessageBox.warning(self, "Delete job & file", str(e))
+        self.refresh()
+
+    def open_toolkit(self, job_id=None):
+        """Media Toolkit (Compress / Trim / Make GIF) for a finished job, or
+        for any file picked with Browse."""
+        from gui_toolkit import ToolkitDialog
+        job = None
+        if job_id is not None:
+            job = next((x for x in self.model.items if x["id"] == job_id), None)
+        else:
+            done = [x for x in self._selected_rows() if x.get("status") == "done"]
+            job = done[0] if done else None
+        ToolkitDialog(self.api, job, self).exec()
+
+    def toggle_shell(self):
+        """Flip the handheld shell on/off from anywhere (Ctrl+Shift+S): off
+        gives a plain, modern window with more room for rows."""
+        try:
+            on = not bool(load_settings().get("shell_enabled"))
+            self.api.save_setting("shell_enabled", on)
+            _settings_cache["mtime"] = 0      # force load_settings to re-read
+            self.apply_shell()
+            self.statusBar().showMessage(
+                "Handheld shell on" if on else "Handheld shell off", 3000)
+        except Exception as e:
+            QMessageBox.warning(self, "Shell", str(e))
 
     def _open_selected(self, folder=False, job_id=None):
         """Open a job's file (or its containing folder) with proper error

@@ -81,21 +81,49 @@ def _staging_root() -> Path:
     return Path(base) / STAGING_PARENT / "update"
 
 
-def _http_get_json(url: str):
-    req = Request(url, headers={
+# ETag cache for the release poll. A 304 answer does not count against
+# GitHub's unauthenticated rate limit (60/hour), which is what makes a
+# 60 second poll affordable. Kept in memory only: the body is cached with the
+# tag, and a tag without its body would turn the first poll after a restart
+# into an unusable 304.
+_ETAG_CACHE = {"url": "", "etag": "", "body": None}
+_RATE_LIMIT_UNTIL = [0.0]
+_LAST_LOGGED = [""]
+
+
+def _http_get_json(url: str, use_etag: bool = False):
+    from urllib.error import HTTPError
+    headers = {
         "User-Agent": "VideoGrabber-Updater",
         "Accept": "application/vnd.github+json",
-    })
-    with urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))
+    }
+    cached = use_etag and _ETAG_CACHE["url"] == url and _ETAG_CACHE["body"] is not None
+    if cached and _ETAG_CACHE["etag"]:
+        headers["If-None-Match"] = _ETAG_CACHE["etag"]
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=30) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+            if use_etag:
+                _ETAG_CACHE.update(url=url, etag=r.headers.get("ETag", "") or "", body=body)
+            return body
+    except HTTPError as e:
+        if e.code == 304 and cached:
+            return _ETAG_CACHE["body"]
+        if e.code in (403, 429):
+            # Rate limited: stay quiet for 15 minutes instead of hammering.
+            _RATE_LIMIT_UNTIL[0] = time.time() + 900
+        raise
 
 
 def check_for_update(current: str = None):
     """Return (tag, download_url) for the newest app zip, or (None, None).
     `current` is the installed version; defaults to APP_VERSION."""
     current = current or APP_VERSION
+    if time.time() < _RATE_LIMIT_UNTIL[0]:
+        return None, None
     try:
-        rel = _http_get_json(API_URL)
+        rel = _http_get_json(API_URL, use_etag=True)
     except Exception as e:
         log(f"updater: release check failed: {e}")
         return None, None
@@ -103,7 +131,11 @@ def check_for_update(current: str = None):
     # Numeric compare — never string-compare: "v9" > "v42" lexically, which
     # is exactly the bug this guard exists to prevent.
     if compare_versions(tag, current) <= 0:
-        log(f"updater: {tag or 'unversioned'} not newer than {current} — up to date")
+        # Polled every 60s: only log when the answer changes.
+        _msg = f"updater: {tag or 'unversioned'} not newer than {current} — up to date"
+        if _msg != _LAST_LOGGED[0]:
+            _LAST_LOGGED[0] = _msg
+            log(_msg)
         return None, None
     for asset in rel.get("assets") or []:
         name = asset.get("name") or ""
@@ -186,6 +218,7 @@ if __name__ == "__main__":
 # `update_check_hours`; never installs the app on its own (it only records
 # that one is available), and stages yt-dlp for the next launch.
 # --------------------------------------------------------------------------
+APP_POLL_SECONDS = 60
 _UPDATE_STATE = {"available": "", "url": "", "checked_ts": 0, "error": ""}
 _UPDATE_HOOKS = []          # callables(tag) a GUI can register for a toast
 _SCHED_STARTED = False
@@ -208,7 +241,7 @@ def skip_version(tag):
         _UPDATE_STATE["available"] = ""
 
 
-def _check_once():
+def _check_once(do_ytdlp=True):
     # App releases only apply to the installed exe.
     if STATE.get("auto_update_check", True) and getattr(sys, "frozen", False):
         try:
@@ -229,7 +262,7 @@ def _check_once():
         except Exception as e:
             _UPDATE_STATE["error"] = str(e)
             log(f"updater: scheduled check failed: {e}")
-    if STATE.get("ytdlp_auto_update", True):
+    if do_ytdlp and STATE.get("ytdlp_auto_update", True):
         try:
             import ytdlp_update
             ytdlp_update.update_ytdlp()
@@ -246,16 +279,22 @@ def start_update_scheduler():
     _SCHED_STARTED = True
 
     def loop():
+        # The app release is polled every APP_POLL_SECONDS (cheap: ETag 304s).
+        # yt-dlp keeps the slower update_check_hours cadence.
         time.sleep(60)
+        last_ytdlp = 0.0
         while True:
-            try:
-                _check_once()
-            except Exception as e:
-                log(f"updater: scheduler error: {e}")
             try:
                 hours = max(1.0, float(STATE.get("update_check_hours", 6) or 6))
             except (TypeError, ValueError):
                 hours = 6.0
-            time.sleep(hours * 3600)
+            do_yt = (time.time() - last_ytdlp) >= hours * 3600
+            if do_yt:
+                last_ytdlp = time.time()
+            try:
+                _check_once(do_ytdlp=do_yt)
+            except Exception as e:
+                log(f"updater: scheduler error: {e}")
+            time.sleep(APP_POLL_SECONDS)
 
     threading.Thread(target=loop, daemon=True, name="update-scheduler").start()

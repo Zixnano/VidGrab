@@ -825,6 +825,17 @@ _JUNK_STEMS = {
 }
 _JUNK_PATTERN_RE = re.compile(
     r"(?:video|download|file|watch|playlist|media)[ _-]?\(?\d*\)?(?: \(\d+\))*")
+# Raw URL basenames that name a stream rather than a title: HLS/DASH variant
+# playlists (index-f2-v1-a1, chunklist_720p, media_0, seg-12-v1-a1), bare
+# quality labels (720p, 1080), hash-like ids and master/manifest leftovers.
+_JUNK_URL_RE = re.compile(
+    r"(?:index|playlist|master|manifest|main|stream|video|audio|chunklist|media|"
+    r"variant|rendition|segment|seg|frag|fragment|init|hls|dash)"
+    r"(?:[ _.-]?(?:f\d+|v\d+|a\d+|s\d+|\d{1,5}p?|\d{3,4}p|[0-9a-f]{6,}))*"
+    r"|(?:f\d+|v\d+|a\d+)(?:-(?:f\d+|v\d+|a\d+))+"
+    r"|\d{3,4}p?"
+    r"|[0-9a-f]{16,}",             # long hex ids
+    re.I)
 _TITLE_SUFFIX_RE = re.compile(
     r"\s*[-|\u2013\u2014:]\s*(?:YouTube|Twitch|Twitter|Vimeo|Facebook|Instagram|"
     r"TikTok|Reddit|Dailymotion|Bilibili)\s*$", re.I)
@@ -839,7 +850,12 @@ def is_junk_stem(stem):
         return True
     if s in _JUNK_STEMS or s.isdigit():
         return True
-    return bool(_JUNK_PATTERN_RE.fullmatch(s))
+    if _JUNK_PATTERN_RE.fullmatch(s) or _JUNK_URL_RE.fullmatch(s):
+        return True
+    # Hyphen/underscore-joined tokens that are ALL stream tokens, e.g.
+    # "index-f2-v1-a1" or "master_720p".
+    toks = [t for t in re.split(r"[-_. ]+", s) if t]
+    return bool(toks) and all(_JUNK_URL_RE.fullmatch(t) for t in toks)
 
 
 def clean_title(title):
@@ -867,12 +883,44 @@ def source_site_for(*urls):
     return None
 
 
-def generated_name(url):
-    """Fallback stem when nothing better exists: site_YYYY-MM-DD_HHMMSS."""
-    parts = site_host(url).split(".")
+_TYPE_LABELS = {"video": "video", "audio": "audio", "music": "audio",
+                "image": "image", "images": "image", "document": "doc",
+                "documents": "doc", "archive": "archive", "archives": "archive",
+                "program": "app", "programs": "app", "other": "file",
+                "generic": "file"}
+
+
+def generated_name(url, ftype=None, ext=None):
+    """Fallback stem when nothing better exists: {domain}_{date}_{type}.
+    Pass ext (with or without the dot) to get the full "{domain}_{date}_{type}.{ext}"
+    filename; without it the bare stem is returned, as before. ftype is a
+    category/type name ("Video", "video", ...); when omitted the type is
+    guessed from the URL's extension."""
+    host = site_host(url)
+    parts = host.split(".")
     label = parts[-2] if len(parts) >= 2 else (parts[0] if parts and parts[0] else "download")
     label = re.sub(r"[^A-Za-z0-9]+", "", label) or "download"
-    return safe_filename(f"{label}_{time.strftime('%Y-%m-%d_%H%M%S')}")
+    if not ext:
+        m = re.search(r"\.([A-Za-z0-9]{2,5})(?:[?#]|$)", urlparse(url or "").path or "")
+        guess = m.group(1).lower() if m else ""
+    else:
+        guess = ext.lstrip(".").lower()
+    kind = _TYPE_LABELS.get((ftype or "").strip().lower(), "")
+    if not kind:
+        if guess in ("m3u8", "mpd", "mp4", "m4v", "mov", "webm", "mkv", "avi", "ts", "flv"):
+            kind = "video"
+        elif guess in ("mp3", "m4a", "aac", "wav", "flac", "opus", "ogg"):
+            kind = "audio"
+        elif guess in ("jpg", "jpeg", "png", "gif", "webp", "avif", "bmp"):
+            kind = "image"
+        else:
+            kind = "file"
+    stem = safe_filename(f"{label}_{time.strftime('%Y-%m-%d')}_{kind}")
+    if ext:
+        # HLS/DASH manifests are downloaded as mp4, never as .m3u8/.mpd.
+        e = "mp4" if guess in ("m3u8", "mpd") else guess
+        return f"{stem}.{e}" if e else stem
+    return stem
 
 
 _ARCHIVE_LOCK = threading.Lock()

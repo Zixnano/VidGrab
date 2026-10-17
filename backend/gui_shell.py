@@ -127,7 +127,10 @@ class ShellFrame(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(38, 62, COLUMN + 12, 40)
         lay.addWidget(inner)
-        self.setMinimumSize(900, 600)
+        # Freely resizable: the case stretches with the window, the inner screen
+        # takes all the extra room, and the controls column scales down on
+        # short windows (see paintEvent) instead of forcing a big minimum.
+        self.setMinimumSize(760, 520)
         self.backlight = bool(backlight)
         self.overlay = _Backlight(self)
         self.overlay.dim = not self.backlight
@@ -236,7 +239,18 @@ class ShellFrame(QWidget):
         p.setPen(QPen(QColor(0, 0, 0, 140), 4))
         p.drawPath(bez.translated(0, 3))
         p.restore()
-        self._controls(p, w, h, dark)
+        # Controls are laid out for a ~640 px tall case; on shorter windows
+        # draw them scaled down (0.7 floor) and scale the hit boxes to match.
+        k = max(0.7, min(1.0, h / 640.0))
+        if k < 1.0:
+            p.save()
+            p.scale(k, k)
+            self._controls(p, w / k, h / k, dark)
+            p.restore()
+            self._hits = {n: QRectF(r.x() * k, r.y() * k, r.width() * k, r.height() * k)
+                          for n, r in self._hits.items()}
+        else:
+            self._controls(p, w, h, dark)
         p.end()
 
     def _well(self, p, c, r, body, edge, dark):

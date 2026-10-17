@@ -201,6 +201,18 @@ class MiniPreview(QWidget):
 
 
 class PresetTile(QAbstractButton):
+    doubleClicked = Signal()
+
+    def mouseDoubleClickEvent(self, e):
+        # Swallow it: the first click already selected the tile, and letting
+        # the base class turn the second press into another click would
+        # toggle the preview straight back off.
+        if e.button() == Qt.LeftButton:
+            self.doubleClicked.emit()
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
     def __init__(self, key, ring, label_color, parent=None, tokens=None, title=None):
         super().__init__(parent)
         self.key = key
@@ -328,8 +340,13 @@ def _card(title, hint=None):
     return f, lay
 
 
+GALLERY_PAGE_SIZE = 12     # 3 columns x 4 rows
+GALLERY_COLS = 3
+
+
 class ThemePage(QWidget):
     changed = Signal()
+    applied = Signal()      # a tile was double-clicked: apply it and close the dialog
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -381,6 +398,7 @@ class ThemePage(QWidget):
             tile = PresetTile(key, self._ring, self._label)
             tile.setChecked(key == self._preset)
             tile.clicked.connect(lambda _=False, k=key: self._pick_preset(k))
+            tile.doubleClicked.connect(lambda k=key: self._preset_double_clicked(k))
             self._flow.addWidget(tile)
             self._tiles[key] = tile
         l1.addWidget(flow_host)
@@ -393,8 +411,30 @@ class ThemePage(QWidget):
         self._folder_hint = cf.findChildren(QLabel, "CardHint")[0]
         ff_host = QWidget()
         ff_host.setObjectName("Plain")
-        self._ff = FlowLayout(ff_host, 10)
+        self._ff = QGridLayout(ff_host)
+        self._ff.setContentsMargins(0, 0, 0, 0)
+        self._ff.setSpacing(10)
         lf.addWidget(ff_host)
+        # Pagination: 12 themes per page, flipped with < and >.
+        nav = QHBoxLayout()
+        self.pg_prev = QPushButton("<")
+        self.pg_prev.setFixedWidth(40)
+        self.pg_prev.setAccessibleName("Previous page")
+        self.pg_prev.clicked.connect(lambda: self._page_step(-1))
+        self.pg_next = QPushButton(">")
+        self.pg_next.setFixedWidth(40)
+        self.pg_next.setAccessibleName("Next page")
+        self.pg_next.clicked.connect(lambda: self._page_step(1))
+        self.pg_label = QLabel("")
+        self.pg_label.setObjectName("CardHint")
+        self.pg_label.setAlignment(Qt.AlignCenter)
+        nav.addStretch(1)
+        nav.addWidget(self.pg_prev)
+        nav.addWidget(self.pg_label)
+        nav.addWidget(self.pg_next)
+        nav.addStretch(1)
+        lf.addLayout(nav)
+        self._page = 0
         self._file_entries = []
         self._file_tiles = []
         self._file_sel = None
@@ -437,7 +477,7 @@ class ThemePage(QWidget):
 
         c4, l4 = _card("Handheld shell", "Wraps the window in a console body. The D-pad, A, B, "
                        "Start and Select buttons work. Best with a window of about 900 by 640.")
-        self.shell_check = QCheckBox("Show the handheld shell")
+        self.shell_check = QCheckBox("Show the handheld shell (uncheck for a plain, resizable window)")
         self.shell_check.setChecked(self._shell_on)
         self.shell_check.toggled.connect(self._shell_toggled)
         l4.addWidget(self.shell_check)
@@ -467,12 +507,13 @@ class ThemePage(QWidget):
         cl.addWidget(c4)
 
         c5, l5 = _card("Window frame", "Paints the window frame (toolbar, menus, status bar and "
-                       "margins) cream around your theme's dark panels, like the handheld mockup. "
-                       "Works with or without the shell.")
+                       "margins) around your theme's dark panels, like the handheld mockup. "
+                       "Cream by default; pick any color below. Works with or without the shell.")
         self.frame_check = QCheckBox("Cream frame around the panels")
         self.frame_check.setChecked(self._frame_cream)
         self.frame_check.toggled.connect(self._frame_toggled)
         l5.addWidget(self.frame_check)
+        l5.addLayout(self._make_row("frame", "Frame color"))
         cl.addWidget(c5)
 
         c3, l3 = _card("Fine-tune colors", None)
@@ -629,7 +670,11 @@ class ThemePage(QWidget):
             edited = key in self._ov or (key == "accent" and
                                         self._accent.lower() != THEME_PRESETS[self._preset]["accent"].lower())
             reset.setVisible(edited)
-            name.setText(dict(i for _, g in GROUPS for i in g)[key] + ("  \u2022" if edited else ""))
+            name.setText(dict(i for _, g in GROUPS for i in g).get(key, "Frame color")
+                         + ("  \u2022" if edited else ""))
+        _fr = self._rows.get("frame")
+        if _fr:
+            _fr[0].setEnabled(self._frame_cream)
         n = len(self._ov)
         self.count_chip.setText(f"{n} customized" if n else "No tweaks")
         self.clear_btn.setVisible(n > 0)
@@ -680,6 +725,10 @@ class ThemePage(QWidget):
     def _shell_toggled(self, on):
         self._shell_on = on
         self._refresh()
+
+    def _preset_double_clicked(self, key):
+        self._pick_preset(key)
+        self.applied.emit()
 
     def _frame_toggled(self, on):
         self._frame_cream = on
@@ -782,20 +831,15 @@ class ThemePage(QWidget):
         return Path(_settings.HOME) / "themes"
 
     def _scan_themes(self):
-        """(Re)build the tiles from the .json files in the themes folder."""
+        """(Re)read the .json files in the themes folder, then show the page
+        of tiles that holds the current selection (or the current page)."""
         d = self._themes_dir()
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
         sel_path = self._file_sel["path"] if self._file_sel else None
-        while self._ff.count():
-            it = self._ff.takeAt(0)
-            w = it.widget() if it is not None else None
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
-        self._file_entries, self._file_tiles, self._file_sel = [], [], None
+        self._file_entries, self._file_sel = [], None
         try:
             files = sorted((p for p in d.glob("*.json") if p.is_file()),
                            key=lambda p: p.name.lower())[:200]
@@ -813,22 +857,59 @@ class ThemePage(QWidget):
                 continue
             nm = raw.get("name") if isinstance(raw.get("name"), str) and raw["name"].strip() else p.stem
             e["name"], e["path"] = nm.strip(), str(p)
-            idx = len(self._file_entries)
-            tile = PresetTile("amoled_black", self._ring, self._label,
-                              tokens=e["pal"], title=e["name"])
-            tile.clicked.connect(lambda _=False, i=idx: self._select_file_tile(i))
-            self._ff.addWidget(tile)
             self._file_entries.append(e)
-            self._file_tiles.append(tile)
             if e["path"] == sel_path:
-                tile.setChecked(True)
                 self._file_sel = e
+                self._page = (len(self._file_entries) - 1) // GALLERY_PAGE_SIZE
         self._file_empty.setVisible(not self._file_entries)
         self.file_apply.setEnabled(self._file_sel is not None)
         self._folder_hint.setText(f"{d}  ({len(self._file_entries)} theme"
                                   f"{'' if len(self._file_entries) == 1 else 's'}). "
-                                  "Click a tile to preview it, then Apply.")
+                                  "Click a tile to preview it, then Apply. Double-click to apply and close.")
+        self._render_page()
+
+    def _page_count(self):
+        return max(1, -(-len(self._file_entries) // GALLERY_PAGE_SIZE))
+
+    def _page_step(self, delta):
+        self._page = max(0, min(self._page_count() - 1, self._page + delta))
+        self._render_page()
+
+    def _render_page(self):
+        """Build only the tiles of the current page (12 max, 3 x 4)."""
+        self._page = max(0, min(self._page_count() - 1, self._page))
+        while self._ff.count():
+            it = self._ff.takeAt(0)
+            w = it.widget() if it is not None else None
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._file_tiles = []
+        start = self._page * GALLERY_PAGE_SIZE
+        for pos, idx in enumerate(range(start, min(start + GALLERY_PAGE_SIZE,
+                                                    len(self._file_entries)))):
+            e = self._file_entries[idx]
+            tile = PresetTile("amoled_black", self._ring, self._label,
+                              tokens=e["pal"], title=e["name"])
+            tile._gidx = idx
+            tile.clicked.connect(lambda _=False, i=idx: self._select_file_tile(i))
+            tile.doubleClicked.connect(lambda i=idx: self._file_double_clicked(i))
+            self._ff.addWidget(tile, pos // GALLERY_COLS, pos % GALLERY_COLS)
+            tile.setChecked(e is self._file_sel)
+            self._file_tiles.append(tile)
+        pages = self._page_count()
+        self.pg_label.setText(f"Page {self._page + 1} of {pages}")
+        self.pg_prev.setEnabled(self._page > 0)
+        self.pg_next.setEnabled(self._page < pages - 1)
+        self.pg_prev.setVisible(pages > 1)
+        self.pg_next.setVisible(pages > 1)
+        self.pg_label.setVisible(pages > 1)
         self._ff.invalidate()
+
+    def _file_double_clicked(self, idx):
+        self._file_sel = self._file_entries[idx]
+        self._apply_file_theme()
+        self.applied.emit()
 
     def _select_file_tile(self, idx):
         e = self._file_entries[idx]
@@ -837,8 +918,8 @@ class ThemePage(QWidget):
             self._refresh()
             return
         self._file_sel = e
-        for i, tile in enumerate(self._file_tiles):
-            tile.setChecked(i == idx)
+        for tile in self._file_tiles:
+            tile.setChecked(getattr(tile, "_gidx", -1) == idx)
             tile.update()
         self.preview.set_tokens(e["pal"])            # preview only: nothing is stored
         self.file_apply.setEnabled(True)

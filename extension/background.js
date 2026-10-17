@@ -88,11 +88,68 @@ const videoMapReady = (async () => {
   } catch (e) { /* session storage unavailable: start empty */ }
 })();
 
+// ---- HLS/DASH: keep only the top-level manifest per stream ----------------
+// A player fetches master.m3u8, then one variant playlist per rendition
+// (index-f2-v1-a1.m3u8, chunklist_720p.m3u8, ...) plus hundreds of .ts/.m4s
+// segments. Only the top-level manifest is useful: yt-dlp/ffmpeg resolve the
+// variants themselves. A variant is skipped when a master from the same or a
+// parent folder is already listed, and a late master replaces its variants.
+const MANIFEST_RE = /\.(m3u8|mpd)(\?|#|$)/i;
+const SEGMENT_RE = /\.(ts|m4s|m2ts|mts)(\?|#|$)/i;
+const VARIANT_NAME_RE = /(-f\d+|-v\d+|-a\d+|chunklist|media[_-]?\d|[_-]\d{3,4}p|^\d{3,4}p?\.|variant|rendition|segment|frag|audio[_-]|video[_-]|^video\.|^audio\.)/i;
+
+function manifestInfo(url) {
+  try {
+    const u = new URL(url);
+    if (!MANIFEST_RE.test(u.pathname + u.search)) return null;
+    const cut = u.pathname.lastIndexOf("/");
+    const dir = u.origin + u.pathname.slice(0, cut + 1);
+    const base = u.pathname.slice(cut + 1);
+    const isDash = /\.mpd$/i.test(u.pathname);
+    // .mpd files are always top-level; only m3u8 has the master/variant split.
+    return { dir, isVariant: !isDash && VARIANT_NAME_RE.test(base) };
+  } catch (e) {
+    return null;
+  }
+}
+
+function tabHasManifest(tabId) {
+  const m = videoMap.get(tabId);
+  if (!m) return false;
+  for (const it of m.values()) if (manifestInfo(it.url)) return true;
+  return false;
+}
+
+// True when this manifest should NOT be listed (a variant of a known master,
+// or a second variant in a folder that already has one). Also drops variants
+// that a newly arriving master supersedes.
+function manifestSuperseded(m, url) {
+  const info = manifestInfo(url);
+  if (!info) return false;
+  const others = [];
+  for (const [k, it] of m) {
+    const oi = manifestInfo(it.url);
+    if (oi) others.push([k, it, oi]);
+  }
+  if (info.isVariant) {
+    for (const [, , oi] of others) {
+      if (!oi.isVariant && info.dir.startsWith(oi.dir)) return true;   // master known
+      if (oi.isVariant && oi.dir === info.dir) return true;             // keep first only
+    }
+    return false;
+  }
+  for (const [k, , oi] of others) {
+    if (oi.isVariant && oi.dir.startsWith(info.dir)) m.delete(k);       // master wins
+  }
+  return false;
+}
+
 function addItem(tabId, item) {
   if (tabId === undefined || tabId < 0) return;
   if (!videoMap.has(tabId)) videoMap.set(tabId, new Map());
   const m = videoMap.get(tabId);
   const key = dedupKey(item.url);
+  if (!m.has(key) && manifestSuperseded(m, item.url)) return;
   if (m.has(key)) {
     // Don't overwrite real data with empty data: keep the existing size /
     // content-type when the new entry lacks them.
@@ -130,6 +187,8 @@ function setBadge(tabId, text) {
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId < 0) return;
+    // HLS/DASH segments are noise once the tab has a manifest to download.
+    if (SEGMENT_RE.test(details.url) && tabHasManifest(details.tabId)) return;
     if (MEDIA_EXT_REGEX.test(details.url)) {
       addItem(details.tabId, { url: details.url, source: "url-pattern", contentType: null });
     }
@@ -144,6 +203,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     const ct = headers.find((h) => h.name.toLowerCase() === "content-type");
     const cl = headers.find((h) => h.name.toLowerCase() === "content-length");
     const size = cl ? parseInt(cl.value, 10) || 0 : 0;
+    if (SEGMENT_RE.test(details.url) && tabHasManifest(details.tabId)) return;
     if (ct && MEDIA_CT_REGEX.test(ct.value)) {
       addItem(details.tabId, { url: details.url, source: "content-type",
         contentType: ct.value, size });

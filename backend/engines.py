@@ -95,7 +95,28 @@ class FormatInfo:
 # download of the same URL knows whether the picked format needs bestaudio
 # paired with it. Small and bounded; a miss just means "pair it, as before".
 _FORMAT_AUDIO = {}
-_FORMAT_AUDIO_MAX = 200
+_FORMAT_AUDIO_MAX = 100
+
+
+_IMPERSONATE_CACHE = ["_unresolved"]
+
+
+def _impersonate_target():
+    """ImpersonateTarget('chrome') when curl_cffi is installed, else None.
+    yt-dlp's Python API wants an ImpersonateTarget object, not a string, and
+    raises when the requested target has no handler, so this only returns a
+    target that can actually be served. Install: pip install "yt-dlp[curl-cffi]"."""
+    if _IMPERSONATE_CACHE[0] != "_unresolved":
+        return _IMPERSONATE_CACHE[0]
+    tgt = None
+    try:
+        import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        tgt = ImpersonateTarget.from_str("chrome")
+    except Exception as e:
+        log(f"yt-dlp impersonate unavailable ({e}); continuing without it")
+    _IMPERSONATE_CACHE[0] = tgt
+    return tgt
 
 
 def _remember_format_audio(url, formats):
@@ -447,6 +468,9 @@ class YtDlpEngine:
         if _px:
             ydl_opts["proxy"] = _px
         from yt_dlp import YoutubeDL  # lazy: keeps ~100 MB out of idle RAM
+        _imp = _impersonate_target()
+        if _imp is not None:
+            ydl_opts["impersonate"] = _imp
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         formats = []
@@ -524,19 +548,33 @@ class YtDlpEngine:
 
         final_paths = []
         seen = {}
+        started_ts = time.time()
+        _touched = []   # every path yt-dlp reported, newest last
 
         def _hook(d):
             info = d.get("info_dict") or {}
             if info.get("id"):
                 seen["id"] = info["id"]
                 seen["ek"] = str(info.get("extractor_key") or "")
+            if d.get("status") == "finished" and d.get("filename"):
+                _touched.append(d["filename"])
             progress_cb(d)
+
+        def _pp_hook(d):
+            # Merger / FFmpegExtractAudio / convertors report the file they
+            # produced; the last one is the real final name even when the
+            # template was ignored (HLS using page title or format id).
+            if d.get("status") == "finished":
+                fp = (d.get("info_dict") or {}).get("filepath")
+                if fp:
+                    _touched.append(fp)
 
         ydl_opts = {
             "outtmpl": outtmpl,
             "http_headers": headers,
             "progress_hooks": [_hook],
             "post_hooks": [final_paths.append],
+            "postprocessor_hooks": [_pp_hook],
             "quiet": True, "no_warnings": True,
             "continuedl": True,
             "noplaylist": not is_playlist,
@@ -677,6 +715,11 @@ class YtDlpEngine:
 
         # v4.0.5 diagnostics: freeze the environment + full traceback so a
         # [WinError 2] reports exactly which line/subprocess raised it.
+        # Some CDNs block Python's TLS/HTTP fingerprint; present as Chrome.
+        _imp = _impersonate_target()
+        if _imp is not None:
+            ydl_opts["impersonate"] = _imp
+
         diag_opts = dict(ydl_opts)
         try:
             hdrs = dict(diag_opts.get("http_headers") or {})
@@ -718,6 +761,23 @@ class YtDlpEngine:
             _reported = Path(final_paths[-1])
             if _reported.is_file():
                 return _reported
+        # post_hooks gave nothing usable: try the postprocessor / progress
+        # hook paths (newest first), then the newest file written by this
+        # run in the target folder. Beats the stem glob when yt-dlp ignored
+        # the template and named the file after the page title or format id.
+        if not is_playlist:
+            for _p in reversed(_touched):
+                _pp = Path(_p)
+                if _pp.is_file() and not _pp.name.endswith(".part"):
+                    return _pp
+            try:
+                _fresh = [m for m in dest.parent.iterdir()
+                          if m.is_file() and not m.name.endswith((".part", ".ytdl"))
+                          and m.stat().st_mtime >= started_ts - 2]
+                if _fresh:
+                    return max(_fresh, key=lambda p: p.stat().st_mtime)
+            except OSError:
+                pass
 
         # Playlist mode: yt-dlp already wrote one file per item using the
         # %(playlist_index)s-%(title)s template; dest.stem glob won't match

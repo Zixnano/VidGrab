@@ -44,7 +44,7 @@ TOKEN_PROTECTED_PATHS = {
     "/upload-token", "/redownload", "/show-add-dialog",
     "/clear-failed", "/queue-status", "/dup-check", "/favicon",
     "/update-status", "/update-skip", "/ytdlp-update", "/ytdlp-rollback",
-    "/reorder", "/theme", "/queue-running",
+    "/reorder", "/theme", "/queue-running", "/delete-file", "/toolkit",
 }
 
 # Random per-launch key, embedded in the LAN web UI's action links so that
@@ -372,6 +372,254 @@ def redownload(job_id):
 @app.route("/delete/<job_id>", methods=["POST"])
 def delete(job_id):
     return _job_action(job_id, "delete")
+
+# ---- Delete job + file ----------------------------------------------------
+def _allowed_roots():
+    """The only folder the app may delete from or read toolkit sources from:
+    the root VideoGrabber directory (settings.HOME). Nothing else."""
+    from settings import HOME
+    try:
+        return [Path(HOME).resolve()]
+    except (OSError, ValueError):
+        return []
+
+
+def _safe_in_roots(path):
+    """Resolved Path when `path` lies strictly inside an allowed root (symlinks
+    and ".." resolved first), else None. A root folder itself never passes."""
+    try:
+        rp = Path(path).resolve()
+    except (OSError, ValueError):
+        return None
+    for root in _allowed_roots():
+        try:
+            if rp != root and rp.is_relative_to(root):
+                return rp
+        except ValueError:
+            continue
+    return None
+
+
+@app.route("/delete-file/<job_id>", methods=["POST"])
+def delete_job_and_file(job_id):
+    """Remove the job AND its file on disk. The path must resolve inside the
+    VideoGrabber / download folders; anything else is refused and the job is
+    left alone. Thumbnails (thumbs/) are never touched."""
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    cands = []
+    if job.get("dest"):
+        cands.append(Path(job["dest"]))
+    try:
+        cands.append(_dest_for(job))
+    except Exception:
+        pass
+    uniq = []
+    for c in cands:
+        if c not in uniq:
+            uniq.append(c)
+    targets = []
+    for c in uniq:
+        try:
+            exists = c.is_file()
+        except OSError:
+            exists = False
+        if not exists:
+            continue
+        safe = _safe_in_roots(c)
+        # Files only: the resolved target must be a regular file (never a
+        # folder) and sit strictly inside the root VideoGrabber directory.
+        if safe is None or not safe.is_file() or safe.is_dir():
+            log(f"delete-file refused for job {job_id}: {c} is not a file inside the VideoGrabber folder")
+            return jsonify({"error": "File is outside the VideoGrabber folder; "
+                                     "refusing to delete it. The job was kept."}), 403
+        if safe not in targets:
+            targets.append(safe)
+    job["stop_evt"].set()
+    try:
+        _inside = _safe_in_roots(_dest_for(job)) is not None
+    except Exception:
+        _inside = False
+    if _inside:
+        cleanup_partial_files(job)   # .part leftovers, only when dest is inside the root
+    removed = []
+    for t in targets:
+        try:
+            os.remove(t)
+            removed.append(str(t))
+        except PermissionError:
+            return jsonify({"error": f"{t.name} is in use by another program. Close it and try again."}), 409
+        except OSError as e:
+            return jsonify({"error": f"Couldn't delete {t.name}: {e}"}), 500
+    JOBS.pop(job_id, None)
+    save_jobs_snapshot()
+    log(f"deleted job {job_id} and file(s): {removed or 'none on disk'}")
+    return jsonify({"ok": True, "removed": removed})
+
+
+# ---- Media toolkit (ffmpeg): /toolkit/compress, /toolkit/trim, /toolkit/gif ----
+_TOOLKIT_TIMEOUT = 7200
+
+
+def _ff_bins():
+    d = find_ffmpeg_dir()
+    if d:
+        return str(Path(d) / "ffmpeg.exe"), str(Path(d) / "ffprobe.exe")
+    return "ffmpeg", "ffprobe"
+
+
+def _parse_clock(value, name):
+    """'90', '1:30', '00:01:30.5' -> seconds (float). Rejects anything else so
+    nothing user-typed can ever reach ffmpeg as an option."""
+    s = str(value if value is not None else "").strip()
+    parts = s.split(":")
+    if not s or len(parts) > 3 or not all(re.fullmatch(r"\d+(?:\.\d+)?", p) for p in parts):
+        raise ValueError(f"{name} must look like 90, 1:30 or 00:01:30")
+    secs = 0.0
+    for p in parts:
+        secs = secs * 60 + float(p)
+    return secs
+
+
+def _toolkit_source(data):
+    """Source file from a finished job id, or a path inside the allowed folders."""
+    jid = data.get("job_id")
+    if jid:
+        job = JOBS.get(jid)
+        if not job:
+            raise ValueError("unknown job")
+        cands = [Path(job["dest"])] if job.get("dest") else []
+        try:
+            cands.append(_dest_for(job))
+        except Exception:
+            pass
+        for c in cands:
+            if c.is_file():
+                return c
+        raise ValueError("the job's file is missing on disk")
+    raw = data.get("path")
+    if not raw:
+        raise ValueError("no source file given")
+    p = _safe_in_roots(raw)
+    if p is None or not p.is_file():
+        raise ValueError("source must be an existing file inside the VideoGrabber / download folders")
+    return p
+
+
+def _toolkit_out(src, tag, ext):
+    out_dir = Path(STATE.get("output_dir") or src.parent)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return _unique_path(out_dir / safe_filename(f"{src.stem} ({tag}).{ext.lstrip('.')}"))
+
+
+def _probe_duration(src):
+    _, ffprobe = _ff_bins()
+    r = subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=nw=1:nk=1", str(src)],
+                       capture_output=True, text=True, errors="replace", timeout=60,
+                       creationflags=_CREATE_NO_WINDOW)
+    try:
+        return float((r.stdout or "").strip())
+    except ValueError:
+        raise ValueError("couldn't read the video's duration")
+
+
+def _run_toolkit(cmd, out, label):
+    log(f"toolkit {label}: {' '.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           timeout=_TOOLKIT_TIMEOUT, creationflags=_CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        out.unlink(missing_ok=True)
+        return jsonify({"error": "ffmpeg timed out"}), 500
+    except OSError as e:
+        return jsonify({"error": f"couldn't start ffmpeg: {e}"}), 500
+    if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        out.unlink(missing_ok=True)
+        tail = (r.stderr or "").strip().splitlines()[-3:]
+        log(f"toolkit {label} failed (rc={r.returncode}): {' | '.join(tail)}")
+        return jsonify({"error": "ffmpeg failed: " + " ".join(tail)[:300]}), 500
+    log(f"toolkit {label}: wrote {out.name}")
+    return jsonify({"ok": True, "output": str(out), "size": out.stat().st_size})
+
+
+@app.route("/toolkit/compress", methods=["POST"])
+def toolkit_compress():
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        src = _toolkit_source(data)
+        ffmpeg, _ = _ff_bins()
+        out = _toolkit_out(src, "compressed", "mp4")
+        cmd = [ffmpeg, "-y", "-i", str(src), "-c:v", "libx264", "-preset", "medium",
+               "-pix_fmt", "yuv420p"]
+        if (data.get("mode") or "quality") == "size":
+            mb = float(data.get("target_mb") or 0)
+            if mb <= 0:
+                raise ValueError("target size must be above 0 MB")
+            dur = _probe_duration(src)
+            audio_k = 128
+            v_k = int(mb * 8192 / dur - audio_k)      # MB -> kilobit, minus audio
+            if v_k < 50:
+                raise ValueError("target size is too small for this video's length")
+            cmd += ["-b:v", f"{v_k}k", "-maxrate", f"{int(v_k * 1.5)}k",
+                    "-bufsize", f"{v_k * 3}k"]
+        else:
+            crf = int(data.get("crf") if data.get("crf") is not None else 28)
+            cmd += ["-crf", str(max(16, min(40, crf)))]
+        cmd += ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)]
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+    return _run_toolkit(cmd, out, "compress")
+
+
+@app.route("/toolkit/trim", methods=["POST"])
+def toolkit_trim():
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        src = _toolkit_source(data)
+        ffmpeg, _ = _ff_bins()
+        start = _parse_clock(data.get("start") or "0", "start")
+        end_raw = str(data.get("end") or "").strip()
+        end = _parse_clock(end_raw, "end") if end_raw else None
+        if end is not None and end <= start:
+            raise ValueError("end must be after start")
+        out = _toolkit_out(src, "trim", src.suffix or ".mp4")
+        # -ss / -to before -i + -c copy: no re-encode, so it is instant and
+        # lossless (cuts land on the nearest keyframe).
+        cmd = [ffmpeg, "-y", "-ss", f"{start:.3f}"]
+        if end is not None:
+            cmd += ["-to", f"{end:.3f}"]
+        cmd += ["-i", str(src), "-c", "copy", "-avoid_negative_ts", "make_zero", str(out)]
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+    return _run_toolkit(cmd, out, "trim")
+
+
+@app.route("/toolkit/gif", methods=["POST"])
+def toolkit_gif():
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        src = _toolkit_source(data)
+        ffmpeg, _ = _ff_bins()
+        start = _parse_clock(data.get("start") or "0", "start")
+        dur = float(data.get("duration") or 5)
+        if not 0.1 <= dur <= 60:
+            raise ValueError("duration must be between 0.1 and 60 seconds")
+        fps = max(1, min(30, int(data.get("fps") or 12)))
+        width = max(64, min(1280, int(data.get("width") or 480)))
+        out = _toolkit_out(src, "gif", "gif")
+        # Two-stage palette in one pass: palettegen builds the best 256 colors
+        # for this clip, paletteuse maps frames onto it. Far cleaner than the
+        # default GIF palette.
+        vf = (f"fps={fps},scale={width}:-1:flags=lanczos,split[s0][s1];"
+              f"[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5")
+        cmd = [ffmpeg, "-y", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(src),
+               "-vf", vf, "-loop", "0", str(out)]
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+    return _run_toolkit(cmd, out, "gif")
+
 
 @app.route("/jobs", methods=["GET"])
 def jobs():

@@ -392,7 +392,8 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
     if _clean and _clean != _stem:
         fname, _stem = _clean + _ext, _clean
     if is_junk_stem(_stem):
-        fname = safe_filename(generated_name(url)) + _ext
+        # {domain}_{date}_{type}.{ext}; m3u8/mpd become mp4
+        fname = safe_filename(generated_name(url, category, _ext))
         auto_named = not (multi and resolution)
         log(f"new_job: junk name {_stem!r} -> {fname!r} (auto_name={auto_named})")
     # Session 10: multi-quality checklist - when the caller queued several
