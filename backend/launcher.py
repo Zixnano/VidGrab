@@ -337,25 +337,83 @@ def _message_box(title: str, text: str, flags: int) -> int:
         return 0
 
 
-def _source_dir(root: Path):
+# Last-resort source folders, tried only after VG_SOURCE_DIR and
+# source-path.txt both fail. Edit this if the source folder moves.
+_FALLBACK_SOURCE_DIRS = [
+    r"C:\Users\Zix Nano\Downloads\Compressed\Video grabber\Video grabber New",
+]
+
+
+def _read_text_tolerant(path: Path) -> str:
+    """Read a small text file whatever Notepad saved it as: UTF-8 with or
+    without BOM, UTF-16 (with BOM), or ANSI (cp1252). Never raises on bad
+    bytes."""
+    raw = path.read_bytes()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
+
+def _clean_path_text(text: str) -> str:
+    """Whole-text clean-up, then take the first non-empty line: kills BOMs,
+    NULs (from UTF-16 mishaps), CR/LF, surrounding spaces and quotes."""
+    text = text.replace("\x00", "").replace("\ufeff", "").strip()
+    for line in text.splitlines():
+        line = line.strip().strip("\"'").strip()
+        if line:
+            return line
+    return ""
+
+
+def _source_dir(root: Path, app_dir=None):
+    """Find the folder holding the source .py files. Order: VG_SOURCE_DIR,
+    source-path.txt beside the exe, the hardcoded fallbacks, then parent
+    folders of the exe that contain server.py. The install app\\ folder is
+    never picked (copying it onto itself would be pointless)."""
     candidates = []
-    env = os.environ.get("VG_SOURCE_DIR", "").strip()
-    if env:
-        candidates.append(Path(env.strip('"')))
+    env = os.environ.get("VG_SOURCE_DIR", "")
+    if env.strip():
+        candidates.append(_clean_path_text(env))
+
     hint = root / _SOURCE_HINT_FILE
     try:
         if hint.is_file():
-            lines = hint.read_text(encoding="utf-8").strip().splitlines()
-            if lines:
-                candidates.append(Path(lines[0].strip().strip('"')))
-    except OSError:
-        pass
-    for c in candidates:
+            candidates.append(_clean_path_text(_read_text_tolerant(hint)))
+    except OSError as e:
+        _log_error(f"launcher: could not read {hint}: {e}")
+
+    candidates.extend(_FALLBACK_SOURCE_DIRS)
+
+    for parent in [root, *list(root.parents)[:3]]:
+        if (parent / "server.py").is_file():
+            candidates.append(str(parent))
+
+    skip = None
+    if app_dir is not None:
         try:
-            if c.is_dir() and any(c.glob("*.py")):
-                return c.resolve()
+            skip = Path(app_dir).resolve()
+        except OSError:
+            skip = None
+
+    tried = []
+    for raw in candidates:
+        c = (raw or "").strip()
+        if not c:
+            continue
+        tried.append(c)
+        try:
+            p = Path(c).resolve()
+            if not p.is_dir() or not any(p.glob("*.py")):
+                continue
+            if skip is not None and p == skip:
+                continue
+            return p
         except OSError:
             continue
+    _log_error("launcher: no usable source folder; tried: " + " | ".join(tried))
     return None
 
 
@@ -392,7 +450,7 @@ def _offer_repair_and_relaunch(root: Path, app_dir: Path, tb_text: str) -> None:
     if answer != _IDYES:
         return
 
-    src = _source_dir(root)
+    src = _source_dir(root, app_dir)
     if src is None:
         _message_box(
             "Video Grabber",
