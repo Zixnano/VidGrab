@@ -1283,6 +1283,313 @@
   // Some SPA players swap currentSrc without any mutation nearby — poll lightly.
   scheduleScan();
 
+  // ---- v7: image micro-pill (IDM style) ------------------------------------
+  // One tiny round button that jumps onto any <img>, or any element with an
+  // inline background-image, larger than 150x150 while the mouse is over it.
+  // Click queues the best URL directly (RELAY_DOWNLOAD never opens the Add
+  // dialog) and shows a small toast. Delegated capture listeners mean one pill
+  // per frame instead of one per image, and images added later just work.
+  const MICRO_MIN = 150;
+  const MICRO_SIZE = 24;
+  const MICRO_IMG_EXT_RE = /\.(jpe?g|png|gif|webp|avif|bmp|svg|tiff?|heic|heif|jxl|ico)$/i;
+  let microPill = null;
+  let microToast = null;
+  let microTarget = null;
+  let microHideTimer = 0;
+  let microToastTimer = 0;
+  let microPlaceQueued = false;
+
+  function microAbs(u, base) {
+    try {
+      const x = new URL(u, base || document.baseURI);
+      return /^https?:$/i.test(x.protocol) ? x.href : "";
+    } catch (e) { return ""; }
+  }
+
+  // Spec-style srcset parser. A plain split(",") breaks on CDN URLs that
+  // contain commas (w_300,h_200), so walk the string instead: a URL is the
+  // next run of non-space characters, descriptors run to the next comma that
+  // is not inside parentheses.
+  function parseSrcset(str) {
+    const out = [];
+    if (!str) return out;
+    const s = String(str);
+    const n = s.length;
+    let i = 0;
+    while (i < n) {
+      while (i < n && /[\s,]/.test(s[i])) i++;
+      if (i >= n) break;
+      let j = i;
+      while (j < n && !/\s/.test(s[j])) j++;
+      let url = s.slice(i, j);
+      i = j;
+      let desc = "";
+      if (/,+$/.test(url)) {
+        url = url.replace(/,+$/, "");
+      } else {
+        let k = i, depth = 0;
+        while (k < n) {
+          const ch = s[k];
+          if (ch === "(") depth++;
+          else if (ch === ")") depth = Math.max(0, depth - 1);
+          else if (ch === "," && depth === 0) break;
+          k++;
+        }
+        desc = s.slice(i, k).trim();
+        i = k + 1;
+      }
+      if (url) out.push({ url, desc });
+    }
+    return out;
+  }
+
+  // Fold one srcset string into `best`. "2000w" beats "500w"; "2x" beats "1x"
+  // (density is scaled by the rendered width so both kinds stay comparable);
+  // no descriptor means 1x.
+  function srcsetBest(str, base, renderedW, best) {
+    for (const cand of parseSrcset(str)) {
+      const abs = microAbs(cand.url, base);
+      if (!abs) continue;
+      let score = renderedW;
+      for (const tok of cand.desc.split(/\s+/)) {
+        const m = /^(\d+(?:\.\d+)?)([wx])$/i.exec(tok);
+        if (!m) continue;
+        score = m[2].toLowerCase() === "w" ? parseFloat(m[1]) : parseFloat(m[1]) * renderedW;
+      }
+      if (!best || score > best.score) best = { url: abs, score };
+    }
+    return best;
+  }
+
+  // Highest-resolution URL for an <img>: its own srcset / data-srcset plus the
+  // srcset of every <source> in a parent <picture> whose media query matches.
+  // Falls back to currentSrc / src / common lazy-load attributes.
+  function microImageUrl(img) {
+    const base = img.baseURI || document.baseURI;
+    const rw = img.getBoundingClientRect().width || 1;
+    let best = null;
+    try {
+      best = srcsetBest(img.getAttribute("srcset"), base, rw, best);
+      best = srcsetBest(img.getAttribute("data-srcset"), base, rw, best);
+      const pic = img.parentElement;
+      if (pic && pic.tagName === "PICTURE") {
+        for (const src of pic.querySelectorAll("source")) {
+          const media = src.getAttribute("media");
+          if (media) {
+            try { if (!window.matchMedia(media).matches) continue; } catch (e) {}
+          }
+          best = srcsetBest(src.getAttribute("srcset"), base, rw, best);
+        }
+      }
+    } catch (e) {}
+    if (best) return best.url;
+    const fallbacks = [img.currentSrc, img.src,
+                       img.getAttribute("data-src"), img.getAttribute("data-original")];
+    for (const cand of fallbacks) {
+      const abs = cand ? microAbs(cand, base) : "";
+      if (abs) return abs;
+    }
+    return "";
+  }
+
+  // url(...) out of an INLINE background-image style (first one if several).
+  function microBgUrl(el) {
+    let v = "";
+    try { v = (el.style && el.style.backgroundImage) || ""; } catch (e) {}
+    if (!v || v === "none") return "";
+    const m = /url\(\s*(['"]?)(.*?)\1\s*\)/i.exec(v);
+    return m && m[2] ? microAbs(m[2].replace(/\\(["'])/g, "$1"), el.baseURI) : "";
+  }
+
+  function microUrlFor(el) {
+    return el.tagName === "IMG" ? microImageUrl(el) : microBgUrl(el);
+  }
+
+  function microEligible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el === microPill || el === microToast) return false;
+    if (el.tagName !== "IMG" && !(el.hasAttribute("style") && microBgUrl(el))) return false;
+    const r = el.getBoundingClientRect();
+    if (!(r.width > MICRO_MIN && r.height > MICRO_MIN)) return false;
+    return !!microUrlFor(el);
+  }
+
+  function microToastShow(text, isErr) {
+    if (!microToast || !microToast.isConnected) {
+      const t = document.createElement("div");
+      t.id = "vg-micro-toast";
+      t.style.cssText = `
+        all: initial; position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
+        max-width: 260px; box-sizing: border-box; padding: 8px 12px; border-radius: 8px;
+        font: 13px/1.3 -apple-system, Segoe UI, Roboto, sans-serif;
+        background: ${TH.bg_elevated}f2; color: ${TH.text};
+        box-shadow: 0 4px 16px rgba(0,0,0,0.5); pointer-events: none;
+        opacity: 0; transition: opacity 150ms ease; display: none;
+      `;
+      document.documentElement.appendChild(t);
+      microToast = t;
+    }
+    microToast.textContent = text;
+    microToast.style.border = `1px solid ${isErr ? TH.error : TH.accent}`;
+    microToast.style.display = "block";
+    requestAnimationFrame(() => { if (microToast) microToast.style.opacity = "1"; });
+    clearTimeout(microToastTimer);
+    microToastTimer = setTimeout(() => {
+      if (!microToast) return;
+      microToast.style.opacity = "0";
+      setTimeout(() => { if (microToast) microToast.style.display = "none"; }, 180);
+    }, 2200);
+  }
+
+  function ensureMicroPill() {
+    if (microPill && microPill.isConnected) return microPill;
+    const p = document.createElement("div");
+    p.id = "vg-micro-pill";
+    p.className = "vg-micro-pill";
+    p.title = "Download with Video Grabber";
+    p.style.cssText = `
+      all: initial; position: absolute; z-index: 2147483647; display: none;
+      align-items: center; justify-content: center; box-sizing: border-box;
+      width: ${MICRO_SIZE}px; height: ${MICRO_SIZE}px; border-radius: 50%;
+      background: ${TH.bg_base}e6; color: ${TH.accent};
+      border: 1px solid ${TH.accent}; box-shadow: 0 1px 6px rgba(0,0,0,0.5);
+      cursor: pointer; user-select: none;
+    `;
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", "14");
+    svg.setAttribute("height", "14");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2.6");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.style.pointerEvents = "none";
+    for (const d of ["M12 4v11", "M7 11l5 5 5-5", "M5 20h14"]) {
+      const path = document.createElementNS(NS, "path");
+      path.setAttribute("d", d);
+      svg.appendChild(path);
+    }
+    p.appendChild(svg);
+
+    // Keep the site's lightbox / drag handlers from seeing our clicks.
+    for (const ev of ["mousedown", "mouseup", "pointerdown", "pointerup", "dblclick"]) {
+      p.addEventListener(ev, (e) => e.stopPropagation());
+    }
+    p.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      sendMicro();
+    });
+    p.addEventListener("mouseenter", () => {
+      clearTimeout(microHideTimer);
+      p.style.background = TH.accent;
+      p.style.color = TH.bg_base;
+    });
+    p.addEventListener("mouseleave", (e) => {
+      p.style.background = `${TH.bg_base}e6`;
+      p.style.color = TH.accent;
+      scheduleMicroHide(e.relatedTarget);
+    });
+    document.documentElement.appendChild(p);
+    microPill = p;
+    return p;
+  }
+
+  // Top-right corner of the part of the element that is on screen, in page
+  // coordinates (the pill is position:absolute on the root element).
+  function placeMicro() {
+    microPlaceQueued = false;
+    const el = microTarget;
+    if (!el || !microPill) return;
+    if (!el.isConnected) { hideMicro(); return; }
+    const r = el.getBoundingClientRect();
+    if (!(r.width > MICRO_MIN && r.height > MICRO_MIN)
+        || r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) {
+      microPill.style.display = "none";
+      return;
+    }
+    const vw = document.documentElement.clientWidth || innerWidth;
+    const right = Math.min(r.right, vw);
+    const top = Math.max(r.top, 0);
+    microPill.style.left = (right + scrollX - MICRO_SIZE - 6) + "px";
+    microPill.style.top = (top + scrollY + 6) + "px";
+    microPill.style.display = "flex";
+  }
+
+  function showMicro(el) {
+    clearTimeout(microHideTimer);
+    ensureMicroPill();
+    microTarget = el;
+    placeMicro();
+  }
+
+  function hideMicro() {
+    clearTimeout(microHideTimer);
+    microTarget = null;
+    if (microPill) microPill.style.display = "none";
+  }
+
+  function scheduleMicroHide(related) {
+    if (related && related.nodeType === 1) {
+      if (related === microPill || (microPill && microPill.contains(related))) return;
+      if (microTarget && microTarget.contains(related)) return;
+    }
+    clearTimeout(microHideTimer);
+    microHideTimer = setTimeout(hideMicro, 150);
+  }
+
+  function sendMicro() {
+    const el = microTarget;
+    if (!el) return;
+    const url = microUrlFor(el);   // re-read now: srcset may have changed since hover
+    if (!url) { microToastShow("No image URL found", true); return; }
+    let filename;
+    try {
+      const last = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
+      if (MICRO_IMG_EXT_RE.test(last)) filename = last;
+    } catch (e) {}
+    try {
+      chrome.runtime.sendMessage(
+        { type: "RELAY_DOWNLOAD", url, pageUrl: location.href, filename, skipList: true },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            microToastShow(failLabel(null, chrome.runtime.lastError.message), true);
+            return;
+          }
+          if (resp && resp.ok) {
+            microToastShow(resp.duplicate_of ? "Image already in your list" : "Image sent to queue!");
+          } else {
+            microToastShow(failLabel(resp), true);
+          }
+        });
+    } catch (e) {
+      microToastShow("Extension reloading, try again", true);
+    }
+  }
+
+  // mouseenter does not bubble but does pass through the capture phase, so one
+  // listener on the document sees every element the pointer enters.
+  document.addEventListener("mouseenter", (e) => {
+    if (siteDisabled) return;
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    if (t.tagName !== "IMG" && !t.hasAttribute("style")) return;
+    if (!microEligible(t)) return;
+    showMicro(t);
+  }, true);
+  document.addEventListener("mouseleave", (e) => {
+    if (e.target === microTarget) scheduleMicroHide(e.relatedTarget);
+  }, true);
+  const microReplace = () => {
+    if (!microTarget || microPlaceQueued) return;
+    microPlaceQueued = true;
+    requestAnimationFrame(placeMicro);
+  };
+  window.addEventListener("scroll", microReplace, { capture: true, passive: true });
+  window.addEventListener("resize", microReplace, { passive: true });
+
   // ---- v6: blob-anchor download bridge (pairs with mainhook.js) -----------
   // mainhook.js (MAIN world, claude.ai only) swallows <a download href=blob:>
   // clicks while armed and posts the Blob here by reference. We upload it to

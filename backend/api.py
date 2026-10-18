@@ -45,6 +45,7 @@ TOKEN_PROTECTED_PATHS = {
     "/clear-failed", "/queue-status", "/dup-check", "/favicon",
     "/update-status", "/update-skip", "/ytdlp-update", "/ytdlp-rollback",
     "/reorder", "/theme", "/queue-running", "/delete-file", "/toolkit",
+    "/open-folder",
 }
 
 # Random per-launch key, embedded in the LAN web UI's action links so that
@@ -456,6 +457,57 @@ def delete_job_and_file(job_id):
     save_jobs_snapshot()
     log(f"deleted job {job_id} and file(s): {removed or 'none on disk'}")
     return jsonify({"ok": True, "removed": removed})
+
+
+# ---- Open folder: popup "done" link on Recent downloads -------------------
+@app.route("/open-folder", methods=["POST"])
+def open_folder():
+    """Open Explorer on a finished job's file (selected) or, if the file is
+    gone, its folder. The path comes only from the job record, never from the
+    request, and no shell is involved."""
+    data = request.get_json(silent=True) or {}
+    job_id = data.get("job_id")
+    job = JOBS.get(job_id) if isinstance(job_id, str) else None
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    cands = []
+    if job.get("dest"):
+        cands.append(Path(job["dest"]))
+    try:
+        cands.append(_dest_for(job))
+    except Exception:
+        pass
+    target = None
+    for c in cands:
+        try:
+            if c.is_file():
+                target = c
+                break
+        except OSError:
+            continue
+    folder = None
+    if target is None:
+        for c in cands:
+            try:
+                if c.parent.is_dir():
+                    folder = c.parent
+                    break
+            except OSError:
+                continue
+        if folder is None:
+            return jsonify({"error": "Folder not found"}), 404
+    try:
+        if sys.platform == "win32":
+            if target is not None:
+                subprocess.Popen(["explorer", f"/select,{target}"])
+            else:
+                os.startfile(str(folder))
+        else:
+            subprocess.Popen(["xdg-open", str(folder or target.parent)])
+    except Exception as e:
+        log(f"open-folder failed for job {job_id}: {e}")
+        return jsonify({"error": "Couldn't open the folder"}), 500
+    return jsonify({"ok": True})
 
 
 # ---- Media toolkit (ffmpeg): /toolkit/compress, /toolkit/trim, /toolkit/gif ----

@@ -102,6 +102,25 @@
   .rjob.err .rmeta .rstat { color: var(--err); }
   #siteRow { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--mu); margin-bottom: 8px; }
   #siteToggle { font-size: 11px; padding: 3px 10px; }
+
+  /* v4.2: clickable "done" on recent downloads opens the file's folder. */
+  .rjob .rstat.link { cursor: pointer; color: var(--ac); text-decoration: underline; }
+  .rjob .rstat.link:hover { color: var(--ac-dim); }
+  /* v4.2: tag on top-level HLS playlists. */
+  .vtag { font-size: 10px; font-weight: 600; color: var(--ac); border: 1px solid var(--ac-dim);
+          border-radius: 999px; padding: 0 6px; margin-left: 4px; white-space: nowrap; }
+  /* v4.2: "Queue X items?" confirmation for big Grab-all sends. */
+  #grabConfirm { display: none; align-items: center; gap: 8px; margin-top: 6px; padding: 8px 10px;
+                 border: 1px solid var(--warn); border-radius: var(--r); background: var(--panel); }
+  #grabConfirm span { flex: 1; font-size: 12px; }
+  #grabConfirm button { padding: 5px 12px; font-size: 12px; }
+  #grabConfirmYes { background: var(--ac); color: var(--on-ac); border-color: var(--ac); font-weight: 600; }
+  /* v4.2: small toast at the bottom of the popup. */
+  #toast { position: fixed; left: 12px; right: 12px; bottom: 12px; z-index: 10; padding: 8px 12px;
+           border: 1px solid var(--ac); border-radius: var(--r); background: var(--elev); color: var(--tx);
+           font-size: 12px; text-align: center; opacity: 0; pointer-events: none; transition: opacity 150ms ease; }
+  #toast.show { opacity: 1; }
+  #toast.err { border-color: var(--err); color: var(--err); }
 </style>
 </head>
 <body>
@@ -151,6 +170,12 @@
   </div>
   <div id="grabChecklist"></div>
   <button id="grabSendBtn" style="display:none;">Send selected to Grabber</button>
+  <div id="grabConfirm">
+    <span id="grabConfirmText"></span>
+    <button id="grabConfirmYes">Yes</button>
+    <button id="grabConfirmNo">Cancel</button>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
 
   <script src="theme.js"></script>
   <script src="popup.js"></script>

@@ -35,6 +35,21 @@ function dedupKey(url) {
   }
 }
 
+// v4.2: short-window de-dup for the network sniffer. Ad iframes and polled
+// playlists can report the same URL many times a second. Same tab + same
+// dedup key inside SNIFF_DEDUP_MS is ignored, unless the repeat carries
+// information the stored entry lacks (size / content-type from the response
+// headers arrives after the request event for the same URL).
+const SNIFF_DEDUP_MS = 5000;
+const RECENT_SNIFF = new Map();   // "tabId|dedupKey" -> timestamp
+
+function clearRecentFor(tabId) {
+  const prefix = tabId + "|";
+  for (const k of RECENT_SNIFF.keys()) {
+    if (k.startsWith(prefix)) RECENT_SNIFF.delete(k);
+  }
+}
+
 // 6.2: the service worker is torn down after ~30 s idle and the in-memory Map
 // goes with it, so the per-tab list is mirrored into chrome.storage.session
 // (cleared when the browser closes) and hydrated again on startup.
@@ -149,6 +164,22 @@ function addItem(tabId, item) {
   if (!videoMap.has(tabId)) videoMap.set(tabId, new Map());
   const m = videoMap.get(tabId);
   const key = dedupKey(item.url);
+  if (item.source !== "overlay") {
+    const rk = tabId + "|" + key;
+    const nowTs = Date.now();
+    const last = RECENT_SNIFF.get(rk);
+    if (last !== undefined && nowTs - last < SNIFF_DEDUP_MS) {
+      const ex = m.get(key);
+      const adds = ex && ((item.size && !ex.size) || (item.contentType && !ex.contentType));
+      if (ex && !adds) return;
+    }
+    RECENT_SNIFF.set(rk, nowTs);
+    if (RECENT_SNIFF.size > 1000) {
+      for (const [k, ts] of RECENT_SNIFF) {
+        if (nowTs - ts >= SNIFF_DEDUP_MS) RECENT_SNIFF.delete(k);
+      }
+    }
+  }
   if (!m.has(key) && manifestSuperseded(m, item.url)) return;
   if (m.has(key)) {
     // Don't overwrite real data with empty data: keep the existing size /
@@ -219,6 +250,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId === 0) {
     videoMap.delete(details.tabId);
+    clearRecentFor(details.tabId);
     setBadge(details.tabId, "");
     persistVideoMap(true);
   }
@@ -229,6 +261,7 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (details.frameId === 0) {
     videoMap.delete(details.tabId);
+    clearRecentFor(details.tabId);
     setBadge(details.tabId, "");
     persistVideoMap(true);
   }
@@ -236,6 +269,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   videoMap.delete(tabId);
+  clearRecentFor(tabId);
   persistVideoMap();
 });
 
@@ -433,6 +467,22 @@ function ensureContextMenus() {
 }
 chrome.runtime.onInstalled.addListener(ensureContextMenus);
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  // v4.2: right-clicking an image skips the DOM and the Add dialog: srcUrl
+  // goes straight to the queue. Links, video and audio keep the old path.
+  if (info.mediaType === "image" && info.srcUrl) {
+    if (/^(blob|data):/i.test(info.srcUrl)) {
+      commandNotify("Can't send this image, the page built it in memory.");
+      return;
+    }
+    const imgResp = await sendToBackend({
+      url: info.srcUrl,
+      pageUrl: (tab && tab.url) || info.pageUrl || info.srcUrl,
+    });
+    commandNotify(imgResp.ok
+      ? (imgResp.duplicate_of ? "Image already in your list" : "Image sent to queue!")
+      : (imgResp.error || "Couldn't send that to the app."));
+    return;
+  }
   const url = info.linkUrl || info.srcUrl || info.pageUrl;
   if (!url || /^(blob|data):/i.test(url)) return;
   const resp = await showAddDialogFor({
@@ -650,7 +700,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "RELAY_DOWNLOAD") {
     // From content.js overlay OR popup.js
     const tabId = sender.tab ? sender.tab.id : msg.tabId;
-    addItem(tabId, { url: msg.url, source: "overlay", contentType: null });
+    if (!msg.skipList) addItem(tabId, { url: msg.url, source: "overlay", contentType: null });
     sendToBackend({
       url: msg.url,
       pageUrl: msg.pageUrl,

@@ -77,6 +77,20 @@ let mediaItems = [];           // rows: {url, size, timestamp, checked, ...}
 let filterSet = null;          // null = all visible; else Set of categories
 let searchText = "";
 let sortMode = "time";         // E5: "time" | "size" | "name" (saved as popupSort)
+let _autoTried = false;        // v4.2: single-item auto-download runs once per popup open
+const GRAB_CONFIRM_LIMIT = 5;  // v4.2: Grab-all sends above this need a confirmation
+
+// v4.2: small toast at the bottom of the popup.
+let _toastTimer = null;
+function showToast(text, isErr) {
+  const el = document.getElementById("toast");
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle("err", !!isErr);
+  el.classList.add("show");
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
+}
 
 async function checkBackend() {
   const statusEl = document.getElementById("status");
@@ -166,7 +180,9 @@ async function refreshRecent() {
     if (!apiToken) { box.style.display = "none"; return; }
     const res = await fetch(`${BACKEND_BASE}/jobs`, { headers: { "X-API-Token": apiToken } });
     if (!res.ok) { box.style.display = "none"; return; }
-    const jobs = Object.values(await res.json());
+    // Keep the id (the object key) so a row can ask the app to open its folder.
+    const jobsObj = await res.json();
+    const jobs = Object.entries(jobsObj).map(([key, j]) => ({ ...j, _id: j.id || j.job_id || key }));
     jobs.sort((a, b) => (b.created_ts || 0) - (a.created_ts || 0));
     const recent = jobs.filter((j) => j.status !== "skipped").slice(0, 5);
     if (!recent.length) { box.style.display = "none"; return; }
@@ -188,6 +204,11 @@ async function refreshRecent() {
       stat.className = "rstat";
       const retrying = j.status === "queued" && (j.retry_after || 0) > Date.now() / 1000;
       stat.textContent = retrying ? "retrying soon" : j.status + (j.status === "downloading" ? ` ${pct}%` : "");
+      if (j.status === "done") {
+        stat.classList.add("link");
+        stat.title = "Open folder";
+        stat.addEventListener("click", () => openJobFolder(j));
+      }
       const right = document.createElement("span");
       right.textContent = j.status === "downloading" ? (j.speed || "") : fmtB(j.size_total);
       meta.appendChild(stat); meta.appendChild(right);
@@ -197,6 +218,23 @@ async function refreshRecent() {
     box.style.display = "block";
   } catch (e) {
     box.style.display = "none";
+  }
+}
+
+// v4.2: ask the app to open Explorer at a finished job's file.
+async function openJobFolder(j) {
+  try {
+    const { apiToken } = await chrome.storage.local.get("apiToken");
+    const res = await fetch(`${BACKEND_BASE}/open-folder`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Token": apiToken || "" },
+      body: JSON.stringify({ job_id: j._id, filename: j.filename || null }),
+    });
+    if (res.ok) { showToast("Opening folder…"); return; }
+    const d = await res.json().catch(() => ({}));
+    showToast(d.error || (res.status === 404 ? "Open folder needs a newer Video Grabber app" : "Couldn't open the folder"), true);
+  } catch (e) {
+    showToast("Desktop app not reachable", true);
   }
 }
 
@@ -344,6 +382,21 @@ function faviconEl(it) {
   return tile;
 }
 
+// v4.2: the per-row send, shared by the row's download button and the
+// single-item auto-download. Same message and filename rules as before.
+function dlFilename(it, tab) {
+  return redditCdnName(it.url, tab) || (/\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpg|mpeg|mp3|m4a|aac|wav|flac|ogg|opus|wma|aiff|m4b|m3u8|mpd|pdf|zip|rar|7z|tar|gz|tgz|bz2|xz|zst|cab|iso|epub|mobi|azw3|docx?|xlsx?|pptx?|txt|md|rtf|odt|ods|odp|csv|tsv|json|xml|yaml|yml|exe|msi|dmg|deb|rpm|apk|appimage|bat|cmd|sh|ps1|jar|jpe?g|png|gif|webp|avif|heic|heif|bmp|ico|tif|tiff|jxl|psd|raw|woff2?|eot|ttf|otf|3g2|3gp|aif|alac|amr|ape|appx|asf|cr2|divx|dng|img|jpe|js|lz|lzma|m2ts|mid|midi|mts|mxf|nef|ogv|py|rm|rmvb|svg|ts|vob|xcf)(\?|#|$)/i.test(it.url)
+          ? fileName(it.url) : undefined);
+}
+
+function relayOne(it, tab, cb) {
+  chrome.runtime.sendMessage(
+    { type: "RELAY_DOWNLOAD", url: it.url, pageUrl: tab.url,
+      tabId: tab.id, filename: dlFilename(it, tab) },
+    cb
+  );
+}
+
 function rowEl(it) {
   const row = document.createElement("div");
   row.className = "mrow";
@@ -358,6 +411,14 @@ function rowEl(it) {
   name.textContent = chunkLabel(it)
     || `${fileName(it.url)} — ${fmtBytes(it.size) || "unknown"}`;
   name.title = it.url;   // full URL on hover
+  // v4.2: mark the top-level HLS playlist so it isn't mistaken for a sub-stream.
+  if (extOf(it.url) === "m3u8" && /master/i.test(fileName(it.url))) {
+    const tag = document.createElement("span");
+    tag.className = "vtag";
+    tag.textContent = "[Master]";
+    tag.title = "Top-level playlist (contains every quality)";
+    name.appendChild(tag);
+  }
 
   const acts = document.createElement("span");
   acts.className = "macts";
@@ -369,17 +430,11 @@ function rowEl(it) {
   bDl.addEventListener("click", () => {
     bDl.textContent = "…";
     const tab = it.tabRef || currentTab || {};
-    chrome.runtime.sendMessage(
-      { type: "RELAY_DOWNLOAD", url: it.url, pageUrl: tab.url,
-        tabId: tab.id,
-        filename: redditCdnName(it.url, tab) || (/\.(mp4|m4v|mov|webm|mkv|avi|flv|wmv|mpg|mpeg|mp3|m4a|aac|wav|flac|ogg|opus|wma|aiff|m4b|m3u8|mpd|pdf|zip|rar|7z|tar|gz|tgz|bz2|xz|zst|cab|iso|epub|mobi|azw3|docx?|xlsx?|pptx?|txt|md|rtf|odt|ods|odp|csv|tsv|json|xml|yaml|yml|exe|msi|dmg|deb|rpm|apk|appimage|bat|cmd|sh|ps1|jar|jpe?g|png|gif|webp|avif|heic|heif|bmp|ico|tif|tiff|jxl|psd|raw|woff2?|eot|ttf|otf|3g2|3gp|aif|alac|amr|ape|appx|asf|cr2|divx|dng|img|jpe|js|lz|lzma|m2ts|mid|midi|mts|mxf|nef|ogv|py|rm|rmvb|svg|ts|vob|xcf)(\?|#|$)/i.test(it.url)
-          ? fileName(it.url) : undefined) },
-      (resp) => {
-        bDl.textContent = "⬇";
-        setStatus(resp && resp.ok ? `Sent ${fileName(it.url)} ✓`
-                                  : (resp && resp.error) || "Failed");
-      }
-    );
+    relayOne(it, tab, (resp) => {
+      bDl.textContent = "⬇";
+      setStatus(resp && resp.ok ? `Sent ${fileName(it.url)} ✓`
+                                : (resp && resp.error) || "Failed");
+    });
   });
 
   const bOpen = document.createElement("button");
@@ -473,7 +528,37 @@ async function loadCurrent() {
   currentTab = tab;
   chrome.runtime.sendMessage({ type: "GET_VIDEOS", tabId: tab.id }, (resp) => {
     setItems((resp && resp.videos) || [], tab);
+    if (!_autoTried) { _autoTried = true; maybeAutoDownload(tab); }
   });
+}
+
+// v4.2: exactly one visible media item on the current page -> send it right
+// away, toast, and close the popup. Runs once per popup open, and never twice
+// for the same URL in the same tab (the second open shows the normal list).
+async function maybeAutoDownload(tab) {
+  try {
+    if (tabMode !== "current" || !/^https?:/i.test(tab.url || "")) return;
+    const vis = visibleItems();
+    if (vis.length !== 1) return;
+    const it = vis[0];
+    const KEY = "autoSent";
+    const st = await chrome.storage.session.get(KEY);
+    const sent = st[KEY] || {};
+    if (sent[tab.id] === it.url) return;
+    sent[tab.id] = it.url;
+    await chrome.storage.session.set({ [KEY]: sent });
+    showToast(`Sending ${fileName(it.url)}…`);
+    relayOne(it, tab, async (resp) => {
+      if (resp && resp.ok) {
+        showToast(`Sent ${fileName(it.url)} ✓`);
+        setTimeout(() => window.close(), 1300);
+      } else {
+        delete sent[tab.id];
+        try { await chrome.storage.session.set({ [KEY]: sent }); } catch (e) {}
+        showToast((resp && resp.error) || "Failed to send", true);
+      }
+    });
+  } catch (e) { /* keep the normal list */ }
 }
 
 // 7.6: "Other Pages (N)" once other tabs have detected media. The current tab
@@ -578,7 +663,24 @@ function scanPageForDownloads() {
 
 let grabItems = [];
 
+// v4.2: "Queue X items? [Yes] [Cancel]" for big sends.
+function hideGrabConfirm() {
+  const box = document.getElementById("grabConfirm");
+  if (box) box.style.display = "none";
+  const sendBtn = document.getElementById("grabSendBtn");
+  if (sendBtn) sendBtn.style.display = "block";
+}
+
+function showGrabConfirm(count, onYes) {
+  document.getElementById("grabConfirmText").textContent = `Queue ${count} items?`;
+  document.getElementById("grabSendBtn").style.display = "none";
+  document.getElementById("grabConfirm").style.display = "flex";
+  document.getElementById("grabConfirmYes").onclick = () => { hideGrabConfirm(); onYes(); };
+  document.getElementById("grabConfirmNo").onclick = hideGrabConfirm;
+}
+
 function renderGrabChecklist() {
+  hideGrabConfirm();
   const checklist = document.getElementById("grabChecklist");
   const toolbar = document.getElementById("grabToolbar");
   const sendBtn = document.getElementById("grabSendBtn");
@@ -613,6 +715,7 @@ function renderGrabChecklist() {
 }
 
 function updateGrabToolbar() {
+  hideGrabConfirm();
   const countEl = document.getElementById("grabCount");
   const toggleBtn = document.getElementById("grabToggleAll");
   const sendBtn = document.getElementById("grabSendBtn");
@@ -733,7 +836,7 @@ async function grabAll(tab) {
     grabItems = grabItems.map((i) => ({ ...i, checked: !allChecked }));
     renderGrabChecklist();
   });
-  document.getElementById("grabSendBtn").addEventListener("click", () => {
+  const sendGrabSelected = () => {
     const resultEl = document.getElementById("grabResult");
     const selected = grabItems.filter((i) => i.checked).map(({ url, filename }) => ({ url, filename }));
     if (!selected.length) return;
@@ -750,6 +853,11 @@ async function grabAll(tab) {
         }
       }
     );
+  };
+  document.getElementById("grabSendBtn").addEventListener("click", () => {
+    const n = grabItems.filter((i) => i.checked).length;
+    if (n > GRAB_CONFIRM_LIMIT) { showGrabConfirm(n, sendGrabSelected); return; }
+    sendGrabSelected();
   });
 
   showTab("current");
