@@ -312,17 +312,18 @@ def _cleanup_update_leftovers(root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Self-healing: after a crash in server.py, offer to copy the source .py files
-# back into app\ and relaunch once. Frozen (installed) builds only.
-#
-# Source folder lookup, first hit wins:
-#   1. VG_SOURCE_DIR environment variable
-#   2. source-path.txt beside VideoGrabber.exe (first line = the folder path)
+# Self-healing: after a crash in server.py, offer to restore the app's .py
+# files from the source backend folder (the job restore.bat does by hand) and
+# relaunch once. Frozen (installed) builds only.
 # ---------------------------------------------------------------------------
 _RELAUNCH_ENV = "VG_RELAUNCHED"
-_SOURCE_HINT_FILE = "source-path.txt"
+_EXE_NAME = "VideoGrabber.exe"
+_SOURCE_BACKEND_DIR = (r"C:\Users\Zix Nano\Downloads\Compressed"
+                       r"\Video grabber\Video grabber New\backend")
+_SOURCE_MARKER = "api.py"
 _MB_OK, _MB_YESNO, _MB_ICONERROR = 0x0, 0x4, 0x10
 _IDYES = 6
+_CREATE_NO_WINDOW = 0x08000000
 
 
 def _message_box(title: str, text: str, flags: int) -> int:
@@ -337,94 +338,63 @@ def _message_box(title: str, text: str, flags: int) -> int:
         return 0
 
 
-# Last-resort source folders, tried only after VG_SOURCE_DIR and
-# source-path.txt both fail. Edit this if the source folder moves.
-_FALLBACK_SOURCE_DIRS = [
-    r"C:\Users\Zix Nano\Downloads\Compressed\Video grabber\Video grabber New",
-]
-
-
-def _read_text_tolerant(path: Path) -> str:
-    """Read a small text file whatever Notepad saved it as: UTF-8 with or
-    without BOM, UTF-16 (with BOM), or ANSI (cp1252). Never raises on bad
-    bytes."""
-    raw = path.read_bytes()
-    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return raw.decode("utf-16", errors="replace")
+def _is_source_folder(p: Path) -> bool:
     try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return raw.decode("cp1252", errors="replace")
+        return p.is_dir() and (p / _SOURCE_MARKER).is_file()
+    except OSError:
+        return False
 
 
-def _clean_path_text(text: str) -> str:
-    """Whole-text clean-up, then take the first non-empty line: kills BOMs,
-    NULs (from UTF-16 mishaps), CR/LF, surrounding spaces and quotes."""
-    text = text.replace("\x00", "").replace("\ufeff", "").strip()
-    for line in text.splitlines():
-        line = line.strip().strip("\"'").strip()
-        if line:
-            return line
-    return ""
-
-
-def _source_dir(root: Path, app_dir=None):
-    """Find the folder holding the source .py files. Order: VG_SOURCE_DIR,
-    source-path.txt beside the exe, the hardcoded fallbacks, then parent
-    folders of the exe that contain server.py. The install app\\ folder is
-    never picked (copying it onto itself would be pointless)."""
-    candidates = []
-    env = os.environ.get("VG_SOURCE_DIR", "")
-    if env.strip():
-        candidates.append(_clean_path_text(env))
-
-    hint = root / _SOURCE_HINT_FILE
-    try:
-        if hint.is_file():
-            candidates.append(_clean_path_text(_read_text_tolerant(hint)))
-    except OSError as e:
-        _log_error(f"launcher: could not read {hint}: {e}")
-
-    candidates.extend(_FALLBACK_SOURCE_DIRS)
-
-    for parent in [root, *list(root.parents)[:3]]:
-        if (parent / "server.py").is_file():
-            candidates.append(str(parent))
-
-    skip = None
-    if app_dir is not None:
-        try:
-            skip = Path(app_dir).resolve()
-        except OSError:
-            skip = None
-
-    tried = []
-    for raw in candidates:
-        c = (raw or "").strip()
-        if not c:
-            continue
-        tried.append(c)
-        try:
-            p = Path(c).resolve()
-            if not p.is_dir() or not any(p.glob("*.py")):
-                continue
-            if skip is not None and p == skip:
-                continue
-            return p
-        except OSError:
-            continue
-    _log_error("launcher: no usable source folder; tried: " + " | ".join(tried))
+def _source_dir(root: Path = None):
+    """The backend source folder, or None.
+    1. The hardcoded backend folder, if it exists and contains api.py.
+    2. The VG_SOURCE_DIR environment variable, with the same test.
+    Otherwise None. `root` is unused; it keeps the call site unchanged."""
+    hard = Path(_SOURCE_BACKEND_DIR)
+    if _is_source_folder(hard):
+        return hard
+    env = os.environ.get("VG_SOURCE_DIR", "").strip().strip('"')
+    if env and _is_source_folder(Path(env)):
+        return Path(env)
     return None
 
 
-def _repair_app_files(src: Path, dst: Path) -> list:
-    """Copy every top-level .py from src into dst (the install app\\ folder)."""
+def _repair_app_files(src: Path, dst: Path) -> tuple:
+    """Copy every top-level *.py from src into dst, the same as
+    `xcopy /Y *.py`. Each file gets its own shutil.copy2, so one locked file
+    doesn't stop the rest. A PermissionError (or other OSError) is logged to
+    launcher-error.log with the file name. Returns (copied, failed) names."""
     dst.mkdir(parents=True, exist_ok=True)
-    copied = []
+    copied, failed = [], []
     for f in sorted(src.glob("*.py")):
-        shutil.copy2(f, dst / f.name)
-        copied.append(f.name)
-    return copied
+        target = dst / f.name
+        try:
+            shutil.copy2(f, target)
+            copied.append(f.name)
+        except PermissionError as e:
+            failed.append(f.name)
+            _log_error(f"launcher: PermissionError copying {f} -> {target}: {e} "
+                       "(file locked or read-only; is VideoGrabber.exe still running?)")
+        except OSError as e:
+            failed.append(f.name)
+            _log_error(f"launcher: copy failed {f} -> {target}: {e}")
+    return copied, failed
+
+
+def _close_other_instances() -> None:
+    """taskkill /F /IM VideoGrabber.exe, skipping this process: this is the
+    crashing copy, and it exits right after the repair. Logs the result and
+    never raises."""
+    me = os.getpid()
+    try:
+        r = subprocess.run(
+            ["taskkill", "/F", "/IM", _EXE_NAME, "/FI", f"PID ne {me}"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=_CREATE_NO_WINDOW)
+        out = (r.stdout or r.stderr or "").strip()
+        _log_error(f"launcher: taskkill (other instances) exit {r.returncode}: {out}")
+    except (OSError, subprocess.SubprocessError) as e:
+        _log_error(f"launcher: taskkill failed: {e}")
 
 
 def _offer_repair_and_relaunch(root: Path, app_dir: Path, tb_text: str) -> None:
@@ -444,31 +414,47 @@ def _offer_repair_and_relaunch(root: Path, app_dir: Path, tb_text: str) -> None:
         "Video Grabber crashed",
         "Video Grabber hit an error while starting:\n\n"
         f"{last}\n\n"
-        "Copy the app files from the source folder and restart now?\n"
+        "Restore the app files from the source folder and restart now?\n"
         "(Details are in launcher-error.log.)",
         _MB_YESNO | _MB_ICONERROR)
     if answer != _IDYES:
         return
 
-    src = _source_dir(root, app_dir)
+    src = _source_dir(root)
     if src is None:
+        _log_error(f"launcher: no source folder. Checked {_SOURCE_BACKEND_DIR} "
+                   f"and VG_SOURCE_DIR (must contain {_SOURCE_MARKER}).")
         _message_box(
             "Video Grabber",
-            "No source folder is set, so nothing could be repaired.\n\n"
-            "Write the source folder path on the first line of "
-            "source-path.txt beside VideoGrabber.exe, then restart.",
+            "No source folder found. Expected this folder to exist:\n\n"
+            f"{_SOURCE_BACKEND_DIR}\n\n"
+            f"(it must contain {_SOURCE_MARKER}), or set VG_SOURCE_DIR to a "
+            "backend folder with that file.",
             _MB_OK | _MB_ICONERROR)
         return
+
+    _close_other_instances()
+    time.sleep(1)  # give the closed process a moment to release its files
+
     try:
-        copied = _repair_app_files(src, app_dir)
+        copied, failed = _repair_app_files(src, app_dir)
     except OSError as e:
         _log_error(f"launcher: repair failed copying {src} -> {app_dir}: {e}")
         _message_box("Video Grabber",
                      f"The repair failed:\n\n{e}\n\nSee launcher-error.log.",
                      _MB_OK | _MB_ICONERROR)
         return
-    _log_error(f"launcher: repaired {len(copied)} file(s) from {src} "
-               f"into {app_dir}: {', '.join(copied)}")
+    _log_error(f"launcher: copied {len(copied)} file(s) from {src} into {app_dir}: "
+               f"{', '.join(copied) or '(none)'}; failed: {', '.join(failed) or '(none)'}")
+    if failed:
+        # Don't relaunch on a half-restored app.
+        _message_box(
+            "Video Grabber",
+            f"Couldn't copy {len(failed)} file(s):\n\n{', '.join(failed)}\n\n"
+            "Close any other Video Grabber windows, then try again. "
+            "Details are in launcher-error.log.",
+            _MB_OK | _MB_ICONERROR)
+        return
 
     env = dict(os.environ)
     env[_RELAUNCH_ENV] = "1"
