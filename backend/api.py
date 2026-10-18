@@ -1027,6 +1027,46 @@ def ytdlp_rollback():
     import ytdlp_update
     return jsonify({"removed": ytdlp_update.rollback()})
 
+# ---- /changelog: latest GitHub release notes (cached 10 minutes) ----------
+# The GUI calls this once on the first start after an app update and prints
+# the notes to the Activity Log. Public read-only data, so no API token.
+CHANGELOG_REPO = "Zixnano/VidGrab"
+_CHANGELOG_CACHE = {"ts": 0.0, "data": None}
+_CHANGELOG_TTL = 600
+
+
+@app.route("/changelog", methods=["GET"])
+def changelog_route():
+    import json as _json
+    import time as _time
+    from urllib.request import Request, urlopen
+    now = _time.time()
+    cached = _CHANGELOG_CACHE["data"]
+    if cached and now - _CHANGELOG_CACHE["ts"] < _CHANGELOG_TTL:
+        return jsonify(cached)
+    req = Request(
+        f"https://api.github.com/repos/{CHANGELOG_REPO}/releases/latest",
+        headers={"Accept": "application/vnd.github+json",
+                 "User-Agent": f"VideoGrabber/{APP_VERSION}"})
+    try:
+        with urlopen(req, timeout=8) as r:
+            rel = _json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        if cached:  # stale notes beat none when GitHub is unreachable
+            return jsonify(cached)
+        return jsonify({"ok": False, "error": str(e)}), 502
+    data = {
+        "ok": True,
+        "tag": rel.get("tag_name") or "",
+        "name": rel.get("name") or "",
+        "body": rel.get("body") or "",
+        "url": rel.get("html_url") or "",
+        "published_at": rel.get("published_at") or "",
+    }
+    _CHANGELOG_CACHE.update(ts=now, data=data)
+    return jsonify(data)
+
+
 @app.route("/version", methods=["GET"])
 def version():
     return jsonify({"version": APP_VERSION})

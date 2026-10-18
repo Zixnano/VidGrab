@@ -44,14 +44,21 @@
   let lastQuality = {};       // host -> {res: "1920x1080"}
 
   try {
-    chrome.storage.local.get(["disabledSites", "lastQuality"]).then((st) => {
+    chrome.storage.local.get(["disabledSites", "lastQuality", "pillPrefs"]).then((st) => {
       siteDisabled = Array.isArray(st.disabledSites) && st.disabledSites.includes(SITE);
       lastQuality = st.lastQuality || {};
+      pillPrefs = st.pillPrefs || {};
+      migrateLegacyPillOffset();
+      syncAllPills();
       if (siteDisabled) removeAllPills(); else scan();
     }).catch(() => {});
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== "local") return;
       if (changes.lastQuality) lastQuality = changes.lastQuality.newValue || {};
+      if (changes.pillPrefs) {
+        pillPrefs = changes.pillPrefs.newValue || {};
+        syncAllPills();
+      }
       if (changes.disabledSites) {
         const list = changes.disabledSites.newValue;
         const now = Array.isArray(list) && list.includes(SITE);
@@ -69,6 +76,141 @@
       try { entry.overlay.cleanup(); } catch (e) {}
     }
     LIVE.length = 0;
+  }
+
+  // ---- v8: pill prefs (drag offset, snap corner, mini), per site ---------
+  // Stored in chrome.storage.local as { [site]: { dx, dy, corner, mini } }.
+  // corner: null (free position, uses dx/dy) or "tl" | "tr" | "bl" | "br".
+  let pillPrefs = {};
+  const PILL_DEFAULT = { dx: 8, dy: 8, corner: null, mini: false };
+  const POSITION_CHOICES = [["tl", "Top-Left"], ["tr", "Top-Right"],
+                            ["bl", "Bottom-Left"], ["br", "Bottom-Right"]];
+
+  function prefsFor(host) {
+    return { ...PILL_DEFAULT, ...(pillPrefs[host] || {}) };
+  }
+
+  function savePillPrefs(host, state) {
+    pillPrefs = { ...pillPrefs, [host]: { dx: state.dx, dy: state.dy,
+                                          corner: state.corner, mini: !!state.mini } };
+    try { chrome.storage.local.set({ pillPrefs }); } catch (e) { /* context gone */ }
+  }
+
+  // The earlier build kept the drag offset in localStorage; carry it over once.
+  function migrateLegacyPillOffset() {
+    if (pillPrefs[SITE]) return;
+    try {
+      const old = JSON.parse(localStorage.getItem(`vg_pill_offset_${location.hostname}`) || "null");
+      if (old && typeof old.dx === "number" && typeof old.dy === "number") {
+        savePillPrefs(SITE, { ...PILL_DEFAULT, dx: old.dx, dy: old.dy });
+      }
+    } catch (e) { /* no legacy value */ }
+  }
+
+  function syncAllPills() {
+    for (const entry of LIVE) {
+      try { entry.overlay.syncPrefs(); } catch (e) { /* pill already gone */ }
+    }
+  }
+
+  let pillStyleDone = false;
+  function ensurePillStyle() {
+    if (pillStyleDone) return;
+    pillStyleDone = true;
+    const s = document.createElement("style");
+    s.id = "vg-pill-style";
+    s.textContent = `
+      .vg-pill-mini { padding: 3px 4px !important; gap: 2px !important; border-radius: 999px !important; }
+      .vg-pill-mini .vg-pill-label { display: none !important; }
+      .vg-pill-mini .vg-pill-btn { padding: 2px 6px !important; }
+    `;
+    (document.head || document.documentElement).appendChild(s);
+  }
+
+  // ---- v8: one small context menu, shared by the pill and the micro-pill --
+  // rows: { label, onClick, checked?, indent? } | { header } | { sep: true }
+  let pillCtx = null;
+
+  function closePillCtx() {
+    if (pillCtx) { pillCtx.remove(); pillCtx = null; }
+    document.removeEventListener("mousedown", onCtxOutside, true);
+    document.removeEventListener("keydown", onCtxKey, true);
+    window.removeEventListener("scroll", closePillCtx, true);
+    window.removeEventListener("resize", closePillCtx);
+    if (microPill) scheduleMicroHide(null);   // the micro-pill may be waiting to hide
+  }
+
+  function onCtxOutside(e) {
+    if (pillCtx && !pillCtx.contains(e.target)) closePillCtx();
+  }
+
+  function onCtxKey(e) {
+    if (e.key === "Escape") closePillCtx();
+  }
+
+  function openPillCtx(x, y, rows) {
+    closePillCtx();
+    const m = document.createElement("div");
+    m.id = "vg-pill-ctx";
+    m.style.cssText = `
+      all: initial; display: block; position: fixed; z-index: 2147483647;
+      min-width: 200px; box-sizing: border-box; padding: 6px;
+      background: ${TH.bg_elevated}f8; color: ${TH.text};
+      border: 1px solid ${TH.border_hi}; border-radius: 10px;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+      font: 12px/1.4 -apple-system, Segoe UI, Roboto, sans-serif;
+    `;
+    for (const row of rows) {
+      if (row.sep) {
+        const d = document.createElement("div");
+        d.style.cssText = `height: 1px; margin: 4px 2px; background: ${TH.border_hi};`;
+        m.appendChild(d);
+        continue;
+      }
+      if (row.header) {
+        const h = document.createElement("div");
+        h.textContent = row.header;
+        h.style.cssText = `padding: 4px 10px 2px; color: ${TH.text_muted}; font-size: 11px;`;
+        m.appendChild(h);
+        continue;
+      }
+      const el = document.createElement("div");
+      el.textContent = row.checked ? "\u2713  " + row.label : row.label;
+      el.style.cssText = `
+        padding: 6px 10px ${row.indent ? "6px 22px" : ""}; border-radius: 6px;
+        cursor: pointer; white-space: nowrap;
+      `;
+      el.addEventListener("mouseenter", () => { el.style.background = TH.border_hi; });
+      el.addEventListener("mouseleave", () => { el.style.background = "transparent"; });
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        closePillCtx();
+        row.onClick();
+      });
+      m.appendChild(el);
+    }
+    document.documentElement.appendChild(m);
+    // Keep it on screen.
+    const w = m.offsetWidth, h = m.offsetHeight;
+    m.style.left = Math.max(4, Math.min(x, innerWidth - w - 4)) + "px";
+    m.style.top = Math.max(4, Math.min(y, innerHeight - h - 4)) + "px";
+    pillCtx = m;
+    // Listen after this event finishes so the opening click doesn't close it.
+    setTimeout(() => {
+      if (pillCtx === m) document.addEventListener("mousedown", onCtxOutside, true);
+    }, 0);
+    document.addEventListener("keydown", onCtxKey, true);
+    window.addEventListener("scroll", closePillCtx, true);
+    window.addEventListener("resize", closePillCtx);
+  }
+
+  function hideOnThisSiteNow() {
+    try {
+      chrome.storage.local.get("disabledSites").then((st) => {
+        const list = Array.isArray(st.disabledSites) ? st.disabledSites : [];
+        if (!list.includes(SITE)) chrome.storage.local.set({ disabledSites: [...list, SITE] });
+      }).catch(() => {});
+    } catch (e) { /* extension context gone */ }
   }
 
   function rememberQuality(f) {
@@ -224,28 +366,23 @@
   let _drag = null;
   window.addEventListener("mousemove", (e) => {
     if (!_drag) return;
-    const { wrap, video, offset, start } = _drag;
+    const { wrap, video, state, start } = _drag;
     const r = video.getBoundingClientRect();
     const nx = start.dx + (e.clientX - start.x);
     const ny = start.dy + (e.clientY - start.y);
     // Keep the pill inside the viewport.
-    offset.dx = Math.max(8 - r.left,
+    state.dx = Math.max(8 - r.left,
       Math.min(nx, innerWidth - r.left - wrap.offsetWidth - 8));
-    offset.dy = Math.max(8 - r.top,
+    state.dy = Math.max(8 - r.top,
       Math.min(ny, innerHeight - r.top - wrap.offsetHeight - 8));
     wrap.__vgPosition();
   });
   window.addEventListener("mouseup", () => {
     if (!_drag) return;
-    const { wrap, offset, isTopFrame } = _drag;
+    const { wrap, persist } = _drag;
     _drag = null;
     wrap.style.cursor = "grab";
-    if (isTopFrame) {
-      try {
-        localStorage.setItem(`vg_pill_offset_${location.hostname}`,
-                             JSON.stringify(offset));
-      } catch (e) {}
-    }
+    persist();   // saved to chrome.storage.local (top frame only)
   });
 
   function makeOverlay(video) {
@@ -263,6 +400,7 @@
     wrap.style.opacity = "0";
 
     const btn = document.createElement("button");
+    btn.className = "vg-pill-btn";
     btn.style.cssText = `
       display:flex; align-items:center; gap:6px; background:transparent;
       border:1px solid ${TH.border_hi}; color:${TH.text}; border-radius:6px;
@@ -272,6 +410,7 @@
     icon.style.cssText = `color:${TH.accent}; font-size:11px;`;
     icon.textContent = "▶";
     const label = document.createElement("span");
+    label.className = "vg-pill-label";
     btn.appendChild(icon);
     btn.appendChild(label);
 
@@ -306,29 +445,41 @@
     // 12.4: fade the pill in (open); display can't transition, opacity can.
     requestAnimationFrame(() => { wrap.style.opacity = "1"; });
 
-    // Per-site drag offset, persisted in localStorage (top frame only —
-    // an iframe's location.hostname is the parent's, so sub-frame pills
-    // would share and fight over the same key).
+    // Pill state for this site (drag offset, snap corner, mini). Read from the
+    // shared pillPrefs map; only the top frame writes it back, because an
+    // iframe's pill would otherwise fight the parent's over the same key.
     const isTopFrame = window === window.top;
-    let offset = { dx: 8, dy: 8 };
-    if (isTopFrame) {
-      try {
-        const saved = localStorage.getItem(`vg_pill_offset_${location.hostname}`);
-        if (saved) offset = JSON.parse(saved);
-      } catch (e) {}
+    const state = prefsFor(SITE);
+    function persist() {
+      if (isTopFrame) savePillPrefs(SITE, state);
+    }
+    function applyMini() {
+      wrap.classList.toggle("vg-pill-mini", !!state.mini);
     }
 
     function position() {
       const r = video.getBoundingClientRect();
-      wrap.style.top = Math.max(8, r.top + offset.dy) + "px";
-      wrap.style.left = Math.max(8, r.left + offset.dx) + "px";
-      wrap.style.display = isVisible(video)
+      const visible = isVisible(video)
         && r.bottom > 0 && r.top < innerHeight
-        && r.right > 0 && r.left < innerWidth
-        ? "flex" : "none";
+        && r.right > 0 && r.left < innerWidth;
+      wrap.style.display = visible ? "flex" : "none";
+      // Measured after the display change so right/bottom anchors use the real size.
+      let top, left;
+      if (state.corner) {
+        left = state.corner[1] === "l" ? r.left + 8 : r.right - wrap.offsetWidth - 8;
+        top = state.corner[0] === "t" ? r.top + 8 : r.bottom - wrap.offsetHeight - 8;
+      } else {
+        left = r.left + state.dx;
+        top = r.top + state.dy;
+      }
+      wrap.style.top = Math.max(8, top) + "px";
+      wrap.style.left = Math.max(8, left) + "px";
     }
+    ensurePillStyle();
+    applyMini();
     position();
     wrap.__vgPosition = position;
+
     const reposition = () => requestAnimationFrame(position);
     window.addEventListener("scroll", reposition, true);
     window.addEventListener("resize", reposition);
@@ -348,15 +499,22 @@
       if (idx >= 0) LIVE.splice(idx, 1);
       wrap.remove();
     }
-
     // ---- drag to reposition (module-level delegated handlers; see _drag) ----
     wrap.style.cursor = "grab";
     wrap.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;   // right-click opens the menu, not a drag
       // Ignore drags starting on a button, the close X, or the open menu.
       if (e.target.closest("button") || menu.contains(e.target)) return;
-      _drag = { wrap, video, offset,
-                start: { x: e.clientX, y: e.clientY, dx: offset.dx, dy: offset.dy },
-                isTopFrame };
+      if (state.corner) {
+        // Leaving a snapped corner: start the free drag where the pill actually is.
+        const vr = video.getBoundingClientRect();
+        const pr = wrap.getBoundingClientRect();
+        state.dx = pr.left - vr.left;
+        state.dy = pr.top - vr.top;
+        state.corner = null;
+      }
+      _drag = { wrap, video, state, persist,
+                start: { x: e.clientX, y: e.clientY, dx: state.dx, dy: state.dy } };
       wrap.style.cursor = "grabbing";
       e.preventDefault();
     });
@@ -364,14 +522,40 @@
     wrap.addEventListener("dblclick", (e) => {
       // Double-click the pill body (not a button) resets its position.
       if (e.target.closest("button") || menu.contains(e.target)) return;
-      offset = { dx: 8, dy: 8 };
-      if (isTopFrame) {
-        try { localStorage.removeItem(`vg_pill_offset_${location.hostname}`); } catch (e) {}
-      }
+      state.dx = PILL_DEFAULT.dx;
+      state.dy = PILL_DEFAULT.dy;
+      state.corner = null;
+      persist();
       position();
     });
 
-    return { wrap, btn, label, icon, menu, position, cleanup };
+    // ---- v8: right-click menu (mini-pill, corner, hide on this site) --------
+    wrap.addEventListener("contextmenu", (e) => {
+      if (menu.contains(e.target)) return;   // the download menu keeps its own behavior
+      e.preventDefault();
+      e.stopPropagation();
+      openPillCtx(e.clientX, e.clientY, [
+        { label: state.mini ? "Switch to Full Pill" : "Switch to Mini-Pill",
+          onClick: () => { state.mini = !state.mini; applyMini(); persist(); position(); } },
+        { sep: true },
+        { header: "Change Position" },
+        ...POSITION_CHOICES.map(([id, name]) => ({
+          label: name, indent: true, checked: state.corner === id,
+          onClick: () => { state.corner = id; persist(); position(); },
+        })),
+        { sep: true },
+        { label: "Hide on this site", onClick: () => hideOnThisSiteNow() },
+      ]);
+    });
+
+    // Re-read the saved prefs (another tab or a fresh load changed them).
+    function syncPrefs() {
+      Object.assign(state, prefsFor(SITE));
+      applyMini();
+      position();
+    }
+
+    return { wrap, btn, label, icon, menu, position, cleanup, syncPrefs };
   }
 
   // v5: tell the user when a send was a repeat of something already queued.
@@ -1291,6 +1475,7 @@
   // per frame instead of one per image, and images added later just work.
   const MICRO_MIN = 150;
   const MICRO_SIZE = 24;
+  const MICRO_W = 46;   // v8: download half (24px) + ▾ menu half
   const MICRO_IMG_EXT_RE = /\.(jpe?g|png|gif|webp|avif|bmp|svg|tiff?|heic|heif|jxl|ico)$/i;
   let microPill = null;
   let microToast = null;
@@ -1443,17 +1628,25 @@
 
   function ensureMicroPill() {
     if (microPill && microPill.isConnected) return microPill;
+    ensurePillStyle();
     const p = document.createElement("div");
     p.id = "vg-micro-pill";
     p.className = "vg-micro-pill";
-    p.title = "Download with Video Grabber";
+    p.title = "Video Grabber";
     p.style.cssText = `
       all: initial; position: absolute; z-index: 2147483647; display: none;
-      align-items: center; justify-content: center; box-sizing: border-box;
-      width: ${MICRO_SIZE}px; height: ${MICRO_SIZE}px; border-radius: 50%;
+      align-items: stretch; box-sizing: border-box; overflow: hidden;
+      width: ${MICRO_W}px; height: ${MICRO_SIZE}px; border-radius: ${MICRO_SIZE / 2}px;
       background: ${TH.bg_base}e6; color: ${TH.accent};
       border: 1px solid ${TH.accent}; box-shadow: 0 1px 6px rgba(0,0,0,0.5);
       cursor: pointer; user-select: none;
+    `;
+    // Left half: the one-click download (unchanged from v7).
+    const dl = document.createElement("span");
+    dl.title = "Download Image";
+    dl.style.cssText = `
+      all: initial; display: flex; align-items: center; justify-content: center;
+      width: ${MICRO_SIZE}px; height: ${MICRO_SIZE}px; box-sizing: border-box; cursor: pointer;
     `;
     const NS = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(NS, "svg");
@@ -1471,16 +1664,33 @@
       path.setAttribute("d", d);
       svg.appendChild(path);
     }
-    p.appendChild(svg);
+    dl.appendChild(svg);
+    // Right half: a tiny dropdown arrow that opens the image menu.
+    const arrow = document.createElement("span");
+    arrow.title = "More image options";
+    arrow.textContent = "\u25be";
+    arrow.style.cssText = `
+      all: initial; display: flex; align-items: center; justify-content: center;
+      flex: 1 1 auto; height: ${MICRO_SIZE}px; box-sizing: border-box; cursor: pointer;
+      font: 10px/1 -apple-system, Segoe UI, Roboto, sans-serif; color: ${TH.accent};
+      border-left: 1px solid ${TH.accent};
+    `;
+    p.appendChild(dl);
+    p.appendChild(arrow);
 
     // Keep the site's lightbox / drag handlers from seeing our clicks.
     for (const ev of ["mousedown", "mouseup", "pointerdown", "pointerup", "dblclick"]) {
       p.addEventListener(ev, (e) => e.stopPropagation());
     }
-    p.addEventListener("click", (e) => {
+    dl.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
-      sendMicro();
+      sendMicro(microTarget);
+    });
+    arrow.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      openMicroMenu(e.clientX, e.clientY, microTarget);
     });
     p.addEventListener("mouseenter", () => {
       clearTimeout(microHideTimer);
@@ -1490,6 +1700,7 @@
     p.addEventListener("mouseleave", (e) => {
       p.style.background = `${TH.bg_base}e6`;
       p.style.color = TH.accent;
+      if (pillCtx) return;   // the menu is open: keep the target until it closes
       scheduleMicroHide(e.relatedTarget);
     });
     document.documentElement.appendChild(p);
@@ -1513,7 +1724,7 @@
     const vw = document.documentElement.clientWidth || innerWidth;
     const right = Math.min(r.right, vw);
     const top = Math.max(r.top, 0);
-    microPill.style.left = (right + scrollX - MICRO_SIZE - 6) + "px";
+    microPill.style.left = (right + scrollX - MICRO_W - 6) + "px";
     microPill.style.top = (top + scrollY + 6) + "px";
     microPill.style.display = "flex";
   }
@@ -1540,19 +1751,22 @@
     microHideTimer = setTimeout(hideMicro, 150);
   }
 
-  function sendMicro() {
-    const el = microTarget;
+  function microFilenameFor(url) {
+    try {
+      const last = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
+      if (MICRO_IMG_EXT_RE.test(last)) return last;
+    } catch (e) {}
+    return undefined;
+  }
+
+  function sendMicro(el) {
     if (!el) return;
     const url = microUrlFor(el);   // re-read now: srcset may have changed since hover
     if (!url) { microToastShow("No image URL found", true); return; }
-    let filename;
-    try {
-      const last = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
-      if (MICRO_IMG_EXT_RE.test(last)) filename = last;
-    } catch (e) {}
     try {
       chrome.runtime.sendMessage(
-        { type: "RELAY_DOWNLOAD", url, pageUrl: location.href, filename, skipList: true },
+        { type: "RELAY_DOWNLOAD", url, pageUrl: location.href,
+          filename: microFilenameFor(url), skipList: true },
         (resp) => {
           if (chrome.runtime.lastError) {
             microToastShow(failLabel(null, chrome.runtime.lastError.message), true);
@@ -1566,6 +1780,89 @@
         });
     } catch (e) {
       microToastShow("Extension reloading, try again", true);
+    }
+  }
+
+  // Clipboard write from a content script. Falls back to execCommand, which
+  // still works on pages where navigator.clipboard is refused.
+  function copyToClipboard(text) {
+    const fallback = () => {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.cssText = "position: fixed; opacity: 0;";
+      document.documentElement.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) {}
+      ta.remove();
+      return ok;
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(() => true, () => fallback());
+    }
+    return Promise.resolve(fallback());
+  }
+
+  function openMicroMenu(x, y, el) {
+    if (!el) return;
+    openPillCtx(x, y, [
+      { label: "Download Image", onClick: () => sendMicro(el) },
+      { label: "Download ALL Images", onClick: () => downloadAllPageImages() },
+      { sep: true },
+      { label: "Copy Image URL", onClick: () => {
+          const url = microUrlFor(el);
+          if (!url) { microToastShow("No image URL found", true); return; }
+          copyToClipboard(url).then((ok) =>
+            microToastShow(ok ? "Image URL copied" : "Couldn't copy the URL", !ok));
+        } },
+    ]);
+  }
+
+  // "Download ALL Images": every <img> on the page that is a real picture
+  // (not an icon) with an http(s) URL, de-duplicated. Blob and data URLs are
+  // skipped because the desktop app can't fetch them.
+  function collectPageImageUrls() {
+    const seen = new Set();
+    const urls = [];
+    for (const img of document.querySelectorAll("img")) {
+      const w = img.naturalWidth || img.width || 0;
+      const h = img.naturalHeight || img.height || 0;
+      if (Math.max(w, h) < 100) continue;
+      const url = microImageUrl(img);
+      if (!url || !/^https?:/i.test(url) || seen.has(url)) continue;
+      seen.add(url);
+      urls.push(url);
+    }
+    return urls;
+  }
+
+  function downloadAllPageImages() {
+    const urls = collectPageImageUrls().slice(0, 200);
+    if (!urls.length) { microToastShow("No images found on this page", true); return; }
+    let sent = 0, dupes = 0, failed = 0, pending = urls.length;
+    const finish = () => {
+      if (--pending > 0) return;
+      const parts = [`Queued ${sent} image(s)`];
+      if (dupes) parts.push(`${dupes} already listed`);
+      if (failed) parts.push(`${failed} failed`);
+      microToastShow(parts.join(", "), failed > 0 && sent === 0);
+    };
+    microToastShow(`Sending ${urls.length} image(s)\u2026`);
+    for (const url of urls) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "RELAY_DOWNLOAD", url, pageUrl: location.href,
+            filename: microFilenameFor(url), skipList: true },
+          (resp) => {
+            if (chrome.runtime.lastError || !(resp && resp.ok)) failed++;
+            else if (resp.duplicate_of) dupes++;
+            else sent++;
+            finish();
+          });
+      } catch (e) {
+        failed++;
+        finish();
+      }
     }
   }
 

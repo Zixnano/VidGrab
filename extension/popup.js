@@ -717,15 +717,13 @@ function renderGrabChecklist() {
 function updateGrabToolbar() {
   hideGrabConfirm();
   const countEl = document.getElementById("grabCount");
-  const toggleBtn = document.getElementById("grabToggleAll");
   const sendBtn = document.getElementById("grabSendBtn");
   const checkedCount = grabItems.filter((i) => i.checked).length;
   countEl.textContent = `${checkedCount} of ${grabItems.length} selected`;
-  toggleBtn.textContent = checkedCount === grabItems.length ? "Select none" : "Select all";
   sendBtn.disabled = checkedCount === 0;
   sendBtn.textContent = checkedCount
-    ? `Send ${checkedCount} selected to Grabber`
-    : "Send selected to Grabber";
+    ? `Download Selected (${checkedCount})`
+    : "Download Selected";
 }
 
 async function grabAll(tab) {
@@ -831,9 +829,12 @@ async function grabAll(tab) {
   if (tab) {
     document.getElementById("grabAllBtn").addEventListener("click", () => grabAll(tab));
   }
-  document.getElementById("grabToggleAll").addEventListener("click", () => {
-    const allChecked = grabItems.every((i) => i.checked);
-    grabItems = grabItems.map((i) => ({ ...i, checked: !allChecked }));
+  document.getElementById("grabCheckAll").addEventListener("click", () => {
+    grabItems = grabItems.map((i) => ({ ...i, checked: true }));
+    renderGrabChecklist();
+  });
+  document.getElementById("grabUncheckAll").addEventListener("click", () => {
+    grabItems = grabItems.map((i) => ({ ...i, checked: false }));
     renderGrabChecklist();
   });
   const sendGrabSelected = () => {

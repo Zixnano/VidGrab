@@ -311,6 +311,119 @@ def _cleanup_update_leftovers(root: Path) -> None:
     threading.Thread(target=_later, daemon=True).start()
 
 
+# ---------------------------------------------------------------------------
+# Self-healing: after a crash in server.py, offer to copy the source .py files
+# back into app\ and relaunch once. Frozen (installed) builds only.
+#
+# Source folder lookup, first hit wins:
+#   1. VG_SOURCE_DIR environment variable
+#   2. source-path.txt beside VideoGrabber.exe (first line = the folder path)
+# ---------------------------------------------------------------------------
+_RELAUNCH_ENV = "VG_RELAUNCHED"
+_SOURCE_HINT_FILE = "source-path.txt"
+_MB_OK, _MB_YESNO, _MB_ICONERROR = 0x0, 0x4, 0x10
+_IDYES = 6
+
+
+def _message_box(title: str, text: str, flags: int) -> int:
+    """Native Windows MessageBox. Returns the button id (IDYES = 6), or 0
+    when no box could be shown (not Windows, or ctypes failed)."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.MessageBoxW(None, text, title, flags))
+    except Exception:
+        return 0
+
+
+def _source_dir(root: Path):
+    candidates = []
+    env = os.environ.get("VG_SOURCE_DIR", "").strip()
+    if env:
+        candidates.append(Path(env.strip('"')))
+    hint = root / _SOURCE_HINT_FILE
+    try:
+        if hint.is_file():
+            lines = hint.read_text(encoding="utf-8").strip().splitlines()
+            if lines:
+                candidates.append(Path(lines[0].strip().strip('"')))
+    except OSError:
+        pass
+    for c in candidates:
+        try:
+            if c.is_dir() and any(c.glob("*.py")):
+                return c.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def _repair_app_files(src: Path, dst: Path) -> list:
+    """Copy every top-level .py from src into dst (the install app\\ folder)."""
+    dst.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for f in sorted(src.glob("*.py")):
+        shutil.copy2(f, dst / f.name)
+        copied.append(f.name)
+    return copied
+
+
+def _offer_repair_and_relaunch(root: Path, app_dir: Path, tb_text: str) -> None:
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return  # source runs already print the traceback to the console
+    if os.environ.get(_RELAUNCH_ENV) == "1":
+        # Already relaunched once and it crashed again: stop here, don't loop.
+        _message_box(
+            "Video Grabber",
+            "Video Grabber still crashes after the repair.\n\n"
+            "See launcher-error.log beside the app for details.",
+            _MB_OK | _MB_ICONERROR)
+        return
+    lines = [ln.strip() for ln in tb_text.strip().splitlines() if ln.strip()]
+    last = lines[-1][:300] if lines else "unknown error"
+    answer = _message_box(
+        "Video Grabber crashed",
+        "Video Grabber hit an error while starting:\n\n"
+        f"{last}\n\n"
+        "Copy the app files from the source folder and restart now?\n"
+        "(Details are in launcher-error.log.)",
+        _MB_YESNO | _MB_ICONERROR)
+    if answer != _IDYES:
+        return
+
+    src = _source_dir(root)
+    if src is None:
+        _message_box(
+            "Video Grabber",
+            "No source folder is set, so nothing could be repaired.\n\n"
+            "Write the source folder path on the first line of "
+            "source-path.txt beside VideoGrabber.exe, then restart.",
+            _MB_OK | _MB_ICONERROR)
+        return
+    try:
+        copied = _repair_app_files(src, app_dir)
+    except OSError as e:
+        _log_error(f"launcher: repair failed copying {src} -> {app_dir}: {e}")
+        _message_box("Video Grabber",
+                     f"The repair failed:\n\n{e}\n\nSee launcher-error.log.",
+                     _MB_OK | _MB_ICONERROR)
+        return
+    _log_error(f"launcher: repaired {len(copied)} file(s) from {src} "
+               f"into {app_dir}: {', '.join(copied)}")
+
+    env = dict(os.environ)
+    env[_RELAUNCH_ENV] = "1"
+    try:
+        subprocess.Popen([sys.executable, *sys.argv[1:]],
+                         cwd=str(root), env=env, close_fds=True)
+    except OSError as e:
+        _log_error(f"launcher: relaunch failed: {e}")
+        _message_box("Video Grabber",
+                     f"Repaired, but the app could not restart:\n\n{e}",
+                     _MB_OK | _MB_ICONERROR)
+
+
 def main() -> int:
     root = _root()
     app_dir = root / "app"
@@ -357,10 +470,14 @@ def main() -> int:
         runpy.run_path(str(server_py), run_name="__main__")
     except Exception:
         import traceback
+        tb = traceback.format_exc()
         _log_error(
-            "launcher: unhandled exception while running server.py:\n"
-            + traceback.format_exc()
+            "launcher: unhandled exception while running server.py:\n" + tb
         )
+        # Stop the PO-token provider first, so a relaunched copy doesn't
+        # reuse a provider this process is about to kill on exit.
+        _stop_pot_provider()
+        _offer_repair_and_relaunch(root, app_dir, tb)
         return 1
     finally:
         # Normal exit, error, or server.py's sys.exit(): stop the provider

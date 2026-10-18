@@ -6,6 +6,7 @@ from settings.json. Imported and launched by server.py's main().
 """
 
 import base64
+from collections import deque
 import html as _html
 import json
 import math
@@ -536,6 +537,9 @@ class ApiClient:
     def version(self):
         data = self._req("GET", "/version") or {}
         return data.get("version", "")
+
+    def changelog(self):
+        return self._req("GET", "/changelog", timeout=12) or {}
 
     def disk_space(self):
         return self._req("GET", "/diskspace") or {}
@@ -2599,6 +2603,46 @@ class _ApiFetchWorker(QThread):
             self.failed.emit()
 
 
+class UpdateDialog(QDialog):
+    """Prominent new-version prompt. self.choice ends up as "now",
+    "later" (4 h snooze) or "skip" (this version only). The caller saves
+    the snooze or skip; closing the window counts as "later"."""
+
+    def __init__(self, parent, tag, current):
+        super().__init__(parent)
+        self.choice = "later"
+        self.setWindowTitle("Video Grabber update")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        title = QLabel(f"Video Grabber {tag} is available")
+        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        body = QLabel(
+            f"You're on v{current}. Update now for the latest fixes and features. "
+            "The app restarts briefly while the files are swapped.")
+        body.setWordWrap(True)
+        lay.addWidget(title)
+        lay.addWidget(body)
+        row = QHBoxLayout()
+        skip = QPushButton("Skip This Version")
+        later = QPushButton("Remind Me Later")
+        now = QPushButton("Update Now")
+        now.setDefault(True)
+        for btn, choice in ((skip, "skip"), (later, "later"), (now, "now")):
+            btn.setMinimumHeight(30)
+            btn.clicked.connect(lambda _=False, c=choice: self._pick(c))
+        row.addWidget(skip)
+        row.addStretch(1)
+        row.addWidget(later)
+        row.addWidget(now)
+        lay.addLayout(row)
+
+    def _pick(self, choice):
+        self.choice = choice
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     # Carries the pill payload from /show-add-dialog to the GUI thread.
     _show_dialog_signal = Signal(object)
@@ -2630,6 +2674,15 @@ class MainWindow(QMainWindow):
         self._batch = {"seeded": False, "busy": False, "done": 0, "failed": 0,
                        "known_done": set(), "known_err": set()}
         self._update_notified = ""
+        # Update prompt + changelog state (see _maybe_show_update_dialog).
+        self._update_dialog_open = False
+        self._snooze_gen = 0
+        self._changelog_worker = None
+        # Activity Log feed: changelog lines drain here, one per tick.
+        self._activity_feed = deque()
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setInterval(2200)
+        self._activity_timer.timeout.connect(self._activity_tick)
         # Settings snapshot fetched on the worker thread each refresh —
         # the GUI thread never reads settings.json on the hot path (11.2).
         self._gui_settings = {}
@@ -2668,6 +2721,7 @@ class MainWindow(QMainWindow):
         self.log_timer = QTimer(self)
         self.log_timer.timeout.connect(self.refresh_logs)
         self.log_timer.start(1500)
+        QTimer.singleShot(2000, self._check_version_changelog)
         self.diskspace_timer = QTimer(self)
         self.diskspace_timer.timeout.connect(self.refresh_diskspace)
         self.queue_timer = QTimer(self)
@@ -3322,15 +3376,111 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_update_available(self, tag):
+        # The status-bar badge is no longer the prompt; the dialog is.
         self._update_tag = tag
         self.update_btn.setText(f"\u2b06 Update {tag} available")
-        self.update_btn.setVisible(True)
+        self.update_btn.setVisible(False)
         if self._tray and self._update_notified != tag:
             self._update_notified = tag
             self._tray.showMessage(
                 "Video Grabber update",
-                f"{tag} is available. Click the badge in the status bar to install.",
+                f"{tag} is available. Open Video Grabber to install.",
                 QSystemTrayIcon.Information, 5000)
+        self._maybe_show_update_dialog(tag)
+
+    # ---- update prompt (dialog) -------------------------------------------
+    def _maybe_show_update_dialog(self, tag, force=False):
+        """Show the update prompt for tag, unless that version was skipped or
+        a Remind-Me-Later snooze is still running. force=True ignores both."""
+        if not tag:
+            return
+        st = _read_gui_state()
+        if not force:
+            if st.get("skipped_update_tag") == tag:
+                return
+            wait = float(st.get("update_snooze_until") or 0) - time.time()
+            if wait > 0:
+                self._schedule_update_prompt(tag, wait)
+                return
+        if self._update_dialog_open:
+            return
+        self._update_dialog_open = True
+        try:
+            dlg = UpdateDialog(self, tag, DISPLAY_VERSION)
+            dlg.exec()
+            choice = dlg.choice
+        finally:
+            self._update_dialog_open = False
+        if choice == "now":
+            self.check_for_updates()
+        elif choice == "skip":
+            # Saved in gui_state.json (the /settings route only takes keys
+            # it already knows, and the GUI state file is always writable).
+            _write_gui_state({"skipped_update_tag": tag})
+            try:
+                import updater
+                updater.skip_version(tag)
+            except Exception:
+                pass
+        else:  # "later": 4-hour snooze, saved so it survives a restart
+            _write_gui_state({"update_snooze_until": time.time() + 4 * 3600})
+            self._schedule_update_prompt(tag, 4 * 3600)
+
+    def _schedule_update_prompt(self, tag, seconds):
+        self._snooze_gen += 1
+        gen = self._snooze_gen
+
+        def _fire():
+            if gen == self._snooze_gen:  # a newer schedule replaces this one
+                self._maybe_show_update_dialog(tag)
+        QTimer.singleShot(int(seconds * 1000) + 1000, _fire)
+
+    # ---- changelog after an update -----------------------------------------
+    def _check_version_changelog(self):
+        """First start after an app update (the version differs from the one
+        this GUI saw last): fetch the release notes for the Activity Log.
+        A first run only records the version."""
+        last = _read_gui_state().get("last_seen_version", "")
+        if last == DISPLAY_VERSION:
+            return
+        if not last:
+            _write_gui_state({"last_seen_version": DISPLAY_VERSION})
+            return
+        self._changelog_worker = _ApiFetchWorker(self.api.changelog, self)
+        self._changelog_worker.result.connect(self._on_changelog, Qt.QueuedConnection)
+        self._changelog_worker.failed.connect(
+            lambda: self._on_changelog({"ok": False, "error": "backend unreachable"}),
+            Qt.QueuedConnection)
+        self._changelog_worker.start()
+
+    def _on_changelog(self, payload):
+        payload = payload or {}
+        if payload.get("ok"):
+            # Marked seen only once the notes arrive, so an offline start
+            # simply tries again on the next launch.
+            _write_gui_state({"last_seen_version": DISPLAY_VERSION})
+            lines = [f"What's new in v{DISPLAY_VERSION}:"]
+            for raw in str(payload.get("body") or "").splitlines():
+                t = raw.strip()
+                if not t:
+                    continue
+                t = re.sub(r"^#+\s*", "", t)
+                t = re.sub(r"^[-*+]\s+", "\u2022 ", t)
+                lines.append(t)
+            if len(lines) == 1:
+                lines.append("(this release has no notes)")
+        else:
+            lines = [f"Updated to v{DISPLAY_VERSION}. Couldn't load the release notes "
+                     f"({payload.get('error') or 'unknown error'})."]
+        self._activity_feed.extend(lines[:25])
+        self._activity_tick()
+        self._activity_timer.start()
+
+    def _activity_tick(self):
+        if not self._activity_feed:
+            self._activity_timer.stop()
+            return
+        self.log.setText(self._activity_feed.popleft())
 
     def _on_update_badge(self):
         m = QMenu(self)
@@ -3505,7 +3655,7 @@ class MainWindow(QMainWindow):
 
     def _on_logs_refreshed(self, lines):
         try:
-            if lines:
+            if lines and not self._activity_timer.isActive():
                 self.log.setText(lines[-1])
             self._log_lines = [str(x) for x in (lines or [])]
             if self.detail_pane.isVisible() and self.detail_pane.job_id is not None:
