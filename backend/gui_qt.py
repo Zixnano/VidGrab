@@ -2611,6 +2611,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, api=None):
         super().__init__()
+        self.setAcceptDrops(True)     # drop a local video to open the Media Toolkit
         self.api = api or ApiClient()
         self.model = DownloadModel(self)
         self.current_filter = "All"
@@ -3146,9 +3147,65 @@ class MainWindow(QMainWindow):
         try:
             if obj is self.table.viewport() and event.type() == event.Type.Resize:
                 self._place_empty_label()
+            # The table accepts drops for its own row reordering, which would
+            # swallow file/URL drops before the window sees them; route those here.
+            elif obj is self.table.viewport() and event.type() in (
+                    event.Type.DragEnter, event.Type.DragMove, event.Type.Drop):
+                md = event.mimeData()
+                if md.hasUrls():
+                    if event.type() == event.Type.Drop:
+                        self.dropEvent(event)
+                    else:
+                        event.acceptProposedAction()
+                    return True
         except Exception:
             pass
         return super().eventFilter(obj, event)
+
+    # ---- drag and drop: local media -> Media Toolkit, links -> download queue
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md.hasUrls() or md.hasText():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        from gui_toolkit import is_media_file
+        md = event.mimeData()
+        files, links = [], []
+        for u in md.urls():
+            if u.isLocalFile():
+                files.append(u.toLocalFile())
+            elif u.scheme() in ("http", "https"):
+                links.append(u.toString())
+        if not md.hasUrls() and md.hasText():
+            links += [t for t in md.text().split() if t.lower().startswith(("http://", "https://"))]
+        event.acceptProposedAction()
+        if links:
+            queued = 0
+            for link in links:
+                try:
+                    self.api.add(link)
+                    queued += 1
+                except Exception as e:
+                    QMessageBox.critical(self, "Add failed", str(e))
+            if queued:
+                self.statusBar().showMessage(
+                    f"Queued {queued} link{'s' if queued != 1 else ''} from drop", 5000)
+                self.refresh()
+        media = [f for f in files if is_media_file(f)]
+        if media:
+            if len(media) > 1:
+                self.statusBar().showMessage(
+                    f"Opened the first of {len(media)} dropped files in the Media Toolkit", 5000)
+            # Deferred: opening a modal dialog inside dropEvent would block the
+            # drag source (Explorer) until the dialog closes.
+            QTimer.singleShot(0, lambda p=media[0]: self.open_toolkit(path=p))
+        elif files and not links:
+            self.statusBar().showMessage(
+                f"Not a media file: {Path(files[0]).name}", 5000)
 
     def _apply_toolbar_text(self):
         extra = 262 if getattr(self, "shell", None) else 0   # the shell eats width
@@ -4112,17 +4169,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Delete job & file", str(e))
         self.refresh()
 
-    def open_toolkit(self, job_id=None):
-        """Media Toolkit (Compress / Trim / Make GIF) for a finished job, or
-        for any file picked with Browse."""
+    def open_toolkit(self, job_id=None, path=None):
+        """Media Toolkit (visual Trim / Compress / GIF editor). Opens on an
+        explicit file path (drag and drop), a finished job, or the selected
+        finished job; with none of those it opens empty (Open file / drop)."""
         from gui_toolkit import ToolkitDialog
-        job = None
-        if job_id is not None:
-            job = next((x for x in self.model.items if x["id"] == job_id), None)
-        else:
-            done = [x for x in self._selected_rows() if x.get("status") == "done"]
-            job = done[0] if done else None
-        ToolkitDialog(self.api, job, self).exec()
+        if path is None:
+            job = None
+            if job_id is not None:
+                job = next((x for x in self.model.items if x["id"] == job_id), None)
+            else:
+                done = [x for x in self._selected_rows() if x.get("status") == "done"]
+                job = done[0] if done else None
+            if job is not None:
+                try:
+                    p = _path_for(job)
+                    path = str(p) if p and Path(p).is_file() else None
+                except Exception:
+                    path = None
+        ToolkitDialog(str(path) if path else None, self).exec()
 
     def toggle_shell(self):
         """Flip the handheld shell on/off from anywhere (Ctrl+Shift+S): off
