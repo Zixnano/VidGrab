@@ -303,13 +303,27 @@ async function cookieHeaderForItem(url, pageUrl) {
   return "";
 }
 
+// Last /health outcome. A success younger than HEALTH_CACHE_MS lets the
+// blob-hook state query (VG_STATE) answer without touching /health, so a busy
+// backend can't flip the hook to "not armed" in the middle of a click.
+const HEALTH_CACHE_MS = 30000;
+let lastHealthCheck = 0;   // timestamp of the last successful /health, 0 = none / last one failed
+
 async function checkBackend() {
   try {
     const res = await fetch(`${BACKEND_BASE}/health`, { method: "GET" });
+    lastHealthCheck = res.ok ? Date.now() : 0;
     return res.ok;
   } catch (e) {
+    lastHealthCheck = 0;
     return false;
   }
+}
+
+// Same as checkBackend, but trusts a successful check made < 30 s ago.
+async function checkBackendCached() {
+  if (lastHealthCheck && Date.now() - lastHealthCheck < HEALTH_CACHE_MS) return true;
+  return checkBackend();
 }
 
 async function getApiToken() {
@@ -855,7 +869,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // a cold service-worker wake from reporting false before the read lands.
     (async () => {
       try {
-        const [alive, token] = await Promise.all([checkBackend(), getApiToken(), interceptReady]);
+        const [alive, token] = await Promise.all([checkBackendCached(), getApiToken(), interceptReady]);
         sendResponse({ alive: !!alive, paired: !!token, intercept: !!interceptDownloads });
       } catch (e) {
         sendResponse({ alive: false, paired: false, intercept: false });

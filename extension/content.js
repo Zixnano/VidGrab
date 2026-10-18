@@ -1905,8 +1905,10 @@
     const SECRET = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 
     let hookEnabled = true;    // blobHookEnabled option, default on
-    let lastSync = 0;
-    let syncing = false;
+    let lastSync = 0;          // when the cached armed result was stored
+    let syncSeq = 0;           // lets a newer sync win over a slower older one
+    let lastArmed = null;      // cached armed result (null = nothing yet)
+    const ARMED_CACHE_MS = 5000;
 
     const dbg = (...a) => { if (BLOB_DEBUG) console.debug("[VG] blob bridge:", ...a); };
 
@@ -1924,18 +1926,26 @@
       });
     }
 
+    // Non-forced calls (pointerdown / keydown) reuse the cached result for 5 s
+    // so rapid clicks don't spam background.js. syncArmed(true) always runs.
     async function syncArmed(force) {
       const now = Date.now();
-      if (syncing || (!force && now - lastSync < 2000)) return;
-      syncing = true;
-      lastSync = now;
-      try {
-        const st = await queryState();
-        const armed = !!(hookEnabled && st && st.alive && st.paired && st.intercept);
-        post({ type: "vg-armed", armed, debug: BLOB_DEBUG });
-      } finally {
-        syncing = false;
+      if (!force && lastArmed !== null && now - lastSync < ARMED_CACHE_MS) return;
+      const seq = ++syncSeq;
+      const st = await queryState();
+      if (seq !== syncSeq) return;   // a newer sync started meanwhile; its result wins
+      let armed;
+      if (st === null && lastArmed !== null) {
+        // The message to background.js failed (worker waking, busy): keep the
+        // last known state instead of disarming. If the app really is gone,
+        // uploadBlob re-checks and the click is replayed natively.
+        armed = lastArmed && hookEnabled;
+      } else {
+        armed = !!(hookEnabled && st && st.alive && st.paired && st.intercept);
       }
+      lastArmed = armed;
+      lastSync = Date.now();
+      post({ type: "vg-armed", armed, debug: BLOB_DEBUG });
     }
 
     function cleanName(name) {
@@ -1949,21 +1959,38 @@
         dbg("not ready", st);
         return false;
       }
-      const nresp = await new Promise((resolve) => {
-        try {
-          chrome.runtime.sendMessage({ type: "GET_UPLOAD_NONCE" }, (r) => {
-            resolve(chrome.runtime.lastError ? null : r);
-          });
-        } catch (e) { resolve(null); }
-      });
-      if (!nresp || !nresp.ok || !nresp.nonce) { dbg("no nonce", nresp); return false; }
-      const form = new FormData();
-      form.append("file", blob, cleanName(filename));
-      const res = await fetch("http://127.0.0.1:5757/upload", {
-        method: "POST",
-        headers: { "X-Upload-Nonce": nresp.nonce },
-        body: form,
-      });
+      // One attempt = fresh one-time nonce + POST. A network failure throws
+      // out of fetch(); it is retried once below.
+      const attempt = async () => {
+        const nresp = await new Promise((resolve) => {
+          try {
+            chrome.runtime.sendMessage({ type: "GET_UPLOAD_NONCE" }, (r) => {
+              resolve(chrome.runtime.lastError ? null : r);
+            });
+          } catch (e) { resolve(null); }
+        });
+        if (!nresp || !nresp.ok || !nresp.nonce) { dbg("no nonce", nresp); return { fail: true }; }
+        const form = new FormData();
+        form.append("file", blob, cleanName(filename));
+        const r = await fetch("http://127.0.0.1:5757/upload", {
+          method: "POST",
+          headers: { "X-Upload-Nonce": nresp.nonce },
+          body: form,
+        });
+        return { res: r };
+      };
+      let out;
+      try {
+        out = await attempt();
+      } catch (e) {
+        // NetworkError: wait 500 ms and retry once before giving up (the
+        // caller then posts vg-blob-replay).
+        dbg("upload network error, retrying", e);
+        await new Promise((r) => setTimeout(r, 500));
+        out = await attempt();   // a second throw propagates to the caller
+      }
+      if (out.fail) return false;
+      const res = out.res;
       if (!res.ok) { dbg("upload status", res.status); return null; }
       // E7: the app says which category folder it filed the upload under.
       let category = "";

@@ -560,7 +560,16 @@ def _toolkit_source(data):
 
 
 def _toolkit_out(src, tag, ext):
-    out_dir = Path(STATE.get("output_dir") or src.parent)
+    # Toolkit exports (trim / compress / gif) go to <VideoGrabber root>/Edited,
+    # i.e. Downloads/VideoGrabber/Edited, not next to the source file. The root
+    # is settings.HOME, the same folder _allowed_roots() trusts, so the outputs
+    # stay valid toolkit sources and deletable from the app.
+    try:
+        from settings import HOME
+        root = Path(HOME)
+    except Exception:
+        root = Path.home() / "Downloads" / "VideoGrabber"
+    out_dir = root / "Edited"
     out_dir.mkdir(parents=True, exist_ok=True)
     return _unique_path(out_dir / safe_filename(f"{src.stem} ({tag}).{ext.lstrip('.')}"))
 
