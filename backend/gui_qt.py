@@ -768,22 +768,33 @@ class DownloadModel(QAbstractTableModel):
         return self.mimeDataForJobs([self.items[r].get("id") for r in rows])
 
     def mimeDataForJobs(self, ids):
-        """Drag payload for these job ids. Looked up by id at call time: the
-        table refreshes every second, so a remembered row number can point at
-        a different job by the time a drag actually starts."""
         by_id = {j.get("id"): j for j in self.items}
         urls = []
         for jid in ids:
             j = by_id.get(jid)
             if not j or j.get("status") != "done":
                 continue
-            path = _path_for(j)
-            if path.exists():
-                urls.append(QUrl.fromLocalFile(str(path)))
+            try:
+                path = _path_for(j)
+                if path.exists():
+                    # Absolute path is required for reliable CF_HDROP / text/uri-list
+                    # conversion on Windows.
+                    urls.append(QUrl.fromLocalFile(str(path.resolve())))
+            except Exception:
+                continue
         if not urls:
-            return QMimeData()  # empty drag payload, never None
+            return QMimeData()  # empty payload, never None
+
         mime = QMimeData()
         mime.setUrls(urls)
+
+        # Explicit text/uri-list (CRLF + trailing empty line) — some Electron apps
+        # (Discord, Slack, etc.) are picky about the exact format Qt emits.
+        uri_list = "\r\n".join(u.toString() for u in urls) + "\r\n"
+        mime.setData("text/uri-list", uri_list.encode("utf-8"))
+
+        # Plain-text fallback that Explorer / many apps also accept
+        mime.setText("\n".join(u.toLocalFile() for u in urls))
         return mime
 
 
@@ -916,13 +927,16 @@ class DownloadTable(QTableView):
         mime = model.mimeDataForJobs(ids)
         if not mime.hasUrls():
             return
-        # Windows drop fix: Explorer/Discord want plain text alongside the URLs.
-        mime.setText("\n".join(u.toLocalFile() for u in mime.urls()))
+
         drag = QDrag(self)
         drag.setMimeData(mime)
-        drag.exec(Qt.CopyAction)
+
+        # Offer both actions; prefer Copy. Explorer almost always copies when the
+        # source is another process, but some targets negotiate Move first.
+        drag.exec(Qt.CopyAction | Qt.MoveAction, Qt.CopyAction)
+
         try:
-            self.setState(QAbstractItemView.NoState)   # the drag swallowed the mouse release
+            self.setState(QAbstractItemView.NoState)  # drag swallowed the mouse release
         except Exception:
             pass
         self._band_end()
