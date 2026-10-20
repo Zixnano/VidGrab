@@ -17,6 +17,30 @@
   .hdr img { width: 32px; height: 32px; border-radius: 8px; }
   .hdr b { display: block; font-size: 15px; }
   .hdr small { color: var(--mu); letter-spacing: .06em; font-size: 11px; }
+  .hdr .cog { margin-left: auto; width: 32px; height: 32px; padding: 0; font-size: 17px; line-height: 1; }
+
+  /* v4.3: settings panel (cog). Sections: Pill / Sniffer / Notifications. */
+  #settingsView { display: none; padding-bottom: 8px; }
+  .sethdr { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .sethdr b { font-size: 14px; }
+  .sethdr button { padding: 4px 10px; font-size: 12px; }
+  .setsec { border: 1px solid var(--bd); background: var(--panel); border-radius: var(--r);
+            padding: 8px 12px 10px; margin-bottom: 10px; }
+  .setsec h2 { font-size: 11px; font-weight: 600; color: var(--ac); letter-spacing: .08em;
+               text-transform: uppercase; margin: 2px 0 8px; }
+  .setrow { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 8px; }
+  .setrow > label { flex: 1; }
+  .setrow.chk { justify-content: flex-start; }
+  .setrow.chk input { accent-color: var(--ac); margin: 0; }
+  .setrow.chk label { flex: 0 1 auto; cursor: pointer; }
+  .setrow select { font: inherit; color: var(--tx); background: var(--bg); border: 1px solid var(--bd);
+                   border-radius: var(--r); padding: 4px 8px; max-width: 170px; }
+  .sethint { font-size: 11px; color: var(--mu); margin: -4px 0 8px; }
+  #setSites .site { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+                    font-size: 12px; padding: 3px 0; }
+  #setSites .site button { padding: 1px 8px; font-size: 12px; }
+  #setSites .none { font-size: 11px; color: var(--dim); }
+  .setbtn { width: 100%; padding: 7px; font-size: 12px; margin-top: 2px; }
   #status { font-size: 12px; margin-bottom: 10px; padding: 8px 12px; border-radius: var(--r); }
   .ok { background: color-mix(in srgb, var(--ok) 14%, var(--panel)); color: var(--ok); }
   .ok:before { content: "\25CF  "; font-size: 10px; }
@@ -57,6 +81,18 @@
   .toolbar button { flex: 1 1 auto; font-size: 11px; padding: 6px 8px; }
   .toolbar button:disabled { opacity: .4; cursor: default; }
   #btnDownload { background: var(--ac); color: var(--on-ac); border-color: var(--ac); font-weight: 600; }
+  .toolbar #grabAllBtn { width: auto; padding: 6px 8px; margin: 0; }
+  .toolbar .more { position: relative; flex: 0 0 auto; }
+  #btnMore { font-size: 16px; line-height: 1; padding: 4px 12px; min-width: 40px; }
+  /* Opens upward: the bar sits near the bottom of the popup. */
+  #moreMenu { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 20; min-width: 170px;
+              display: flex; flex-direction: column; gap: 2px; padding: 4px; background: var(--elev);
+              border: 1px solid var(--bd-hi); border-radius: var(--r); box-shadow: 0 6px 18px rgba(0,0,0,.45); }
+  #moreMenu[hidden] { display: none; }
+  #moreMenu button { width: 100%; text-align: left; border: 0; background: transparent; padding: 7px 10px;
+                     font-size: 12px; border-radius: 6px; }
+  #moreMenu button:hover:not(:disabled), #moreMenu button:focus-visible { background: var(--hover); }
+  #moreMenu button:disabled { opacity: .4; cursor: default; }
   #btnDownload:hover:not(:disabled) { background: var(--ac-dim); border-color: var(--ac-dim); }
 
   #filterPanel { border: 1px solid var(--bd); background: var(--panel); border-radius: var(--r);
@@ -124,7 +160,8 @@
 </style>
 </head>
 <body>
-  <div class="hdr"><img src="icons/icon48.png" alt=""><div><b>Video Grabber</b><small>BROWSER EXTENSION</small></div></div>
+  <div class="hdr"><img src="icons/icon48.png" alt=""><div><b>Video Grabber</b><small>BROWSER EXTENSION</small></div><button id="btnCog" class="cog" title="Settings" aria-label="Settings">&#9881;</button></div>
+  <div id="mainView">
   <div id="status">Checking desktop app…</div>
   <div id="recent" style="display:none;"><h2>Recent downloads</h2><div id="recentList"></div></div>
   <div id="siteRow"><span id="siteName"></span><button id="siteToggle">Hide pill on this site</button></div>
@@ -150,19 +187,25 @@
   <div id="mediaList"><div class="empty">Scanning this tab…</div></div>
   <div id="mediaStatus"></div>
 
+  <!-- v4.3: Download and Grab all stay on the bar; the rest live in the overflow menu. -->
   <div class="toolbar">
-    <button id="btnMerge" disabled title="Download checked items, merging HLS streams">Merge</button>
     <button id="btnDownload" title="Download checked items">Download</button>
-    <button id="btnCopy" title="Copy checked URLs">Copy</button>
-    <button id="btnToggle" title="Check/uncheck all">Toggle</button>
-    <button id="btnSort" title="Cycle the sort order: Time, Size, Name">Sort: Time</button>
-    <button id="btnFilter" title="Filter by type">Filter</button>
-    <button id="btnClear" title="Clear this tab's detected list">Clear</button>
-    <button id="btnSearch" title="Search">Search</button>
+    <button id="grabAllBtn" title="Scan this page for every media file and link">🔍 Grab all</button>
+    <div class="more">
+      <button id="btnMore" aria-haspopup="menu" aria-expanded="false" aria-controls="moreMenu" aria-label="More actions" title="More actions">&hellip;</button>
+      <div id="moreMenu" role="menu" hidden>
+        <button id="btnMerge" role="menuitem" disabled title="Download checked items, merging HLS streams">Merge</button>
+        <button id="btnCopy" role="menuitem" title="Copy checked URLs">Copy</button>
+        <button id="btnToggle" role="menuitem" title="Check/uncheck all">Toggle</button>
+        <button id="btnSort" role="menuitem" title="Cycle the sort order: Time, Size, Name">Sort: Time</button>
+        <button id="btnFilter" role="menuitem" title="Filter by type">Filter</button>
+        <button id="btnClear" role="menuitem" title="Clear this tab's detected list">Clear</button>
+        <button id="btnSearch" role="menuitem" title="Search">Search</button>
+      </div>
+    </div>
   </div>
 
   <div class="divider"></div>
-  <button id="grabAllBtn" style="margin-bottom:8px;">🔍 Grab all media/files on this page</button>
   <div id="grabResult" style="font-size:11px;color:#555;margin-bottom:8px;"></div>
   <div id="grabToolbar" class="grab-toolbar" style="display:none;">
     <span id="grabCount" style="font-size:11px;color:#555;"></span>
@@ -176,9 +219,70 @@
     <button id="grabConfirmYes">Yes</button>
     <button id="grabConfirmNo">Cancel</button>
   </div>
+  </div>
+
+  <div id="settingsView">
+    <div class="sethdr"><button id="setBack">&larr; Back</button><b>Settings</b></div>
+
+    <div class="setsec">
+      <h2>Pill</h2>
+      <div class="setrow chk"><input type="checkbox" id="setPillVisible"><label for="setPillVisible">Show the pill on videos</label></div>
+      <div class="setrow chk"><input type="checkbox" id="setMicroPill"><label for="setMicroPill">Show the image micro-pill on hover</label></div>
+      <div class="setrow"><label for="setCorner">Default corner</label>
+        <select id="setCorner">
+          <option value="">Free (top-left offset)</option>
+          <option value="tl">Top-Left</option>
+          <option value="tr">Top-Right</option>
+          <option value="bl">Bottom-Left</option>
+          <option value="br">Bottom-Right</option>
+        </select></div>
+      <div class="sethint">Applies to sites where you haven't moved the pill.</div>
+      <div class="setrow"><label for="setQuality">Default format</label>
+        <select id="setQuality">
+          <option value="0">Auto (best)</option>
+          <option value="2160">Up to 2160p</option>
+          <option value="1440">Up to 1440p</option>
+          <option value="1080">Up to 1080p</option>
+          <option value="720">Up to 720p</option>
+          <option value="480">Up to 480p</option>
+        </select></div>
+      <div class="sethint">Starred in the menu when a site has no remembered pick.</div>
+      <div class="setrow"><label for="setMenuH">Max dropdown height</label>
+        <select id="setMenuH">
+          <option value="0">No limit</option>
+          <option value="240">240 px</option>
+          <option value="320">320 px</option>
+          <option value="400">400 px</option>
+          <option value="520">520 px</option>
+        </select></div>
+      <div class="setrow"><label>Hidden on these sites</label></div>
+      <div id="setSites"></div>
+      <button id="setResetPos" class="setbtn">Reset pill positions on all sites</button>
+    </div>
+
+    <div class="setsec">
+      <h2>Sniffer</h2>
+      <div class="setrow"><label for="setSniffer">Detect media in</label>
+        <select id="setSniffer">
+          <option value="all">All tabs</option>
+          <option value="active">Active tab only</option>
+        </select></div>
+      <div class="sethint">Active tab only skips background tabs, so media that loads while a tab is in the background isn't listed.</div>
+    </div>
+
+    <div class="setsec">
+      <h2>Notifications</h2>
+      <div class="setrow chk"><input type="checkbox" id="setNotifyRec"><label for="setNotifyRec">Recording started / finished</label></div>
+      <div class="setrow chk"><input type="checkbox" id="setNotifyAct"><label for="setNotifyAct">Shortcut and right-click sends</label></div>
+    </div>
+
+    <button id="setOptions" class="setbtn">Pairing and advanced options&hellip;</button>
+  </div>
+
   <div id="toast" role="status" aria-live="polite"></div>
 
   <script src="theme.js"></script>
+  <script src="vgsettings.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

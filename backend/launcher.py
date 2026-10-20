@@ -282,6 +282,55 @@ def _start_pot_provider(root: Path, runtime: Path) -> None:
         _log_error(f"pot provider: could not start: {e}")
 
 
+def _apply_pending_components(runtime: Path) -> None:
+    """Swap in ffmpeg/deno staged by the Settings > Updates page
+    (component_updater.py). Runs before anything starts, so nothing holds
+    the files open. Same rename-then-replace pattern as updater.bat:
+    live -> .old, .new -> live, and put .old back if the second step fails.
+    The .old leftovers are deleted by _cleanup_update_leftovers."""
+    import json
+    marker = runtime / "components-pending.json"
+    if not marker.is_file():
+        return
+    try:
+        pend = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception as e:
+        _log_error(f"launcher: unreadable {marker.name}: {e}")
+        return
+    left = {}
+    for comp, info in pend.items():
+        failed = False
+        for fname in (info or {}).get("files", []):
+            live, new, old = runtime / fname, runtime / (fname + ".new"), runtime / (fname + ".old")
+            if not new.is_file():
+                continue
+            try:
+                if old.exists():
+                    old.unlink()
+                if live.exists():
+                    live.rename(old)
+                try:
+                    new.rename(live)
+                except OSError:
+                    if old.exists() and not live.exists():
+                        old.rename(live)       # restore the working binary
+                    raise
+            except OSError as e:
+                failed = True
+                _log_error(f"launcher: couldn't apply {fname} update ({e}); will retry next start")
+        if failed:
+            left[comp] = info
+        else:
+            _log_error(f"launcher: applied {comp} {info.get('version', '')} update")
+    try:
+        if left:
+            marker.write_text(json.dumps(left, indent=2), encoding="utf-8")
+        else:
+            marker.unlink()
+    except OSError:
+        pass
+
+
 def _cleanup_update_leftovers(root: Path) -> None:
     """Delete the previous update's rollback leftovers (app.old\\, the
     renamed-out launcher exe, the renamed-out internal folder). Never
@@ -292,6 +341,10 @@ def _cleanup_update_leftovers(root: Path) -> None:
         root / "app.old",
         root / "VideoGrabber.exe.old",
         root / "VideoGrabber_internal.old",
+        # v5.5: ffmpeg/deno binaries replaced by _apply_pending_components.
+        root / "runtime" / "ffmpeg.exe.old",
+        root / "runtime" / "ffprobe.exe.old",
+        root / "runtime" / "deno.exe.old",
     ]
     leftovers = [p for p in leftovers if p.exists()]
     if not leftovers:
@@ -502,6 +555,8 @@ def main() -> int:
 
     sys.path.insert(0, str(app_dir))
 
+    if runtime_dir.is_dir():
+        _apply_pending_components(runtime_dir)
     _cleanup_update_leftovers(root)
     if runtime_dir.is_dir():
         _start_pot_provider(root, runtime_dir)

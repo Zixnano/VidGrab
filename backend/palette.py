@@ -41,6 +41,11 @@ def build_palette():
 
         "radius":      "10px",
         "radius_pill": "999px",
+        # Layout tokens (v5.5): shape and spacing live apart from the colors,
+        # so a preset can restyle shapes without touching a color.
+        "radius_sm":   "6px",       # menu items, list items, menu-bar hover
+        "radius_chip": "10px",      # small chips
+        "pad_scale":   1.0,         # density: multiplies every padding in gui_style
         "font":        _SANS,
         "font_mono":   '"JetBrains Mono", "Consolas", monospace',
     }
@@ -49,23 +54,28 @@ def build_palette():
 # Presets only list what differs from the default.
 _PRESET_DIFFS = {
     "amoled_black": {},
+    # Softer and roomier.
     "dark_gray": dict(bg_base="#16161c", bg_panel="#1d1d26", bg_elevated="#262630",
-                      border="#30303c", border_hi="#3f3f4b"),
+                      border="#30303c", border_hi="#3f3f4b",
+                      radius="12px", radius_sm="8px", radius_chip="12px", pad_scale=1.08),
     "high_contrast": dict(bg_base="#000000", bg_panel="#0d0d0d", bg_elevated="#1a1a1a",
                           border="#555555", border_hi="#777777", text="#ffffff",
-                          text_muted="#cccccc", text_dim="#999999", accent="#00e5ff"),
+                          text_muted="#cccccc", text_dim="#999999", accent="#00e5ff",
+                          radius="4px", radius_sm="3px", radius_chip="6px", pad_scale=1.1),
     # Dark LCD screen, muted green, monospace type (the handheld screen).
     "handheld": dict(bg_base="#101412", bg_panel="#171c19", bg_elevated="#222925",
                      border="#39413b", border_hi="#59625a", text="#f0ede2",
                      text_muted="#a3aaa0", text_dim="#6f786f", accent="#8ccf72",
                      accent_dim="#4e8b45", success="#8ccf72", warning="#d6b85a",
-                     error="#e56a62", info="#7894c8", radius="8px", font=_MONO),
+                     error="#e56a62", info="#7894c8", radius="8px", font=_MONO,
+                     radius_sm="4px", radius_chip="8px", pad_scale=0.9),
     # Light four-shade green LCD.
     "classic_lcd": dict(bg_base="#9bbc0f", bg_panel="#8bac0f", bg_elevated="#7d9d0e",
                         border="#306230", border_hi="#0f380f", text="#0f380f",
                         text_muted="#306230", text_dim="#4a7a2a", accent="#0f380f",
                         accent_dim="#306230", success="#0f380f", warning="#5c5a0a",
-                        error="#7a1f12", info="#306230", radius="4px", font=_MONO),
+                        error="#7a1f12", info="#306230", radius="4px", font=_MONO,
+                        radius_sm="2px", radius_chip="4px", pad_scale=0.85),
 }
 
 PRESET_NAMES = {
@@ -78,6 +88,10 @@ PRESET_NAMES = {
 
 THEME_PRESETS = {k: dict(build_palette(), **v) for k, v in _PRESET_DIFFS.items()}
 PALETTE = THEME_PRESETS["amoled_black"]
+
+# The layout layer (shape and spacing). A color-only preset or theme file
+# simply inherits the defaults above, so older themes keep working.
+LAYOUT_KEYS = ("radius", "radius_sm", "radius_chip", "radius_pill", "pad_scale")
 
 # Computed from the base tokens; the user can still override them.
 DERIVED = ("bg_side", "bg_input", "bg_hover", "bg_sel", "text_soft", "text_on_accent")
@@ -118,6 +132,20 @@ def contrast(a, b):
     return (hi + 0.05) / (lo + 0.05)
 
 
+def _lift(fg, backgrounds, toward, target):
+    """Nudge fg toward `toward` (the main text color) in small steps until it
+    reaches the contrast ratio `target` on every background."""
+    cur = fg
+    for _ in range(24):
+        try:
+            if all(contrast(cur, b) >= target for b in backgrounds):
+                return cur
+        except Exception:
+            return fg
+        cur = mix(cur, toward, 0.08)
+    return cur
+
+
 def _derive(p):
     p["bg_side"] = p["bg_base"]
     p["bg_input"] = p["bg_base"]
@@ -145,6 +173,14 @@ def resolve_palette(settings_state=None):
     for k, v in overrides.items():
         if k in pal:
             pal[k] = v
+    # v5.5 accessibility floor: secondary text reaches WCAG AA (4.5:1) and faint
+    # text 3:1 on the surfaces it sits on. A color the user set explicitly is
+    # left alone. Done before _derive so text_soft follows the lifted value.
+    _surf = [pal["bg_base"], pal["bg_panel"], pal["bg_elevated"]]
+    if "text_muted" not in overrides:
+        pal["text_muted"] = _lift(pal["text_muted"], _surf, pal["text"], 4.5)
+    if "text_dim" not in overrides:
+        pal["text_dim"] = _lift(pal["text_dim"], _surf, pal["text"], 3.0)
     _derive(pal)
     for k, v in overrides.items():          # explicit overrides of derived tokens win
         if k in DERIVED:

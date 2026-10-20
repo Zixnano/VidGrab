@@ -41,20 +41,34 @@
   const SITE = location.hostname.replace(/^www\./, "").toLowerCase();
   let siteDisabled = false;
   const LIVE = [];            // {video, overlay} for every pill we created
+  let cfg = vgNormalize();    // v4.3: extension settings (popup cog), see vgsettings.js
   let lastQuality = {};       // host -> {res: "1920x1080"}
 
   try {
-    chrome.storage.local.get(["disabledSites", "lastQuality", "pillPrefs"]).then((st) => {
+    chrome.storage.local.get(["disabledSites", "lastQuality", "pillPrefs", VG_SETTINGS_KEY]).then((st) => {
       siteDisabled = Array.isArray(st.disabledSites) && st.disabledSites.includes(SITE);
       lastQuality = st.lastQuality || {};
       pillPrefs = st.pillPrefs || {};
+      cfg = vgNormalize(st[VG_SETTINGS_KEY]);
       migrateLegacyPillOffset();
       syncAllPills();
-      if (siteDisabled) removeAllPills(); else scan();
+      if (siteDisabled || !cfg.pillVisible) removeAllPills(); else scan();
+      if (!cfg.microPill) hideMicro();
     }).catch(() => {});
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== "local") return;
       if (changes.lastQuality) lastQuality = changes.lastQuality.newValue || {};
+      if (changes[VG_SETTINGS_KEY]) {
+        // v4.3: popup settings changed; apply live.
+        const prev = cfg;
+        cfg = vgNormalize(changes[VG_SETTINGS_KEY].newValue);
+        if (!siteDisabled) {
+          if (!cfg.pillVisible) removeAllPills();
+          else if (!prev.pillVisible) scan();
+        }
+        if (!cfg.microPill) hideMicro();
+        if (cfg.pillCorner !== prev.pillCorner) syncAllPills();
+      }
       if (changes.pillPrefs) {
         pillPrefs = changes.pillPrefs.newValue || {};
         syncAllPills();
@@ -64,7 +78,7 @@
         const now = Array.isArray(list) && list.includes(SITE);
         if (now === siteDisabled) return;
         siteDisabled = now;
-        if (siteDisabled) removeAllPills(); else scan();
+        if (siteDisabled || !cfg.pillVisible) removeAllPills(); else scan();
       }
     });
   } catch (e) { /* extension context gone: pills simply stay enabled */ }
@@ -87,7 +101,14 @@
                             ["bl", "Bottom-Left"], ["br", "Bottom-Right"]];
 
   function prefsFor(host) {
-    return { ...PILL_DEFAULT, ...(pillPrefs[host] || {}) };
+    // v4.3: the Settings default corner applies to sites with no saved position.
+    const merged = { ...PILL_DEFAULT, corner: cfg.pillCorner || null, ...(pillPrefs[host] || {}) };
+    // A saved free position still at the default offset was never moved, so
+    // the default corner applies to it too.
+    if (!merged.corner && merged.dx === PILL_DEFAULT.dx && merged.dy === PILL_DEFAULT.dy) {
+      merged.corner = cfg.pillCorner || null;
+    }
+    return merged;
   }
 
   function savePillPrefs(host, state) {
@@ -135,9 +156,17 @@
     if (pillCtx) { pillCtx.remove(); pillCtx = null; }
     document.removeEventListener("mousedown", onCtxOutside, true);
     document.removeEventListener("keydown", onCtxKey, true);
-    window.removeEventListener("scroll", closePillCtx, true);
+    window.removeEventListener("scroll", onCtxScroll, true);
     window.removeEventListener("resize", closePillCtx);
     if (microPill) scheduleMicroHide(null);   // the micro-pill may be waiting to hide
+  }
+
+  // The page scrolling closes the menu, but the menu scrolling inside itself
+  // (it can now be capped and scrollable) must not.
+  function onCtxScroll(e) {
+    const t = e && e.target;
+    if (pillCtx && t && t.nodeType === 1 && pillCtx.contains(t)) return;
+    closePillCtx();
   }
 
   function onCtxOutside(e) {
@@ -190,17 +219,28 @@
       m.appendChild(el);
     }
     document.documentElement.appendChild(m);
-    // Keep it on screen.
+    // Keep it on screen: cap the height to the viewport (and to Settings > max
+    // dropdown height), scroll inside when it is longer, and open above the
+    // pointer when there is no room below it.
+    const EDGE = 4;
+    let cap = innerHeight - 2 * EDGE;
+    if (cfg.maxMenuHeight > 0) cap = Math.min(cap, cfg.maxMenuHeight);   // v4.3 setting
+    if (m.offsetHeight > cap) {
+      m.style.maxHeight = cap + "px";
+      m.style.overflowY = "auto";
+    }
     const w = m.offsetWidth, h = m.offsetHeight;
-    m.style.left = Math.max(4, Math.min(x, innerWidth - w - 4)) + "px";
-    m.style.top = Math.max(4, Math.min(y, innerHeight - h - 4)) + "px";
+    let top = y;
+    if (top + h > innerHeight - EDGE) top = (y - h >= EDGE) ? y - h : innerHeight - h - EDGE;
+    m.style.left = Math.max(EDGE, Math.min(x, innerWidth - w - EDGE)) + "px";
+    m.style.top = Math.max(EDGE, top) + "px";
     pillCtx = m;
     // Listen after this event finishes so the opening click doesn't close it.
     setTimeout(() => {
       if (pillCtx === m) document.addEventListener("mousedown", onCtxOutside, true);
     }, 0);
     document.addEventListener("keydown", onCtxKey, true);
-    window.addEventListener("scroll", closePillCtx, true);
+    window.addEventListener("scroll", onCtxScroll, true);
     window.addEventListener("resize", closePillCtx);
   }
 
@@ -213,6 +253,23 @@
     } catch (e) { /* extension context gone */ }
   }
 
+  // v4.3: pill menu / right-click "Start Queue". The background worker calls
+  // the app's /queue-running route; the in-page toast confirms the result.
+  function startQueue() {
+    try {
+      chrome.runtime.sendMessage({ type: "START_QUEUE" }, (resp) => {
+        if (chrome.runtime.lastError) {
+          microToastShow(failLabel(null, chrome.runtime.lastError.message), true);
+          return;
+        }
+        if (resp && resp.ok) microToastShow("Queue started \u2713");
+        else microToastShow(failLabel(resp), true);
+      });
+    } catch (e) {
+      microToastShow("Extension reloading, try again", true);
+    }
+  }
+
   function rememberQuality(f) {
     if (!f || !f.resolution) return;
     lastQuality[SITE] = { res: f.resolution };
@@ -222,7 +279,26 @@
   // Put the format matching this site's last pick first and star it.
   function orderFormats(formats) {
     const want = lastQuality[SITE] && lastQuality[SITE].res;
-    if (!want) return { list: formats, starred: null };
+    if (!want) {
+      // v4.3: no remembered pick for this site, so use the Settings default
+      // format (highest resolution not above it) and star it.
+      if (cfg.defaultQuality > 0) {
+        let bestIdx = -1, bestH = 0;
+        formats.forEach((f, idx) => {
+          const mm = /(\d+)\s*x\s*(\d+)/.exec(f.resolution || "");
+          if (!mm) return;
+          const h = Math.min(+mm[1], +mm[2]);
+          if (h <= cfg.defaultQuality && h > bestH) { bestH = h; bestIdx = idx; }
+        });
+        if (bestIdx >= 0) {
+          const list = formats.slice();
+          const [hit] = list.splice(bestIdx, 1);
+          list.unshift(hit);
+          return { list, starred: hit };
+        }
+      }
+      return { list: formats, starred: null };
+    }
     const i = formats.findIndex((f) => f.resolution === want);
     if (i <= 0) return { list: formats, starred: i === 0 ? formats[0] : null };
     const list = formats.slice();
@@ -474,13 +550,18 @@
       }
       wrap.style.top = Math.max(8, top) + "px";
       wrap.style.left = Math.max(8, left) + "px";
+      if (typeof wrap.__vgReplaceMenu === "function") wrap.__vgReplaceMenu();   // Batch 4 #1
     }
     ensurePillStyle();
     applyMini();
     position();
     wrap.__vgPosition = position;
 
-    const reposition = () => requestAnimationFrame(position);
+    const reposition = (e) => {
+      // The menu scrolling inside itself is not the page moving.
+      if (e && e.target && e.target.nodeType === 1 && wrap.contains(e.target)) return;
+      requestAnimationFrame(position);
+    };
     window.addEventListener("scroll", reposition, true);
     window.addEventListener("resize", reposition);
     const ro = new ResizeObserver(reposition);
@@ -524,7 +605,7 @@
       if (e.target.closest("button") || menu.contains(e.target)) return;
       state.dx = PILL_DEFAULT.dx;
       state.dy = PILL_DEFAULT.dy;
-      state.corner = null;
+      state.corner = cfg.pillCorner || null;
       persist();
       position();
     });
@@ -544,6 +625,7 @@
           onClick: () => { state.corner = id; persist(); position(); },
         })),
         { sep: true },
+        { label: "Start Queue", onClick: () => startQueue() },
         { label: "Hide on this site", onClick: () => hideOnThisSiteNow() },
       ]);
     });
@@ -1008,7 +1090,7 @@
     addDivider(menu);
   }
   function wire(video) {
-    if (siteDisabled) return;
+    if (siteDisabled || !cfg.pillVisible) return;
     if (HANDLED.has(video) || DISMISSED.has(video)) return;
     HANDLED.add(video);
 
@@ -1039,15 +1121,34 @@
     // below, and hug the right edge when the pill is near the viewport edge.
     function placeMenu() {
       const m = overlay.menu;
+      const GAP = 6, EDGE = 8;
+      // Batch 4 #1: cap the height to the room on screen, open above or below
+      // the pill (whichever has more room), and scroll inside when it is long.
+      // Called again whenever the formats load and whenever the pill moves or
+      // the page scrolls or resizes (see wrap.__vgReplaceMenu).
+      const keep = m.scrollTop;
+      m.style.maxHeight = "";
+      m.style.overflowY = "";
       const r = overlay.wrap.getBoundingClientRect();
-      const below = innerHeight - r.bottom;
-      const above = r.top;
-      if (m.offsetHeight > below - 8 && above > below) {
+      const natural = m.offsetHeight;
+      const below = innerHeight - r.bottom - GAP - EDGE;
+      const above = r.top - GAP - EDGE;
+      const flipUp = natural > below && above > below;
+      let cap = Math.max(120, flipUp ? above : below);
+      if (cfg.maxMenuHeight > 0) cap = Math.min(cap, cfg.maxMenuHeight);   // v4.3 setting
+      if (natural > cap) {
+        m.style.overflowY = "auto";
+        m.style.maxHeight = cap + "px";
+        const over = m.offsetHeight - cap;   // padding and border when box-sizing is content-box
+        if (over > 0) m.style.maxHeight = Math.max(80, cap - over) + "px";
+        m.scrollTop = keep;
+      }
+      if (flipUp) {
         m.style.top = "auto"; m.style.bottom = "100%";
-        m.style.marginTop = "0"; m.style.marginBottom = "6px";
+        m.style.marginTop = "0"; m.style.marginBottom = GAP + "px";
       } else {
         m.style.top = "100%"; m.style.bottom = "auto";
-        m.style.marginTop = "6px"; m.style.marginBottom = "0";
+        m.style.marginTop = GAP + "px"; m.style.marginBottom = "0";
       }
       if (r.left + m.offsetWidth > innerWidth - 8) {
         m.style.left = "auto"; m.style.right = "0";
@@ -1055,6 +1156,9 @@
         m.style.left = "0"; m.style.right = "auto";
       }
     }
+
+    // Pill moved, page scrolled or resized: lay the open menu out again.
+    overlay.wrap.__vgReplaceMenu = () => { if (menuOpen) placeMenu(); };
 
     function sendChoice({ format_id = null, target_format = null,
                          bypass_dialog = false, download_playlist = false,
@@ -1125,6 +1229,12 @@
       } catch (e) {
         return legacy();
       }
+    }
+
+    // v4.3: last row of every pill menu variant.
+    function addQueueItem(menu) {
+      addDivider(menu);
+      addMenuItem(menu, "Start Queue", {}, () => { closeMenu(); startQueue(); });
     }
 
     function toggleMenu() {
@@ -1254,6 +1364,7 @@
           });
           addDivider(menu);
           addRecordItems(menu, video, overlay, closeMenu);
+          addQueueItem(menu);
           return;
         }
 
@@ -1271,6 +1382,7 @@
           placeMenu();
         });
         addRecordItems(menu, video, overlay, closeMenu);
+        addQueueItem(menu);
         menu.style.display = "flex";
         placeMenu();
         document.addEventListener("click", onDocClick, true);
@@ -1299,6 +1411,7 @@
         () => sendChoice({ target_format: "flac" }));
       addMenuItem(menu, "Extract audio → Opus", {},
         () => sendChoice({ target_format: "opus" }));
+      addQueueItem(menu);
 
       menu.style.display = "flex";
       placeMenu();
@@ -1869,7 +1982,7 @@
   // mouseenter does not bubble but does pass through the capture phase, so one
   // listener on the document sees every element the pointer enters.
   document.addEventListener("mouseenter", (e) => {
-    if (siteDisabled) return;
+    if (siteDisabled || !cfg.microPill) return;
     const t = e.target;
     if (!(t instanceof Element)) return;
     if (t.tagName !== "IMG" && !t.hasAttribute("style")) return;

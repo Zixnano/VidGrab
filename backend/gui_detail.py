@@ -6,18 +6,26 @@ Pure UI. MainWindow turns a job dict into the plain `info` dict that
 DetailPane.set_job() takes (ready-made strings, no backend calls here).
 Thumbnails come from ThumbLoader: images are scaled directly, videos get one
 frame from ffmpeg (if it can be found) on a background thread."""
+import os
 import re
 import shutil
 import subprocess
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
-from PySide6.QtWidgets import (
+from PySide6.QtWidgets import (QScrollArea, 
     QFrame, QGridLayout, QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar,
     QPushButton, QSizePolicy, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
+
+try:    # inline playback is optional; without it a click opens the file externally
+    from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+    HAVE_MM = True
+except Exception:
+    HAVE_MM = False
 
 VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v", ".ts", ".wmv", ".mpg", ".mpeg"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -101,6 +109,7 @@ def _fmt_clock(sec):
 
 class _Thumb(QWidget):
     clicked = Signal()
+    double_clicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -129,6 +138,12 @@ class _Thumb(QWidget):
     def mousePressEvent(self, e):
         if self._clickable and e.button() == Qt.LeftButton:
             self.clicked.emit()
+
+    def mouseDoubleClickEvent(self, e):
+        # The second click of a double click arrives here instead of as a
+        # press, so a double click is exactly one `clicked` plus one of these.
+        if self._clickable and e.button() == Qt.LeftButton:
+            self.double_clicked.emit()
 
     def paintEvent(self, _e):
         p = QPainter(self)
@@ -271,6 +286,15 @@ class DetailPane(QFrame):
         super().__init__(parent)
         self.setObjectName("DetailPane")
         self.job_id = None
+        # Inline thumbnail playback (v5.5): ONE QMediaPlayer for the pane's
+        # whole life, built on first use and reused for every job.
+        self._player = None
+        self._audio = None
+        self._video_w = None
+        self._path = ""
+        self._playable = False
+        self._muted = False
+        self._click_mode = "inline"
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 10)
         root.setSpacing(8)
@@ -278,7 +302,8 @@ class DetailPane(QFrame):
         top = QHBoxLayout()
         top.setSpacing(14)
         self.thumb = _Thumb()
-        self.thumb.clicked.connect(self.open_clicked)
+        self.thumb.clicked.connect(self._on_thumb_click)
+        self.thumb.double_clicked.connect(self._on_thumb_double)
         top.addWidget(self.thumb, 0, Qt.AlignTop)
 
         right = QVBoxLayout()
@@ -340,16 +365,35 @@ class DetailPane(QFrame):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(300)
-        self.log_view.setFixedHeight(110)
-        self.tabs.addTab(self.p_general, "General")
-        self.tabs.addTab(self.p_progress, "Progress")
-        self.tabs.addTab(self.p_conn, "Connections")
+        # Batch 4 #2: the log grows with the panel (it was fixed at 110 px),
+        # and each info grid scrolls instead of being squeezed when the pane
+        # is short, so every row always renders in full.
+        self.log_view.setMinimumHeight(80)
+        self.tabs.addTab(self._scrolled(self.p_general), "General")
+        self.tabs.addTab(self._scrolled(self.p_progress), "Progress")
+        self.tabs.addTab(self._scrolled(self.p_conn), "Connections")
         self.tabs.addTab(self.log_view, "Log")
-        root.addWidget(self.tabs)
+        self.tabs.setMinimumHeight(150)
+        self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        root.addWidget(self.tabs, 1)
         self.toggle.setChecked(bool(tabs_open))
         self._on_toggle(bool(tabs_open), emit=False)
 
+    @staticmethod
+    def _scrolled(page):
+        """Wrap an info grid in a frameless scroll area."""
+        page.setObjectName("Plain")
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.viewport().setObjectName("Plain")
+        area.setWidget(page)
+        return area
+
     def _on_toggle(self, on, emit=True):
+        # A sensible floor for the panel: the header block alone, or the header
+        # plus the tabs, so nothing is ever squashed below readable size.
+        self.setMinimumHeight(340 if on else 150)
         self.tabs.setVisible(on)
         self.toggle.setText(("\u25BE " if on else "\u25B8 ") + "Details")
         if emit:
@@ -361,6 +405,9 @@ class DetailPane(QFrame):
         self.job_id = info.get("id")
         if changed:
             self.thumb.clear_image()
+            self.stop_inline()
+        self._path = info.get("path") or ""
+        self._playable = bool(info.get("done") and info.get("is_video") and info.get("path_exists"))
         self.title.set_full(info.get("title", ""))
         self.bar.setValue(int(max(0.0, min(100.0, info.get("pct", 0.0))) * 10))
         self.sub.setText(info.get("progress_text", ""))
@@ -381,6 +428,102 @@ class DetailPane(QFrame):
         self.p_general.set_rows(info.get("general", []))
         self.p_progress.set_rows(info.get("progress", []))
         self.p_conn.set_rows(info.get("connections", []))
+
+    # ---- inline playback (v5.5) ------------------------------------------
+    def set_play_prefs(self, muted, mode):
+        """muted: play with no audio. mode: "inline" (click plays here,
+        double click opens the external player) or "external" (click opens)."""
+        self._muted = bool(muted)
+        self._click_mode = mode if mode in ("inline", "external") else "inline"
+        if self._audio is not None:
+            self._audio.setMuted(self._muted)
+
+    def _inline_ok(self):
+        return HAVE_MM and self._click_mode == "inline" and self._playable and bool(self._path)
+
+    def _ensure_player(self):
+        if self._player is not None:
+            return True
+        try:
+            self._video_w = QVideoWidget(self.thumb)
+            self._video_w.setGeometry(0, 0, THUMB_W, THUMB_H)
+            self._video_w.setAttribute(Qt.WA_TransparentForMouseEvents)   # clicks reach the thumb
+            self._video_w.hide()
+            self._player = QMediaPlayer(self)
+            # Attach audio only when the PC has an output device (creating a
+            # QAudioOutput without one can crash Qt Multimedia); same guard
+            # as the Media Toolkit preview.
+            try:
+                has_audio = (not os.environ.get("VG_TOOLKIT_NO_AUDIO")
+                             and bool(QMediaDevices.audioOutputs()))
+            except Exception:
+                has_audio = False
+            if has_audio:
+                self._audio = QAudioOutput(self)
+                self._audio.setVolume(0.8)
+                self._audio.setMuted(self._muted)
+                self._player.setAudioOutput(self._audio)
+            self._player.setVideoOutput(self._video_w)
+            self._player.mediaStatusChanged.connect(self._on_media_status)
+            self._player.errorOccurred.connect(self._on_player_error)
+            return True
+        except Exception:
+            self._player = None
+            return False
+
+    def _toggle_inline(self):
+        if not self._ensure_player():
+            self.open_clicked.emit()
+            return
+        url = QUrl.fromLocalFile(self._path)
+        st = self._player.playbackState()
+        if st == QMediaPlayer.PlayingState:
+            self._player.pause()
+            return
+        if st == QMediaPlayer.PausedState and self._player.source() == url:
+            self._player.play()
+            return
+        self._player.setSource(url)
+        if self._audio is not None:
+            self._audio.setMuted(self._muted)
+        self._video_w.show()
+        self._video_w.raise_()
+        self._player.play()
+
+    def stop_inline(self):
+        if self._player is None:
+            return
+        try:
+            self._player.stop()
+            self._player.setSource(QUrl())
+        except Exception:
+            pass
+        if self._video_w is not None:
+            self._video_w.hide()
+
+    def _on_media_status(self, status):
+        if status == QMediaPlayer.EndOfMedia:
+            self.stop_inline()
+
+    def _on_player_error(self, *_):
+        # Can't play it here (codec etc.): fall back to the external player.
+        self.stop_inline()
+        self.open_clicked.emit()
+
+    def _on_thumb_click(self):
+        if self._inline_ok():
+            self._toggle_inline()
+        else:
+            self.open_clicked.emit()
+
+    def _on_thumb_double(self):
+        if self._inline_ok():
+            self.stop_inline()
+            self.open_clicked.emit()
+
+    def hideEvent(self, e):
+        self.stop_inline()
+        super().hideEvent(e)
 
     def set_thumb(self, job_id, path, duration=0.0):
         if str(job_id) == str(self.job_id):

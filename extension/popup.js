@@ -757,12 +757,149 @@ async function grabAll(tab) {
   renderGrabChecklist();
 }
 
+// ---------------- v4.3: overflow menu (the "..." button) ----------------
+// Merge, Copy, Toggle, Sort, Filter, Clear and Search live in #moreMenu. They
+// are the same buttons with the same ids and handlers; this only opens and
+// closes the menu (click, Escape, arrow keys, click outside).
+function setupOverflowMenu() {
+  const btn = document.getElementById("btnMore");
+  const menu = document.getElementById("moreMenu");
+  const items = () => Array.from(menu.querySelectorAll("button")).filter((b) => !b.disabled);
+  const close = (refocus) => {
+    menu.hidden = true;
+    btn.setAttribute("aria-expanded", "false");
+    if (refocus) btn.focus();
+  };
+  const open = () => {
+    menu.hidden = false;
+    btn.setAttribute("aria-expanded", "true");
+    const first = items()[0];
+    if (first) first.focus();
+  };
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (menu.hidden) open(); else close(true);
+  });
+  // The button's own handler runs first (target phase), then the menu closes.
+  menu.addEventListener("click", (e) => {
+    if (e.target.closest("button:not(:disabled)")) close(false);
+  });
+  document.addEventListener("click", (e) => {
+    if (!menu.hidden && !menu.contains(e.target) && e.target !== btn) close(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (menu.hidden) return;
+    if (e.key === "Escape") { e.preventDefault(); close(true); return; }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const list = items();
+      if (!list.length) return;
+      const i = list.indexOf(document.activeElement);
+      const next = e.key === "ArrowDown" ? (i + 1) % list.length : (i - 1 + list.length) % list.length;
+      list[next].focus();
+    }
+  });
+}
+
+// ---------------- v4.3: settings panel (cog) ----------------
+// Sections: Pill / Sniffer / Notifications. Every control saves straight to
+// chrome.storage.local (key vgSettings, see vgsettings.js); content.js and
+// background.js pick the change up through storage.onChanged.
+async function setupSettings() {
+  const $ = (id) => document.getElementById(id);
+  const mainView = $("mainView");
+  const setView = $("settingsView");
+  const showSettings = (on) => {
+    mainView.style.display = on ? "none" : "";
+    setView.style.display = on ? "block" : "none";
+    if (on) paintSites();
+  };
+  $("btnCog").addEventListener("click", () => showSettings(setView.style.display !== "block"));
+  $("setBack").addEventListener("click", () => showSettings(false));
+
+  let cfg = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+  // [element id, setting key, kind]
+  const controls = [
+    ["setPillVisible", "pillVisible", "bool"],
+    ["setMicroPill", "microPill", "bool"],
+    ["setCorner", "pillCorner", "str"],
+    ["setQuality", "defaultQuality", "num"],
+    ["setMenuH", "maxMenuHeight", "num"],
+    ["setSniffer", "snifferMode", "str"],
+    ["setNotifyRec", "notifyRecording", "bool"],
+    ["setNotifyAct", "notifyActions", "bool"],
+  ];
+  const paint = () => {
+    for (const [id, key, kind] of controls) {
+      const el = $(id);
+      if (kind === "bool") el.checked = !!cfg[key];
+      else el.value = String(cfg[key]);
+    }
+  };
+  for (const [id, key, kind] of controls) {
+    $(id).addEventListener("change", async () => {
+      const el = $(id);
+      const value = kind === "bool" ? el.checked : kind === "num" ? Number(el.value) : el.value;
+      cfg = vgNormalize({ ...cfg, [key]: value });
+      try { await chrome.storage.local.set({ [VG_SETTINGS_KEY]: cfg }); }
+      catch (e) { showToast("Couldn't save the setting", true); }
+      paint();
+    });
+  }
+  paint();
+
+  // Sites the pill is hidden on (the same list the "Hide pill on this site"
+  // button edits), each removable here.
+  async function paintSites() {
+    const box = $("setSites");
+    const { disabledSites = [] } = await chrome.storage.local.get("disabledSites");
+    box.textContent = "";
+    if (!disabledSites.length) {
+      const none = document.createElement("div");
+      none.className = "none";
+      none.textContent = "None. The pill shows on every site.";
+      box.appendChild(none);
+      return;
+    }
+    for (const host of disabledSites) {
+      const row = document.createElement("div");
+      row.className = "site";
+      const name = document.createElement("span");
+      name.textContent = host;
+      const rm = document.createElement("button");
+      rm.textContent = "\u00d7";
+      rm.title = "Show the pill on " + host;
+      rm.setAttribute("aria-label", "Show the pill on " + host);
+      rm.addEventListener("click", async () => {
+        const cur = (await chrome.storage.local.get("disabledSites")).disabledSites || [];
+        await chrome.storage.local.set({ disabledSites: cur.filter((h) => h !== host) });
+        paintSites();
+      });
+      row.append(name, rm);
+      box.appendChild(row);
+    }
+  }
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.disabledSites && setView.style.display === "block") paintSites();
+  });
+
+  $("setResetPos").addEventListener("click", async () => {
+    await chrome.storage.local.remove("pillPrefs");
+    showToast("Pill positions reset");
+  });
+  $("setOptions").addEventListener("click", () => {
+    try { chrome.runtime.openOptionsPage(); } catch (e) { showToast("Couldn't open Options", true); }
+  });
+}
+
 // ---------------- wiring ----------------
 
 (async () => {
   await checkBackend();
   startRecent();
   setupSiteSwitch();
+  setupSettings();
+  setupOverflowMenu();
 
   document.getElementById("tabCurrent").addEventListener("click", () => showTab("current"));
   document.getElementById("tabOther").addEventListener("click", () => showTab("other"));

@@ -218,6 +218,23 @@ _V5_DEFAULTS = {
     "shell_colors": {},
     # Cream window frame (toolbar, menu bar, status bar, margins) around the dark panels.
     "frame_cream": False,
+    # v5.5 polish pass. completion_sound is a preset id from sounds.PRESETS
+    # or "custom" (then completion_sound_path is the .wav/.mp3 to play).
+    "completion_sound": "chime",
+    "completion_sound_path": "",
+    # Blanc minimal mode: hides the Activity Log, toolbar text labels and
+    # the status-bar extras.
+    "blanc_mode": False,
+    # Sidebar collapsed to icons only.
+    "sidebar_collapsed": False,
+    # Detail-pane thumbnail: play inline without audio; click behavior is
+    # "inline" (click plays, double-click opens externally) or "external".
+    "inline_play_muted": False,
+    "thumb_click_mode": "inline",
+    # Text size in percent (General). Scales the stylesheet's font sizes.
+    "text_scale": 100,
+    # Theme page view: "simple" (presets, accent, shell toggle) or "detailed".
+    "theme_detail_mode": "simple",
 }
 STATE.update(_V5_DEFAULTS)
 
@@ -519,9 +536,15 @@ def _unique_path(path, taken=None):
     raise RuntimeError(f"no free file name for {path.name} after 1000 tries")
 
 
+# v5.5: HLS/DASH playlists are video streams. Their URL basename ends in
+# .m3u8 / .mpd, which is in no extension set, so they were created as "Other".
+_STREAM_EXT_CATEGORY = {".m3u8": "Video", ".m3u": "Video", ".mpd": "Video"}
+
+
 def category_for(filename):
     _, ext = split_ext(filename)
-    return CATEGORY_MAP.get(ext.lower(), "Other")
+    ext = ext.lower()
+    return CATEGORY_MAP.get(ext) or _STREAM_EXT_CATEGORY.get(ext, "Other")
 
 
 # Any URL whose path ends in one of these extensions is a plain file

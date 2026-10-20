@@ -2,7 +2,9 @@
 dark screen bezel, D-pad, A/B, speaker, Select/Start and a power light.
 The controls are real: they emit signals MainWindow connects to actions.
 Pure painting, no backend calls."""
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
+import sys
+
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QLinearGradient, QPainter, QPainterPath,
                            QPen, QPolygonF, QRadialGradient, QTransform)
 from PySide6.QtWidgets import QHBoxLayout, QWidget
@@ -81,6 +83,66 @@ def _luminance(c):
 
 
 COLUMN = 210   # width of the controls column
+
+
+# ---------------------------------------------------------------------------
+# Dark title bars (Windows). The native title bar is drawn by Windows, so it
+# stays white unless each top-level window opts in to the immersive dark mode
+# through DWM. No custom frameless title bar: the standard one just goes dark.
+# ---------------------------------------------------------------------------
+def apply_dark_titlebar(widget, dark=True):
+    """Switch one top-level window's native title bar to dark (or back to
+    light). Returns True when Windows accepted it. A no-op off Windows."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        hwnd = ctypes.c_void_p(int(widget.winId()))
+        val = ctypes.c_int(1 if dark else 0)
+        dwm = ctypes.windll.dwmapi
+        ok = False
+        # DWMWA_USE_IMMERSIVE_DARK_MODE is 20 on Windows 10 2004+ and 11,
+        # and 19 on the older Windows 10 builds that had it.
+        for attr in (20, 19):
+            if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
+                ok = True
+                break
+        if ok:
+            # Repaint the frame so the change shows without a focus change.
+            SWP = 0x0002 | 0x0001 | 0x0004 | 0x0020 | 0x0010   # NOMOVE|NOSIZE|NOZORDER|FRAMECHANGED|NOACTIVATE
+            ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP)
+        return ok
+    except Exception:
+        return False
+
+
+class DarkTitleBarFilter(QObject):
+    """Application-wide event filter: every normal top-level window (main
+    window, dialogs, message boxes) gets the title bar matching the theme the
+    moment it is shown. `dark_fn()` says whether the current theme is dark."""
+
+    def __init__(self, dark_fn, parent=None):
+        super().__init__(parent)
+        self._dark_fn = dark_fn
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Show and isinstance(obj, QWidget) and obj.isWindow():
+            try:
+                flags = obj.windowFlags()
+                if (obj.windowType() in (Qt.Window, Qt.Dialog)
+                        and not (flags & Qt.FramelessWindowHint)):
+                    apply_dark_titlebar(obj, bool(self._dark_fn()))
+            except Exception:
+                pass
+        return False
+
+    def refresh(self):
+        """Re-apply to every open window (theme changed light <-> dark)."""
+        from PySide6.QtWidgets import QApplication
+        for w in QApplication.topLevelWidgets():
+            if w.isVisible() and w.windowType() in (Qt.Window, Qt.Dialog) \
+                    and not (w.windowFlags() & Qt.FramelessWindowHint):
+                apply_dark_titlebar(w, bool(self._dark_fn()))
 
 
 class _Backlight(QWidget):

@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QProcess, QRectF, Qt, QThread, QTimer, QUrl, Signal
@@ -166,6 +167,12 @@ class TimelineSlider(QSlider):
     endChanged = Signal(int)
 
     PAD = 12
+    # Batch 4 #6: a handle is grabbed within GRAB px of the centre of its
+    # painted body (the old test was 9 px from the line, which is narrower than
+    # the handle looks). While dragging, seeks and field updates are emitted at
+    # most every EMIT_MS so the handle follows the mouse smoothly.
+    GRAB = 14
+    EMIT_MS = 16
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
@@ -174,6 +181,12 @@ class TimelineSlider(QSlider):
         self._start, self._end = 0, 0
         self._show_sel = True
         self._drag = None
+        self._grab_dx = 0.0          # where inside the handle the press landed
+        self._pending = None         # (kind, value) waiting to be emitted
+        self._last_emit = 0.0
+        self._emit_timer = QTimer(self)
+        self._emit_timer.setSingleShot(True)
+        self._emit_timer.timeout.connect(self._flush)
         self._c = _theme_colors()
 
     # -- state
@@ -205,8 +218,12 @@ class TimelineSlider(QSlider):
     def _hit(self, x):
         if not self._show_sel:
             return "scrub"
-        ds, de = abs(x - self._x(self._start)), abs(x - self._x(self._end))
-        if min(ds, de) <= 9:
+        # The painted start handle sits just left of its line and the end
+        # handle just right of its line (see paintEvent), so measure from the
+        # centre of each body.
+        ds = abs(x - (self._x(self._start) - 3))
+        de = abs(x - (self._x(self._end) + 3))
+        if min(ds, de) <= self.GRAB:
             # Handles stacked at the same spot: pick by which side the click is on.
             if ds == de:
                 return "start" if x < self._x(self._start) else "end"
@@ -217,9 +234,18 @@ class TimelineSlider(QSlider):
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton or not self.isEnabled():
             return
-        self._drag = self._hit(e.position().x())
+        x = e.position().x()
+        self._drag = self._hit(x)
+        # Remember how far from the handle's line the press landed, so the
+        # handle keeps that offset instead of snapping its line to the cursor.
+        if self._drag == "start":
+            self._grab_dx = x - self._x(self._start)
+        elif self._drag == "end":
+            self._grab_dx = x - self._x(self._end)
+        else:
+            self._grab_dx = 0.0
         self.setSliderDown(True)
-        self._apply(e.position().x())
+        self._apply(x)
 
     def mouseMoveEvent(self, e):
         if self._drag:
@@ -231,23 +257,42 @@ class TimelineSlider(QSlider):
     def mouseReleaseEvent(self, e):
         if self._drag:
             self._drag = None
+            self._emit_timer.stop()
+            self._flush()                 # the final position is always delivered
             self.setSliderDown(False)
 
+    def _flush(self):
+        if self._pending is None:
+            return
+        kind, value = self._pending
+        self._pending = None
+        self._last_emit = time.monotonic()
+        if kind == "start":
+            self.startChanged.emit(value)
+        elif kind == "end":
+            self.endChanged.emit(value)
+        self.scrubbed.emit(value)
+
+    def _queue_emit(self, kind, value):
+        self._pending = (kind, value)
+        if time.monotonic() - self._last_emit >= self.EMIT_MS / 1000.0:
+            self._flush()
+        elif not self._emit_timer.isActive():
+            self._emit_timer.start(self.EMIT_MS)
+
     def _apply(self, x):
-        ms = self._ms(x)
+        ms = self._ms(x - self._grab_dx)
         if self._drag == "start":
             self._start = max(0, min(ms, self._end - MIN_GAP_MS))
-            self.startChanged.emit(self._start)
             self.setValue(self._start)
-            self.scrubbed.emit(self._start)
+            self._queue_emit("start", self._start)
         elif self._drag == "end":
             self._end = min(self.maximum(), max(ms, self._start + MIN_GAP_MS))
-            self.endChanged.emit(self._end)
             self.setValue(self._end)
-            self.scrubbed.emit(self._end)
+            self._queue_emit("end", self._end)
         else:
             self.setValue(ms)
-            self.scrubbed.emit(ms)
+            self._queue_emit("scrub", ms)
         self.update()
 
     # -- paint

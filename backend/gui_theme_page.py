@@ -9,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QRect, QRectF, QSize, QPoint, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QAbstractButton, QCheckBox, QColorDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QAbstractButton, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QLabel, QLayout, QMessageBox, QPushButton, QSizePolicy, QToolButton,
     QVBoxLayout, QWidget, QWidgetItem,
 )
@@ -266,11 +266,15 @@ def _theme_from_dict(d):
         return None
     base = THEME_PRESETS["amoled_black"]
     allowed = set(base) | set(DERIVED)
-    non_color = {"radius", "radius_pill", "font", "font_mono"}
+    non_color = {"radius", "radius_pill", "font", "font_mono", "radius_sm", "radius_chip"}
 
     def clean(toks):
         out = {}
         for k, v in (toks or {}).items():
+            if k == "pad_scale":      # v5.5 layout token: density multiplier, a number
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.6 <= v <= 1.5:
+                    out[k] = float(v)
+                continue
             if k == "accent" or k not in allowed or not isinstance(v, str) or not v.strip():
                 continue
             if k in non_color or QColor(v.strip()).isValid():
@@ -364,6 +368,9 @@ class ThemePage(QWidget):
         chrome = resolve_palette(s)
         self._ring, self._label = chrome["accent"], chrome["text"]
         self._rows = {}
+        # v5.5: Simple (presets, accent, shell toggle) or Detailed (adds the
+        # shell colors, window frame and the full fine-tune grid).
+        self._detail = (s.get("theme_detail_mode") == "detailed")
 
         root = QGridLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -387,6 +394,23 @@ class ThemePage(QWidget):
         cl = QVBoxLayout(self.controls)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(14)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(0)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self.mode_simple = QPushButton("Simple")
+        self.mode_detailed = QPushButton("Detailed")
+        for _b in (self.mode_simple, self.mode_detailed):
+            _b.setCheckable(True)
+            _b.setCursor(Qt.PointingHandCursor)
+            self._mode_group.addButton(_b)
+            mode_row.addWidget(_b)
+        self.mode_simple.setChecked(not self._detail)
+        self.mode_detailed.setChecked(self._detail)
+        self.mode_detailed.toggled.connect(self._set_detail)
+        mode_row.addStretch(1)
+        cl.addLayout(mode_row)
 
         c1, l1 = _card("Preset", "Start from a look, then adjust the accent or individual "
                                  "colors below. Your tweaks stay when you switch presets.")
@@ -496,14 +520,21 @@ class ThemePage(QWidget):
             b.clicked.connect(lambda _=False, k=key: self._pick_shell(k))
             sh_flow.addWidget(b)
             self._shell_sw.append((key, b))
-        l4.addWidget(sh_host)
+        # Shell body colors and per-part colors: Detailed view only.
+        self.shell_detail = QWidget()
+        self.shell_detail.setObjectName("Plain")
+        sdl = QVBoxLayout(self.shell_detail)
+        sdl.setContentsMargins(0, 0, 0, 0)
+        sdl.setSpacing(l4.spacing())
+        sdl.addWidget(sh_host)
         for gname, items in SHELL_PART_GROUPS:
             gl = QLabel(gname.upper())
             gl.setObjectName("SectionLabel")
-            l4.addSpacing(6)
-            l4.addWidget(gl)
+            sdl.addSpacing(6)
+            sdl.addWidget(gl)
             for key, label in items:
-                l4.addLayout(self._make_shell_row(key, label))
+                sdl.addLayout(self._make_shell_row(key, label))
+        l4.addWidget(self.shell_detail)
         cl.addWidget(c4)
 
         c5, l5 = _card("Window frame", "Paints the window frame (toolbar, menus, status bar and "
@@ -514,6 +545,7 @@ class ThemePage(QWidget):
         self.frame_check.toggled.connect(self._frame_toggled)
         l5.addWidget(self.frame_check)
         l5.addLayout(self._make_row("frame", "Frame color"))
+        self.frame_card = c5
         cl.addWidget(c5)
 
         c3, l3 = _card("Fine-tune colors", None)
@@ -545,6 +577,7 @@ class ThemePage(QWidget):
             for key, label in items:
                 fb.addLayout(self._make_row(key, label))
         l3.addWidget(self.fine_body)
+        self.fine_card = c3
         cl.addWidget(c3)
 
         row = QHBoxLayout()
@@ -561,8 +594,9 @@ class ThemePage(QWidget):
         self._scan_themes()
         self._wide = None
         self._relayout(self.width() or 600)
-        self.fine_toggle.setChecked(bool(self._ov))
+        self.fine_toggle.setChecked(bool(self._ov) or self._detail)
         self._toggle_fine(self.fine_toggle.isChecked())
+        self._apply_detail()
         self._refresh()
 
     # ---- layout: preview beside the controls when wide, above when narrow ----
@@ -709,6 +743,17 @@ class ThemePage(QWidget):
         self.warn.setVisible(bool(warns))
         self.changed.emit()
 
+    # ---- Simple / Detailed (v5.5) ----
+    def _apply_detail(self):
+        for w in (self.shell_detail, self.frame_card, self.fine_card):
+            w.setVisible(self._detail)
+
+    def _set_detail(self, on):
+        self._detail = bool(on)
+        self._apply_detail()
+        if self._detail:
+            self.fine_toggle.setChecked(True)     # Detailed reveals the full grid
+
     # ---- actions ----
     def _toggle_fine(self, on):
         self.fine_body.setVisible(on)
@@ -790,7 +835,7 @@ class ThemePage(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self, "Export theme", str(self._themes_dir() / "theme.json"), "JSON (*.json)")
         if path:
-            Path(path).write_text(json.dumps(self.values(), indent=2, sort_keys=True),
+            Path(path).write_text(json.dumps(self.values(for_save=False), indent=2, sort_keys=True),
                                   encoding="utf-8")
             self._scan_themes()
 
@@ -1012,10 +1057,21 @@ class ThemePage(QWidget):
                                     + (f"; skipped {skipped} file(s) that were not valid themes."
                                        if skipped else "."))
 
-    def values(self):
-        return {"theme_preset": self._preset, "accent": self._accent,
-                "theme_tokens": dict(self._ov), "shell_enabled": self._shell_on,
+    def values(self, for_save=True):
+        # v5.5: the server merges dict settings key by key, so a color that was
+        # reset or cleared has to be sent as "" or the old override stayed in
+        # settings after Save. Exports keep only the real overrides.
+        if for_save:
+            _keys = {k for k in self._rows if k != "accent"} | set(self._ov)
+            _tokens = {k: self._ov.get(k, "") for k in sorted(_keys)}
+        else:
+            _tokens = dict(self._ov)
+        out = {"theme_preset": self._preset, "accent": self._accent,
+                "theme_tokens": _tokens, "shell_enabled": self._shell_on,
                 "shell_color": self._shell_color, "shell_backlight": self._backlight, "frame_cream": self._frame_cream,
                 # every key is sent ("" = no override) so the server's key-by-key
                 # dict merge can never leave a reset color behind
                 "shell_colors": {k: self._shell_ov.get(k, "") for k in SHELL_PART_KEYS}}
+        if for_save:
+            out["theme_detail_mode"] = "detailed" if self._detail else "simple"
+        return out

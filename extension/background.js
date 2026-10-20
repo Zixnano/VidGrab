@@ -8,6 +8,40 @@
 
 const BACKEND_BASE = "http://127.0.0.1:5757";
 
+// v4.3: extension settings (popup cog). vgsettings.js holds the defaults and
+// vgNormalize(). VGCFG is kept current by storage.onChanged; until the first
+// read lands it holds the defaults, so nothing is dropped on a cold wake.
+importScripts("vgsettings.js");
+let VGCFG = vgNormalize({});
+chrome.storage.local.get(VG_SETTINGS_KEY).then(
+  (st) => { VGCFG = vgNormalize(st[VG_SETTINGS_KEY]); },
+  () => {}
+);
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes[VG_SETTINGS_KEY]) {
+    VGCFG = vgNormalize(changes[VG_SETTINGS_KEY].newValue);
+  }
+});
+
+// v4.3: which tab is active in each window, for the "Active tab only" sniffer
+// mode. Empty until the first query lands, and snifferAllows() treats empty as
+// "allow", so a cold wake never drops a request.
+const ACTIVE_TABS = new Map();   // windowId -> active tabId
+try {
+  chrome.tabs.query({ active: true }).then((tabs) => {
+    for (const t of tabs) ACTIVE_TABS.set(t.windowId, t.id);
+  }, () => {});
+  chrome.tabs.onActivated.addListener((info) => { ACTIVE_TABS.set(info.windowId, info.tabId); });
+  chrome.windows.onRemoved.addListener((windowId) => { ACTIVE_TABS.delete(windowId); });
+} catch (e) { /* tracking unavailable: sniffer stays on all tabs */ }
+
+function snifferAllows(tabId) {
+  if (VGCFG.snifferMode !== "active") return true;
+  if (!ACTIVE_TABS.size) return true;
+  for (const id of ACTIVE_TABS.values()) if (id === tabId) return true;
+  return false;
+}
+
 const MEDIA_EXT_REGEX = /\.(mp4|m4v|mov|webm|mkv|avi|divx|flv|wmv|mpg|mpeg|ts|m2ts|mts|vob|ogv|rm|rmvb|asf|mxf|3gp|3g2|m3u8|mpd|mp3|m4a|aac|wav|flac|opus|ogg|wma|aiff|aif|alac|ape|m4b|mid|midi|amr|jpe?g|png|gif|webp|avif|heic|heif|bmp|svg|ico|tif|tiff|jxl|psd|raw|dng|cr2|nef|xcf|pdf|epub|mobi|azw3|docx?|xlsx?|pptx?|txt|md|rtf|odt|ods|odp|csv|tsv|json|xml|yaml|yml|zip|rar|7z|tar|gz|tgz|bz2|xz|lz|lzma|zst|cab|iso|img|exe|msi|dmg|deb|rpm|apk|appimage|appx|bat|cmd|sh|ps1|jar|ttf|otf|woff2?|eot)(\?|#|$)/i;
 const MEDIA_CT_REGEX = /^(video\/|audio\/|image\/|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml|pdf|zip|x-7z-compressed|x-rar-compressed|x-tar|x-gzip|x-msdownload|x-msi|vnd\.openxmlformats-officedocument|vnd\.ms-excel|vnd\.ms-powerpoint|msword|epub\+zip)|application\/octet-stream)/i;
 
@@ -218,6 +252,7 @@ function setBadge(tabId, text) {
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.tabId < 0) return;
+    if (!snifferAllows(details.tabId)) return;
     // HLS/DASH segments are noise once the tab has a manifest to download.
     if (SEGMENT_RE.test(details.url) && tabHasManifest(details.tabId)) return;
     if (MEDIA_EXT_REGEX.test(details.url)) {
@@ -230,6 +265,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return;
+    if (!snifferAllows(details.tabId)) return;
     const headers = details.responseHeaders || [];
     const ct = headers.find((h) => h.name.toLowerCase() === "content-type");
     const cl = headers.find((h) => h.name.toLowerCase() === "content-length");
@@ -502,7 +538,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const resp = await showAddDialogFor({
     url, pageUrl: (tab && tab.url) || info.pageUrl || url,
   });
-  if (!resp.ok) {
+  if (!resp.ok && VGCFG.notifyActions) {
     try {
       chrome.notifications.create("", {
         type: "basic",
@@ -521,6 +557,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 // Both read the per-tab list directly: a service worker can't message itself,
 // and this is the same data GET_VIDEOS returns.
 function commandNotify(message) {
+  if (!VGCFG.notifyActions) return;   // v4.3: Settings > Notifications
   try {
     chrome.notifications.create("", {
       type: "basic",
@@ -899,10 +936,43 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // async
   }
 
+  if (msg.type === "START_QUEUE") {
+    // v4.3: pill menu "Start Queue". The app's /queue-running route is the one
+    // deliberate writer of queue_running; token and fetch live here.
+    (async () => {
+      const alive = await checkBackend();
+      if (!alive) {
+        sendResponse({ ok: false, error: "Video Grabber app isn't running." });
+        return;
+      }
+      try {
+        const { res, unpaired } = await authedFetch("/queue-running", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ running: true }),
+        });
+        if (unpaired) {
+          sendResponse({ ok: false, error: "Not paired yet." });
+          return;
+        }
+        const data = await res.json().catch(() => ({}));
+        sendResponse({ ok: res.ok && data.ok !== false, queue_running: data.queue_running,
+                       error: data.error });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e) });
+      }
+    })();
+    return true; // async
+  }
+
   if (msg.type === "SHOW_NOTIFICATION") {
     // v4.0.2 Q1: recorder notifications via chrome.notifications — content
     // scripts can't call it directly, so recNotify() routes through here.
     // The "notifications" permission is declared in manifest.json.
+    if (!VGCFG.notifyRecording) {   // v4.3: Settings > Notifications
+      sendResponse({ ok: true, muted: true });
+      return false;
+    }
     try {
       chrome.notifications.create("", {
         type: "basic",

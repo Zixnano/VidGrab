@@ -140,10 +140,18 @@ def maybe_play_sound():
     if not STATE.get("play_sound_on_complete"):
         return
     try:
+        # v5.5: play the selected bundled/custom file (sounds.py logs every
+        # step and falls back to MessageBeep, then silence).
+        import sounds
+        sounds.play_completion_sound()
+        return
+    except Exception as e:
+        log(f"sound: completion sound failed ({e}); trying MessageBeep")
+    try:
         import winsound
         winsound.MessageBeep(winsound.MB_ICONASTERISK)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"sound: MessageBeep failed too ({e}); staying silent")
 
 
 def record_stat(nbytes):

@@ -25,8 +25,8 @@ from PySide6.QtCore import (
     QItemSelectionModel, QPropertyAnimation, QEasingCurve, QAbstractAnimation,
     QElapsedTimer, QByteArray,
 )
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QGraphicsOpacityEffect, QTextEdit
+from PySide6.QtGui import QAction, QColor, QDrag, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtWidgets import QGraphicsOpacityEffect, QTextEdit, QTextBrowser
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
     QLabel, QPushButton, QToolButton, QLineEdit, QTableView, QHeaderView,
@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QSizePolicy, QAbstractItemView, QStyledItemDelegate,
     QInputDialog, QFileDialog, QCheckBox, QSystemTrayIcon, QStyle,
     QSpinBox, QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
-    QStackedWidget, QScrollArea, QGroupBox,
+    QStackedWidget, QScrollArea, QGroupBox, QBoxLayout, QGridLayout, QSplitter,
 )
 
 BACKEND_BASE = "http://127.0.0.1:5757"
@@ -85,6 +85,15 @@ def _sync_palette(settings=None):
                            "skipped": _PAL["text_dim"]})
 
 
+def _title_bar_dark():
+    """True when the current theme is dark, so the native title bar should be."""
+    try:
+        from palette import luminance
+        return luminance(_PAL["bg_base"]) < 0.4
+    except Exception:
+        return True
+
+
 def reapply_theme():
     """Rebuild the app stylesheet from saved settings and repaint the main
     window. Called after Settings saves."""
@@ -94,12 +103,16 @@ def reapply_theme():
     app = QApplication.instance()
     if app is not None:
         app.setStyleSheet(build_qss(st))
+        f = getattr(app, "_vg_dark_filter", None)
+        if f is not None:
+            f.refresh()              # theme may have flipped light <-> dark
     w = globals().get("_window")
     if w is not None:
         w.table.viewport().update()
         w.table.horizontalHeader().viewport().update()
         w.select_category(w.current_filter)
         w.apply_shell()
+        w._apply_blanc()
 
 
 def _make_tray_icon(active: bool):
@@ -264,10 +277,16 @@ def _is_active(j):
     return j.get("status") == "downloading" or j.get("phase") == "converting"
 
 
+def _in_queue_view(j):
+    """v5.5 Queue view: what is running plus what is waiting to run."""
+    return _is_active(j) or j.get("status") in ("queued", "held")
+
+
 def _sidebar_counts(items):
     c = {
         "All": len(items),
         "Active": sum(1 for j in items if _is_active(j)),
+        "Queue": sum(1 for j in items if _in_queue_view(j)),
         "Finished": sum(1 for j in items if j.get("status") == "done"),
         "Unfinished": sum(1 for j in items if j.get("status") != "done"),
         "Failed": sum(1 for j in items if j.get("status") == "error"),
@@ -554,7 +573,7 @@ class ApiClient:
         return self._req("GET", "/queue-status") or {}
 
     def update_status(self):
-        return self._req("GET", "/update-status") or {}
+        return self._req("GET", "/update-status", timeout=20) or {}
 
     def ytdlp_update(self):
         return self._req("POST", "/ytdlp-update", timeout=10)
@@ -744,11 +763,18 @@ class DownloadModel(QAbstractTableModel):
         return ["text/uri-list"]
 
     def mimeData(self, indexes):
-        rows = sorted({i.row() for i in indexes if i.isValid()})
+        rows = sorted({i.row() for i in indexes if i.isValid() and i.row() < len(self.items)})
+        return self.mimeDataForJobs([self.items[r].get("id") for r in rows])
+
+    def mimeDataForJobs(self, ids):
+        """Drag payload for these job ids. Looked up by id at call time: the
+        table refreshes every second, so a remembered row number can point at
+        a different job by the time a drag actually starts."""
+        by_id = {j.get("id"): j for j in self.items}
         urls = []
-        for r in rows:
-            j = self.items[r]
-            if j["status"] != "done":
+        for jid in ids:
+            j = by_id.get(jid)
+            if not j or j.get("status") != "done":
                 continue
             path = _path_for(j)
             if path.exists():
@@ -758,6 +784,67 @@ class DownloadModel(QAbstractTableModel):
         mime = QMimeData()
         mime.setUrls(urls)
         return mime
+
+
+class DownloadTable(QTableView):
+    """The downloads table. Dragging finished files out is started here, not
+    by the stock Qt drag, so that:
+      (a) the row under the mouse PRESS is what gets dragged, found by job id
+          (the model refreshes every second and rows can move before Qt would
+          have started its own drag), and
+      (c) a real movement threshold applies, so a click is never a drag."""
+    DRAG_THRESHOLD = 5   # pixels
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._press_pos = None
+        self._press_id = None
+
+    def mousePressEvent(self, e):
+        self._press_pos = None
+        self._press_id = None
+        if e.button() == Qt.LeftButton:
+            idx = self.indexAt(e.position().toPoint())
+            items = getattr(self.model(), "items", [])
+            if idx.isValid() and idx.row() < len(items):
+                j = items[idx.row()]
+                if j.get("status") == "done":          # only finished files can be dragged out
+                    self._press_pos = e.position().toPoint()
+                    self._press_id = j.get("id")
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if (self._press_id is not None and self._press_pos is not None
+                and (e.buttons() & Qt.LeftButton)
+                and (e.position().toPoint() - self._press_pos).manhattanLength() >= self.DRAG_THRESHOLD):
+            pid = self._press_id
+            self._press_id = self._press_pos = None
+            self._start_file_drag(pid)
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._press_id = self._press_pos = None
+        super().mouseReleaseEvent(e)
+
+    def _start_file_drag(self, pressed_id):
+        model = self.model()
+        rows = sorted({i.row() for i in self.selectionModel().selectedIndexes()})
+        selected = [model.items[r].get("id") for r in rows if r < len(model.items)]
+        # Dragging a selected row carries the whole selection; dragging an
+        # unselected row carries just that row.
+        ids = selected if pressed_id in selected else [pressed_id]
+        mime = model.mimeDataForJobs(ids)
+        if not mime.hasUrls():
+            return
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.CopyAction)
+        try:
+            self.setState(QAbstractItemView.NoState)   # the drag swallowed the mouse release
+        except Exception:
+            pass
+        self.viewport().update()
 
 
 def _path_for(job):
@@ -921,6 +1008,8 @@ def _detail_info(j):
         "can_resume": status in ("paused", "stopped", "error"),
         "can_stop": status in ("downloading", "paused", "queued"),
         "done": status == "done",
+        "path": str(path) if path else "",
+        "path_exists": bool(status == "done" and path and path.exists()),
         "is_video": ext in VIDEO_EXT, "thumb_label": ext.lstrip(".").upper() or "FILE",
         "general": general, "progress": progress, "connections": connections,
     }
@@ -1784,6 +1873,11 @@ class PlaylistPickerDialog(QDialog):
         return (self._playlist or {}).get("title") or "playlist"
 
 
+# v5.5: ffmpeg/deno check and update workers. Parentless and kept here so
+# closing the Settings dialog mid-download can't destroy a running QThread.
+_COMPONENT_WORKERS = set()
+
+
 class _SettingsNav(QWidget):
     """Left-hand page list + stacked pages + search, in place of a QTabWidget
     (ten tabs behind scroll arrows). Exposes addTab() so the page-building
@@ -1894,6 +1988,35 @@ class SettingsDialog(QDialog):
         self.animations_enabled = QCheckBox("Enable animations")
         self.animations_enabled.setChecked(bool(s.get("animations_enabled", True)))
         gl.addRow(self.animations_enabled)
+        # v5.5: Blanc minimal mode
+        self.blanc_mode = QCheckBox("Blanc mode: hide the Activity Log, toolbar labels and status bar extras")
+        self.blanc_mode.setChecked(bool(s.get("blanc_mode", False)))
+        self.blanc_mode.setToolTip("Keeps the sidebar, table, details pane and search. Toolbar buttons "
+                                   "show icons only; the status bar keeps the connection indicator "
+                                   "and free disk space.")
+        gl.addRow(self.blanc_mode)
+        # v5.5: inline thumbnail playback in the details pane
+        self.thumb_click_mode = QComboBox()
+        self.thumb_click_mode.addItem("Click plays inline, double-click opens the external player",
+                                      userData="inline")
+        self.thumb_click_mode.addItem("Click opens the external player", userData="external")
+        _i = self.thumb_click_mode.findData(s.get("thumb_click_mode", "inline"))
+        self.thumb_click_mode.setCurrentIndex(_i if _i >= 0 else 0)
+        gl.addRow("Details thumbnail", self.thumb_click_mode)
+        self.inline_play_muted = QCheckBox("Play thumbnail previews with no audio")
+        self.inline_play_muted.setChecked(bool(s.get("inline_play_muted", False)))
+        gl.addRow(self.inline_play_muted)
+        # v5.5: global text size (scales the font sizes in the stylesheet)
+        self.text_scale = QComboBox()
+        for _pct in (85, 100, 115, 130, 150):
+            self.text_scale.addItem(f"{_pct}%" + (" (default)" if _pct == 100 else ""), userData=_pct)
+        try:
+            _cur = int(s.get("text_scale", 100) or 100)
+        except (TypeError, ValueError):
+            _cur = 100
+        _i = self.text_scale.findData(_cur)
+        self.text_scale.setCurrentIndex(_i if _i >= 0 else 1)
+        gl.addRow("Text size", self.text_scale)
         tabs.addTab(g, "General")
 
         # ---- Theme tab (gui_theme_page.py) ----
@@ -1948,6 +2071,19 @@ class SettingsDialog(QDialog):
             "Skip videos already downloaded when queueing whole playlists")
         self.ytdlp_use_archive.setChecked(bool(s.get("ytdlp_use_archive", True)))
         dl.addRow(self.ytdlp_use_archive)
+        # ---- Destinations (v5.5: the former "Save To" tab, same settings keys:
+        # output_dir and per_category_dirs, so nothing needs migrating) ----
+        dest_box = QGroupBox("Destinations")
+        stl = QFormLayout(dest_box)
+        self.output_dir = QLineEdit(s.get("output_dir", ""))
+        stl.addRow("Default folder", self.output_dir)
+        self.percat_edits = {}
+        for cat in CATEGORIES:  # single source of truth (settings.py); includes Images and Fonts
+            e = QLineEdit(s.get("per_category_dirs", {}).get(cat, ""))
+            e.setPlaceholderText("(use default folder)")
+            self.percat_edits[cat] = e
+            stl.addRow(f"{cat} folder", e)
+        dl.addRow(dest_box)
         tabs.addTab(d, "Downloads")
 
         # ---- Post-Download ----
@@ -1969,6 +2105,28 @@ class SettingsDialog(QDialog):
         for w in (self.defender_scan, self.auto_shutdown, self.auto_extract,
                   self.open_folder_on_complete, self.play_sound_on_complete):
             pl.addRow(w)
+        # v5.5: completion sound. Bundled presets or your own .wav/.mp3; the
+        # Windows beep is only the fallback when the chosen file can't play.
+        import sounds as _sounds
+        self.sound_preset = QComboBox()
+        for _pid, _label in _sounds.PRESETS.items():
+            self.sound_preset.addItem(_label, userData=_pid)
+        self.sound_preset.addItem("Custom file\u2026", userData=_sounds.CUSTOM)
+        _i = self.sound_preset.findData(s.get("completion_sound", _sounds.DEFAULT_PRESET))
+        self.sound_preset.setCurrentIndex(_i if _i >= 0 else 0)
+        pl.addRow("Completion sound", self.sound_preset)
+        self.sound_path = QLineEdit(s.get("completion_sound_path", ""))
+        self.sound_path.setReadOnly(True)
+        self.sound_path.setPlaceholderText("(no custom file chosen: .wav or .mp3)")
+        _brow = QHBoxLayout()
+        _brow.addWidget(self.sound_path, 1)
+        _pick = QPushButton("Choose custom file\u2026")
+        _pick.clicked.connect(self._choose_sound)
+        _brow.addWidget(_pick)
+        _test = QPushButton("Test Sound")
+        _test.clicked.connect(self._test_sound)
+        _brow.addWidget(_test)
+        pl.addRow("Custom file", _brow)
         tabs.addTab(p, "Post-Download")
 
         # ---- Connection ----
@@ -2039,53 +2197,90 @@ class SettingsDialog(QDialog):
         self.ytdlp_auto_update = QCheckBox("Keep yt-dlp up to date automatically")
         self.ytdlp_auto_update.setChecked(bool(s.get("ytdlp_auto_update", True)))
         upl.addRow(self.ytdlp_auto_update)
-        self.update_info = QLabel("Press Refresh to see yt-dlp and app versions.")
-        self.update_info.setWordWrap(True)
-        self.update_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        upl.addRow(self.update_info)
+        # v5.5: helper text, then the buttons, then a loading bar and the
+        # result area below them (the result used to replace the helper line).
+        self.update_help = QLabel("Press Refresh to see yt-dlp and app versions.")
+        self.update_help.setWordWrap(True)
+        self.update_help.setStyleSheet(f"color: {MUTED};")
+        upl.addRow(self.update_help)
         ub = QHBoxLayout()
+        self._update_btns = []
         for text, fn in (("Refresh", self._update_refresh),
                          ("Check yt-dlp now", self._update_ytdlp_now),
                          ("Roll back yt-dlp", self._update_ytdlp_rollback)):
             b = QPushButton(text)
             b.clicked.connect(fn)
             ub.addWidget(b)
+            self._update_btns.append(b)
         ub.addStretch(1)
         upl.addRow(ub)
+        self.update_busy = QProgressBar()
+        self.update_busy.setRange(0, 0)          # busy bar
+        self.update_busy.setTextVisible(False)
+        self.update_busy.setFixedHeight(6)
+        self.update_busy.setVisible(False)
+        upl.addRow(self.update_busy)
+        self.update_info = QLabel("Not checked yet.")
+        self.update_info.setWordWrap(True)
+        self.update_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        upl.addRow(self.update_info)
         upnote = QLabel("A new yt-dlp is downloaded in the background and applies the "
                         "next time Video Grabber starts. The app itself is never "
                         "installed without asking.")
         upnote.setWordWrap(True)
         upnote.setStyleSheet(f"color: {MUTED};")
         upl.addRow(upnote)
+        # v5.5: ffmpeg and deno as updatable components
+        self.comp_info = QLabel('Press "Check ffmpeg and deno" to see their versions.')
+        self.comp_info.setWordWrap(True)
+        self.comp_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        upl.addRow(self.comp_info)
+        cbrow = QHBoxLayout()
+        _chk = QPushButton("Check ffmpeg and deno")
+        _chk.clicked.connect(self._components_refresh)
+        cbrow.addWidget(_chk)
+        self.comp_btns = {}
+        for _cname in ("ffmpeg", "deno"):
+            _b = QPushButton(f"Update {_cname}")
+            _b.setEnabled(False)
+            _b.clicked.connect(lambda _=False, n=_cname: self._components_update(n))
+            self.comp_btns[_cname] = _b
+            cbrow.addWidget(_b)
+        cbrow.addStretch(1)
+        upl.addRow(cbrow)
+        compnote = QLabel("ffmpeg and deno are downloaded, checked, and swapped in the next "
+                          "time Video Grabber starts. Python is not updated here: the app "
+                          "bundles its own interpreter, so it only changes with a full app update.")
+        compnote.setWordWrap(True)
+        compnote.setStyleSheet(f"color: {MUTED};")
+        upl.addRow(compnote)
         tabs.addTab(up, "Updates")
-
-        # ---- Save To ----
-        st = QWidget()
-        stl = QFormLayout(st)
-        self.output_dir = QLineEdit(s.get("output_dir", ""))
-        stl.addRow("Default folder", self.output_dir)
-        self.percat_edits = {}
-        for cat in CATEGORIES:  # single source of truth (settings.py); includes Images and Fonts
-            e = QLineEdit(s.get("per_category_dirs", {}).get(cat, ""))
-            e.setPlaceholderText("(use default folder)")
-            self.percat_edits[cat] = e
-            stl.addRow(f"{cat} folder", e)
-        tabs.addTab(st, "Save To")
 
         # ---- File Types ----
         ft = QWidget()
         ftl = QFormLayout(ft)
-        ftl.addRow(QLabel("Check to DISABLE auto-capture for that type:"))
+        ftl.addRow(QLabel("Auto-capture these extensions (uncheck to disable)"))
         self.ft_checks = {}
         disabled = s.get("file_types_overrides", {})
-        for ext in ["mp4", "mkv", "webm", "mov", "avi", "mp3", "wav", "flac",
-                    "m4a", "aac", "zip", "rar", "7z", "tar", "gz", "pdf", "doc",
-                    "docx", "ppt", "pptx", "txt", "exe", "msi", "dmg"]:
+        # v5.5: a multi-column grid; a checked box means "capture this type".
+        # The stored value is unchanged: an override of False disables a type.
+        _ft_host = QWidget()
+        _ft_grid = QGridLayout(_ft_host)
+        _ft_grid.setContentsMargins(0, 0, 0, 0)
+        _ft_grid.setHorizontalSpacing(18)
+        _ft_grid.setVerticalSpacing(6)
+        for _n, ext in enumerate(
+                ["mp4", "mkv", "webm", "mov", "avi", "flv", "ts", "m4v",
+                 "mp3", "wav", "flac", "m4a", "aac", "opus", "ogg",
+                 "webp", "svg",
+                 "zip", "rar", "7z", "tar", "gz", "tar.gz", "iso",
+                 "pdf", "doc", "docx", "ppt", "pptx", "txt", "epub", "mobi",
+                 "exe", "msi", "dmg"]):
             cb = QCheckBox(f".{ext}")
-            cb.setChecked(disabled.get(ext) is False)
+            cb.setChecked(disabled.get(ext) is not False)
             self.ft_checks[ext] = cb
-            ftl.addRow(cb)
+            _ft_grid.addWidget(cb, _n // 4, _n % 4)
+        ftl.addRow(_ft_host)
         tabs.addTab(ft, "File Types")
 
         # ---- Engines (Session 9 wires this up) ----
@@ -2125,6 +2320,12 @@ class SettingsDialog(QDialog):
         # ---- Rules: per-site category + engine ----
         ru = QWidget()
         rul = QVBoxLayout(ru)
+        # v5.5: say what rules are for
+        _rsub = QLabel("Override engine or category per domain. Add a rule, then pick a category "
+                       "and an engine for that site; \"auto\" lets the app decide.")
+        _rsub.setWordWrap(True)
+        _rsub.setStyleSheet(f"color: {MUTED};")
+        rul.addWidget(_rsub)
         self.rules_table = QTableWidget(0, 3)
         self.rules_table.setHorizontalHeaderLabels(["Domain", "Category", "Engine"])
         self.rules_table.horizontalHeader().setStretchLastSection(True)
@@ -2136,6 +2337,8 @@ class SettingsDialog(QDialog):
             self._add_rule_row(rule.get("domain", ""),
                                rule.get("category", "Other"),
                                engines.get(rule.get("domain", ""), "auto"))
+        if not self.rules_table.rowCount():
+            self._add_rule_example()
         rul.addWidget(self.rules_table)
         btns = QHBoxLayout()
         add_btn = QPushButton("Add rule")
@@ -2184,18 +2387,44 @@ class SettingsDialog(QDialog):
             lines.append(f"yt-dlp update error: {yt['error']}")
         lines.append(f"App update available: {app['available']}" if app.get("available")
                      else f"App: v{DISPLAY_VERSION} (no update found)")
+        if app.get("error"):
+            lines.append(f"App update check error: {app['error']}")
+        lines.append(f"Checked at {time.strftime('%H:%M:%S')}")
         return "\n".join(lines)
 
+    def _set_update_busy(self, busy):
+        self.update_busy.setVisible(busy)
+        for b in self._update_btns:
+            b.setEnabled(not busy)
+
     def _run_update_job(self, fn, on_done=None):
+        prev = getattr(self, "_update_worker", None)
+        if prev is not None and prev.isRunning():
+            return      # one request at a time: a second click can't replace a running worker
+        self._set_update_busy(True)
         w = _ApiFetchWorker(fn, self)
-        w.result.connect(lambda d: (self.update_info.setText(
-            on_done(d) if on_done else self._fmt_update_status(d))), Qt.QueuedConnection)
-        w.failed.connect(lambda: self.update_info.setText(
-            "Couldn't reach the app backend."), Qt.QueuedConnection)
+
+        def ok(d):
+            self._set_update_busy(False)
+            self.update_info.setStyleSheet("")
+            try:
+                self.update_info.setText(on_done(d) if on_done else self._fmt_update_status(d))
+            except Exception as e:      # never leave the label stuck on "Checking..."
+                self.update_info.setStyleSheet(f"color: {DANGER};")
+                self.update_info.setText(f"Couldn't read the update status: {e}")
+
+        def bad(msg):
+            self._set_update_busy(False)
+            self.update_info.setStyleSheet(f"color: {DANGER};")
+            self.update_info.setText("Couldn't reach the app backend" + (f" ({msg})." if msg else "."))
+
+        w.result.connect(ok, Qt.QueuedConnection)
+        w.error.connect(bad, Qt.QueuedConnection)
         self._update_worker = w
         w.start()
 
     def _update_refresh(self):
+        self.update_info.setStyleSheet("")
         self.update_info.setText("Checking\u2026")
         self._run_update_job(self.api.update_status)
 
@@ -2212,6 +2441,84 @@ class SettingsDialog(QDialog):
         self._run_update_job(self.api.ytdlp_rollback, lambda d: (
             "Override removed. The bundled yt-dlp is used after restart."
             if (d or {}).get("removed") else "Nothing to roll back; already on the bundled version."))
+
+    # --- completion sound (v5.5) ------------------------------------------
+    def _choose_sound(self):
+        start = self.sound_path.text().strip() or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a completion sound", start,
+                                              "Sound files (*.wav *.mp3)")
+        if path:
+            self.sound_path.setText(path)
+            self.sound_preset.setCurrentIndex(self.sound_preset.findData("custom"))
+
+    def _test_sound(self):
+        import sounds as _sounds
+        ok = _sounds.play_completion_sound(self.sound_preset.currentData(),
+                                           self.sound_path.text().strip(), why="test")
+        if not ok:
+            QMessageBox.information(
+                self, "Test Sound",
+                "That sound couldn't be played, so the Windows beep was used instead "
+                "(it is silent if your Windows sound scheme is set to No Sounds). "
+                "The log says why.")
+
+    # --- ffmpeg / deno updates (v5.5) -------------------------------------
+    @staticmethod
+    def _fmt_components(d):
+        d = d or {}
+        if d.get("_error"):
+            return f"Couldn't check ffmpeg and deno: {d['_error']}"
+        if d.get("frozen_only"):
+            return "ffmpeg and deno can only be updated from the installed app, not from a source run."
+        lines = []
+        for name in ("ffmpeg", "deno"):
+            c = d.get(name) or {}
+            line = f"{name}: running {c.get('installed') or 'not found'}"
+            if c.get("error"):
+                line += f" (latest check failed: {c['error']})"
+            elif c.get("pending"):
+                line += f". {c['pending']} is downloaded and applies on next start."
+            elif c.get("update_available"):
+                line += f". Latest: {c['latest']} (update available)"
+            elif c.get("latest"):
+                line += f". Latest: {c['latest']} (up to date)"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _components_run(self, fn, on_result):
+        def run():
+            try:
+                return fn()
+            except Exception as e:
+                return {"_error": str(e), "ok": False, "message": str(e)}
+        w = _ApiFetchWorker(run)          # no parent: an update can outlive this dialog
+        _COMPONENT_WORKERS.add(w)
+        w.result.connect(on_result, Qt.QueuedConnection)
+        w.finished.connect(lambda w=w: _COMPONENT_WORKERS.discard(w))
+        w.start()
+
+    def _components_refresh(self):
+        import component_updater
+        self.comp_info.setText("Checking\u2026")
+        for b in self.comp_btns.values():
+            b.setEnabled(False)
+        self._components_run(component_updater.status, self._on_components_status)
+
+    def _on_components_status(self, d):
+        self.comp_info.setText(self._fmt_components(d))
+        for name, b in self.comp_btns.items():
+            b.setEnabled(bool(((d or {}).get(name) or {}).get("update_available")))
+
+    def _components_update(self, name):
+        import component_updater
+        self.comp_info.setText(f"Downloading and checking {name}\u2026 this can take a minute. "
+                               "You can keep using the app.")
+        for b in self.comp_btns.values():
+            b.setEnabled(False)
+        self._components_run(lambda: component_updater.update(name), self._on_components_updated)
+
+    def _on_components_updated(self, d):
+        self.comp_info.setText((d or {}).get("message") or "Update finished.")
 
     ENGINES = ("auto", "yt-dlp", "streamlink")
 
@@ -2251,7 +2558,30 @@ class SettingsDialog(QDialog):
         log("engine update check: " + "; ".join(lines))
         QMessageBox.information(self, "Engine versions", "\n".join(lines))
 
+    # v5.5: a greyed example row so an empty table still shows what a rule
+    # looks like. It carries a marker, is never saved, and goes away as soon
+    # as a real rule is added.
+    def _add_rule_example(self):
+        row = self.rules_table.rowCount()
+        self.rules_table.insertRow(row)
+        for col, text in enumerate(("example.com", "Video", "yt-dlp")):
+            it = QTableWidgetItem(text)
+            it.setFlags(Qt.NoItemFlags)
+            it.setForeground(QColor(MUTED))
+            f = it.font(); f.setItalic(True); it.setFont(f)
+            if col == 0:
+                it.setData(Qt.UserRole, "example")
+                it.setToolTip("Example only. Press Add rule to make your own.")
+            self.rules_table.setItem(row, col, it)
+
+    def _drop_rule_example(self):
+        for r in range(self.rules_table.rowCount() - 1, -1, -1):
+            it = self.rules_table.item(r, 0)
+            if it is not None and it.data(Qt.UserRole) == "example":
+                self.rules_table.removeRow(r)
+
     def _add_rule_row(self, domain, category, engine):
+        self._drop_rule_example()
         row = self.rules_table.rowCount()
         self.rules_table.insertRow(row)
         self.rules_table.setItem(row, 0, QTableWidgetItem(domain))
@@ -2267,6 +2597,8 @@ class SettingsDialog(QDialog):
                       reverse=True)
         for r in rows:
             self.rules_table.removeRow(r)
+        if not self.rules_table.rowCount():
+            self._add_rule_example()
 
     def _save(self):
         try:
@@ -2322,8 +2654,15 @@ class SettingsDialog(QDialog):
             # Send every known extension explicitly so unchecked boxes
             # reliably re-enable a type (server merges dicts key-by-key).
             self.api.save_setting("file_types_overrides",
-                                  {ext: not cb.isChecked()
+                                  {ext: cb.isChecked()    # v5.5: checked = capture
                                    for ext, cb in self.ft_checks.items()})
+            # --- v5.5 ---
+            self.api.save_setting("completion_sound", self.sound_preset.currentData() or "chime")
+            self.api.save_setting("completion_sound_path", self.sound_path.text().strip())
+            self.api.save_setting("blanc_mode", self.blanc_mode.isChecked())
+            self.api.save_setting("inline_play_muted", self.inline_play_muted.isChecked())
+            self.api.save_setting("thumb_click_mode", self.thumb_click_mode.currentData() or "inline")
+            self.api.save_setting("text_scale", int(self.text_scale.currentData() or 100))
             # --- v4 (Session 6) ---
             tv = self.theme_page.values()
             self.api.save_setting("accent", tv["accent"])
@@ -2334,6 +2673,7 @@ class SettingsDialog(QDialog):
             self.api.save_setting("shell_backlight", tv["shell_backlight"])
             self.api.save_setting("shell_colors", tv["shell_colors"])
             self.api.save_setting("frame_cream", tv["frame_cream"])
+            self.api.save_setting("theme_detail_mode", tv.get("theme_detail_mode", "simple"))
             # rebuild the stylesheet and repaint so the theme lands live
             reapply_theme()
             self.api.save_setting("animations_enabled",
@@ -2346,6 +2686,8 @@ class SettingsDialog(QDialog):
             rules, engines = [], {}
             for row in range(self.rules_table.rowCount()):
                 dom = self.rules_table.item(row, 0)
+                if dom is not None and dom.data(Qt.UserRole) == "example":
+                    continue      # the greyed example row is not a rule
                 dom = dom.text().strip() if dom else ""
                 if not dom:
                     continue
@@ -2482,20 +2824,44 @@ class BandwidthProfilesDialog(QDialog):
 class Sidebar(QFrame):
     category_selected = Signal(str)
     tool_clicked = Signal(str)   # "settings" | "help" | "about"
+    collapsed_changed = Signal(bool)   # v5.5: the user pressed the collapse button
+
+    WIDTH_FULL, WIDTH_COLLAPSED = 200, 56
+    # v5.5: glyph shown for each entry while the sidebar is collapsed.
+    ICONS = {"All": "\u2630", "Active": "\u2193", "Queue": "\u2261", "Finished": "\u2713",
+             "Unfinished": "\u25d4", "Failed": "\u26a0", "Video": "\u25b6", "Music": "\u266a",
+             "Images": "\u25a3", "Compressed": "\u25a5", "Documents": "\u25a4",
+             "Programs": "\u2699", "Fonts": "Aa", "Other": "\u2022"}
+    TOOL_ICONS = {"settings": "\u2699", "help": "?", "about": "i"}
 
     def __init__(self):
         super().__init__()
         self.setObjectName("Sidebar")
-        self.setFixedWidth(200)
+        self.setFixedWidth(self.WIDTH_FULL)
+        self._collapsed = False
+        self._counts = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 16, 14, 14)
         layout.setSpacing(4)
+        self._layout = layout
+        head = QHBoxLayout()
+        head.setSpacing(4)
         brand = QLabel("↓  VIDEO GRABBER")
         brand.setObjectName("Brand")
-        layout.addWidget(brand)
+        head.addWidget(brand, 1)
+        self._brand = brand
+        self.collapse_btn = QToolButton()
+        self.collapse_btn.setObjectName("SidebarTool")
+        self.collapse_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.collapse_btn.setCursor(Qt.PointingHandCursor)
+        self.collapse_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.collapse_btn.clicked.connect(
+            lambda _=False: self.set_collapsed(not self._collapsed, user=True))
+        head.addWidget(self.collapse_btn)
+        layout.addLayout(head)
         layout.addSpacing(14)
         self.buttons = {}
-        for name in ["All", "Active", "Finished", "Unfinished", "Failed"]:
+        for name in ["All", "Active", "Queue", "Finished", "Unfinished", "Failed"]:
             self._add_nav(layout, name)
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -2504,16 +2870,21 @@ class Sidebar(QFrame):
         label = QLabel("CATEGORIES")
         label.setObjectName("SectionLabel")
         layout.addWidget(label)
+        self._cat_label = label
         for name in CATEGORIES:
             self._add_nav(layout, name)
         layout.addStretch()
         tools_label = QLabel("TOOLS")
         tools_label.setObjectName("SectionLabel")
         layout.addWidget(tools_label)
+        self._tools_label = tools_label
         tools = QHBoxLayout()
         tools.setSpacing(2)
-        for key, text, tip in (("settings", "Settings", "Open Settings"),
-                               ("help", "Help", "Tips and shortcuts"),
+        self._tools = tools
+        self._tool_btns = []     # (button, full text, collapsed glyph)
+        # v5.5: Settings is no longer here; it lives on the toolbar cog (and in
+        # File > Settings...). Help and About stay.
+        for key, text, tip in (("help", "Help", "Tips and shortcuts"),
                                ("about", "About", "About Video Grabber")):
             b = QToolButton()
             b.setObjectName("SidebarTool")
@@ -2524,7 +2895,9 @@ class Sidebar(QFrame):
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             b.clicked.connect(lambda _=False, k=key: self.tool_clicked.emit(k))
             tools.addWidget(b)
+            self._tool_btns.append((b, text, self.TOOL_ICONS.get(key, text[:1])))
         layout.addLayout(tools)
+        self.set_collapsed(False)
 
     def _add_nav(self, layout, name):
         btn = QToolButton()
@@ -2537,13 +2910,52 @@ class Sidebar(QFrame):
         layout.addWidget(btn)
         self.buttons[name] = btn
 
+    def _refresh_btn(self, name):
+        """Text, tooltip and style of one nav button for the current mode.
+        Called every refresh tick, so it only touches what changed."""
+        btn = self.buttons[name]
+        n = self._counts.get(name, 0)
+        label = f"{name}  ({n})" if n else name
+        if self._collapsed:
+            text, tip = self.ICONS.get(name, name[:1]), label
+            css = "QToolButton { text-align: center; padding: 0; }"
+        else:
+            text, tip, css = label, "", ""
+        if btn.text() != text:
+            btn.setText(text)
+        if btn.toolTip() != tip:
+            btn.setToolTip(tip)
+        if btn.styleSheet() != css:
+            btn.setStyleSheet(css)
+
+    def set_collapsed(self, flag, user=False):
+        """Icons-only (True) or full width (False). `user` marks a press of
+        the collapse button, which is what gets saved."""
+        flag = bool(flag)
+        changed = flag != self._collapsed
+        self._collapsed = flag
+        self.setFixedWidth(self.WIDTH_COLLAPSED if flag else self.WIDTH_FULL)
+        side = 6 if flag else 14
+        self._layout.setContentsMargins(side, 16, side, 14)
+        self._brand.setVisible(not flag)
+        self._cat_label.setVisible(not flag)
+        self._tools_label.setVisible(not flag)
+        self.collapse_btn.setText("\u00bb" if flag else "\u00ab")
+        self.collapse_btn.setToolTip("Expand the sidebar" if flag else "Collapse the sidebar to icons")
+        self._tools.setDirection(QBoxLayout.TopToBottom if flag else QBoxLayout.LeftToRight)
+        for b, text, icon in self._tool_btns:
+            b.setText(icon if flag else text)
+        for name in self.buttons:
+            self._refresh_btn(name)
+        if changed and user:
+            self.collapsed_changed.emit(flag)
+
     def set_counts(self, counts):
         """Show a count next to each entry that has any rows."""
-        for name, btn in self.buttons.items():
-            n = counts.get(name, 0)
-            text = f"{name}  ({n})" if n else name
-            if btn.text() != text:
-                btn.setText(text)
+        self._counts = counts
+        for name in self.buttons:
+            self._refresh_btn(name)
+
 
 def _fade_widget(widget, enabled, duration=150):
     """Fade `widget` in over `duration` ms, OutCubic (Session 12.1). No-op
@@ -2591,6 +3003,7 @@ class _ApiFetchWorker(QThread):
     cleanly."""
     result = Signal(object)
     failed = Signal()
+    error = Signal(str)      # v5.5: why it failed (emitted just before `failed`)
 
     def __init__(self, fn, parent=None):
         super().__init__(parent)
@@ -2599,8 +3012,311 @@ class _ApiFetchWorker(QThread):
     def run(self):
         try:
             self.result.emit(self._fn())
-        except Exception:
+        except Exception as e:
+            self.error.emit(str(e)[:200])
             self.failed.emit()
+
+
+# ---------------------------------------------------------------------------
+# v5.5 Batch 3: Help, Pair Extension and What's New dialogs
+# ---------------------------------------------------------------------------
+def _md_to_html(md):
+    """Small markdown subset (headers, bullets, bold, code, links) for the
+    What's New dialog. Everything is HTML-escaped first."""
+    import html as _html
+
+    def inline(t):
+        t = _html.escape(t)
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+        t = re.sub(r"`(.+?)`", r"<code>\1</code>", t)
+        t = re.sub(r"\[(.+?)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', t)
+        return t
+
+    out, in_ul = [], False
+    for raw in str(md or "").splitlines():
+        line = raw.rstrip()
+        m = re.match(r"^\s*[-*+]\s+(.*)", line)
+        if m:
+            if not in_ul:
+                out.append("<ul>")
+                in_ul = True
+            out.append(f"<li>{inline(m.group(1))}</li>")
+            continue
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
+        if not line.strip():
+            continue
+        h = re.match(r"^(#{1,6})\s*(.*)", line)
+        if h:
+            out.append(f"<h{3 if len(h.group(1)) <= 2 else 4}>{inline(h.group(2))}</h{3 if len(h.group(1)) <= 2 else 4}>")
+        else:
+            out.append(f"<p>{inline(line)}</p>")
+    if in_ul:
+        out.append("</ul>")
+    return "".join(out)
+
+
+def _release_header(p):
+    """'rev 59 — v5.5.0' style header for a /changelog payload."""
+    tag = str(p.get("tag") or "")
+    name = str(p.get("name") or "")
+    rev = re.fullmatch(r"[vV]?(\d+)", tag.strip())
+    ver = re.search(r"\bv?(\d+\.\d+\.\d+)\b", name + " " + tag)
+    if rev and ver:
+        return f"rev {rev.group(1)} \u2014 v{ver.group(1)}"
+    if rev:
+        return f"rev {rev.group(1)}" + (f" \u2014 {name}" if name and name != tag else "")
+    return name or tag or "Latest release"
+
+
+class WhatsNewDialog(QDialog):
+    """Latest release notes from the app's /changelog route, formatted."""
+
+    def __init__(self, parent, api):
+        super().__init__(parent)
+        self.setWindowTitle("What's New")
+        self.resize(560, 520)
+        lay = QVBoxLayout(self)
+        self.status = QLabel("Loading release notes\u2026")
+        lay.addWidget(self.status)
+        self.busy = QProgressBar()
+        self.busy.setRange(0, 0)
+        self.busy.setTextVisible(False)
+        self.busy.setFixedHeight(6)
+        lay.addWidget(self.busy)
+        self.view = QTextBrowser()
+        self.view.setOpenExternalLinks(True)
+        lay.addWidget(self.view, 1)
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+        # Parentless worker kept in the registry: closing the dialog while the
+        # request is still running must not destroy a running QThread.
+        w = _ApiFetchWorker(api.changelog)
+        _COMPONENT_WORKERS.add(w)
+        w.result.connect(self._show, Qt.QueuedConnection)
+        w.error.connect(self._fail, Qt.QueuedConnection)
+        w.finished.connect(lambda w=w: _COMPONENT_WORKERS.discard(w))
+        w.start()
+
+    def _show(self, payload):
+        self.busy.setVisible(False)
+        payload = payload or {}
+        if not payload.get("ok"):
+            self._fail(str(payload.get("error") or "no data"))
+            return
+        head = _release_header(payload)
+        date = str(payload.get("published_at") or "")[:10]
+        self.status.setText(head + (f"   ({date})" if date else ""))
+        body = _md_to_html(payload.get("body"))
+        self.view.setHtml(f"<h3>{head}</h3>" + (body or "<p>This release has no notes.</p>"))
+
+    def _fail(self, msg):
+        self.busy.setVisible(False)
+        self.status.setStyleSheet(f"color: {DANGER};")
+        self.status.setText(f"Couldn't load the release notes ({msg}). Check your connection and try again.")
+
+
+class PairDialog(QDialog):
+    """Step-by-step pairing for the browser extension. Same token as
+    Settings > Pairing, which stays as the secondary entry."""
+
+    def __init__(self, parent, token):
+        super().__init__(parent)
+        self.setWindowTitle("Pair Extension")
+        self.resize(480, 360)
+        lay = QVBoxLayout(self)
+        intro = QLabel(
+            "<h3 style='margin-bottom:2px;'>Pair the browser extension</h3>"
+            "<p>Pairing is usually automatic: with this app running, open the extension "
+            "popup and it should show as connected.</p>"
+            "<p>If it can't reach the app, pair it by hand:</p>"
+            "<ol>"
+            "<li>Copy the token below.</li>"
+            "<li>In your browser, right-click the Video Grabber icon and choose "
+            "<b>Options</b>.</li>"
+            "<li>Paste the token, press <b>Save</b>, then <b>Test connection</b>.</li>"
+            "</ol>")
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        lay.addWidget(intro)
+        row = QHBoxLayout()
+        self.token_edit = QLineEdit(token or "")
+        self.token_edit.setReadOnly(True)
+        row.addWidget(self.token_edit, 1)
+        copy = QPushButton("Copy token")
+        copy.setObjectName("primary")
+        copy.clicked.connect(self._copy)
+        row.addWidget(copy)
+        lay.addLayout(row)
+        self.note = QLabel("")
+        self.note.setStyleSheet(f"color: {SUCCESS};")
+        lay.addWidget(self.note)
+        lay.addStretch(1)
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self.token_edit.text())
+        self.note.setText("Token copied to the clipboard.")
+
+
+def _help_pages():
+    """(section title, HTML) for the Help dialog."""
+    dim = f"color:{MUTED};"
+    return [
+        ("Capabilities", f"""
+<h3>What Video Grabber does</h3>
+<p>It downloads videos, audio, images, documents, archives and other files, from the browser
+extension or from links you add with the + button.</p>
+<ul>
+<li><b>Three engines.</b> yt-dlp handles most sites, including YouTube and HLS/DASH streams.
+Streamlink handles live streams such as Twitch. A built-in segmented downloader fetches direct
+files in parallel pieces. The app picks one per link, and Settings &gt; Rules can override it per site.</li>
+<li><b>Queue.</b> Downloads run in order. The toolbar pauses or resumes the whole queue,
+Alt+Up / Alt+Down reorder queued items, and the Queue entry in the sidebar shows only what is
+running or waiting. Tools &gt; Downloads &gt; Bandwidth profiles manages bandwidth profiles.</li>
+<li><b>Categories.</b> Files are sorted into Video, Music, Images, Compressed, Documents,
+Programs, Fonts and Other. Settings &gt; Downloads &gt; Destinations sets the folders.</li>
+<li><b>After a download.</b> Right-click a row to open it, move it to another category, convert
+it (mp4, mkv, mp3, wav, m4a, flac, opus), reorder it or delete it. Settings &gt; Post-Download
+covers the completion sound and what happens when a download finishes.</li>
+<li><b>Media Toolkit.</b> Compress, trim, or turn a clip into a GIF.</li>
+<li><b>Look and feel.</b> Themes, text size, Blanc minimal mode, a collapsible sidebar and an
+optional handheld shell.</li>
+<li><b>Updates.</b> yt-dlp updates itself in the background. The app asks before it installs an
+update. ffmpeg and deno update from Settings &gt; Updates.</li>
+</ul>
+<p>Basics: click a row to see its details below, double-click a finished file to open it, and
+drag finished files out into other apps.</p>"""),
+        ("FAQ", f"""
+<h3>Common questions</h3>
+<p><b>Why did my download fail?</b><br>Click the failed row: the details pane shows the reason.
+Usual causes are an expired link (send it again from the page), a site that needs your login
+(send it through the extension so your browser cookies go with it), or an engine that needs an
+update. Try Tools &gt; Downloads &gt; Retry all failed, then Tools &gt; Updates &gt; Check for
+updates. If a new yt-dlp broke a site that worked before, use Tools &gt; Updates &gt; Roll back
+yt-dlp.</p>
+<p><b>Why is a download "held"?</b><br>YouTube sometimes asks to confirm you're not a bot, and the
+app waits before trying again. Switch network or VPN and press Resume to skip the wait.</p>
+<p><b>Why is the pill not showing?</b><br>Open the extension popup, press the cog, and check that
+<i>Show the pill on videos</i> is on and the site isn't in the hidden list. The pill sits on video
+elements; if a page plays video another way, use the popup's list of detected media or
+<b>Grab all</b>. Reload the page after changing a setting.</p>
+<p><b>The extension says the app is unreachable.</b><br>Start Video Grabber. If it is running, use
+Tools &gt; Pairing &gt; Pair Extension and follow the steps.</p>
+<p><b>Where do my files go?</b><br>Settings &gt; Downloads &gt; Destinations: a default folder
+plus an optional folder per category.</p>
+<p><b>Why did a file land in Other?</b><br>The category follows the file type. Add a rule in
+Settings &gt; Rules to send a site's downloads to a category.</p>
+<p><b>Why no sound when a download finishes?</b><br>In Settings &gt; Post-Download turn the
+completion sound on, pick a sound and press Test Sound. If the test falls back to the Windows
+beep and you hear nothing, your Windows sound scheme may be set to No Sounds.</p>
+<p><b>I sent the same link twice.</b><br>A link that is already queued or downloading is not
+added again.</p>"""),
+        ("Troubleshooting", f"""
+<h3>When something goes wrong</h3>
+<p><b>Logs.</b> Tools &gt; Downloads &gt; Open logs folder. Settings, the job list and the logs live
+in the VideoGrabber folder inside your Downloads folder. Attach the newest log when you report
+a problem.</p>
+<p><b>Repair and retry.</b></p>
+<ul>
+<li>Tools &gt; Downloads &gt; Retry all failed requeues every failed download.</li>
+<li>Right-click a download to download it again from scratch.</li>
+<li>Tools &gt; Updates &gt; Roll back yt-dlp returns to the yt-dlp that shipped with the app.</li>
+<li>Recordings made by the extension are repaired with ffmpeg automatically.</li>
+<li>Tools &gt; Pairing &gt; Pair Extension fixes an extension that lost its connection.</li>
+<li>Tools &gt; Media &gt; Trim UI memory frees memory if the window feels sluggish.</li>
+</ul>
+<p><b>Updates.</b> Settings &gt; Updates shows the yt-dlp and app versions (press Refresh) and
+checks ffmpeg and deno. Downloaded updates apply the next time the app starts.</p>
+<p style="{dim}">Nothing here changes your downloaded files.</p>"""),
+        ("Extension guide", f"""
+<h3>The browser extension</h3>
+<p><b>The pill.</b> A small button appears over videos. Click it to open the menu: pick a quality
+(the app remembers your pick per site), extract audio, record, or choose <b>Start Queue</b>. On some
+sites the pill sends the video in one click instead. Drag the pill to move it, double-click it to
+reset its position, and right-click it to snap it to a corner, start the queue or hide it on the
+current site. Hovering an image can show a small pill too.</p>
+<p><b>The popup.</b> Click the toolbar icon. <b>Current Page</b> lists the media the extension
+detected; <b>Other Pages</b> lists other tabs. Tick items and press <b>Download</b>. <b>Grab all</b>
+scans the page for every media file and link. The <b>&hellip;</b> menu holds Merge, Copy, Toggle,
+Sort, Filter, Clear and Search. The cog opens the extension settings (pill, sniffer,
+notifications).</p>
+<p><b>Shortcuts.</b> Ctrl+Shift+D downloads the largest media detected on the page. Ctrl+Shift+A
+opens the add dialog.</p>
+<p><b>Options page.</b> Holds the pairing token, an option to send the browser's own downloads to
+Video Grabber (off by default) and a switch for in-page downloads on claude.ai.</p>
+<p><b>Pairing.</b> Usually automatic. If not, see Tools &gt; Pairing &gt; Pair Extension.</p>"""),
+        ("Shell guide", f"""
+<h3>The handheld shell</h3>
+<p>An optional console body around the window. Turn it on in Settings &gt; Theme (Handheld
+shell), or flip it from anywhere with Ctrl+Shift+S. It works best with a window of about
+900 by 640.</p>
+<ul>
+<li><b>D-pad up / down</b> moves the selection; <b>left / right</b> changes the filter.</li>
+<li><b>A</b> resumes and <b>B</b> pauses the selected download.</li>
+<li><b>START</b> pauses or resumes the whole queue. <b>SELECT</b> jumps to search.</li>
+<li>The <b>power light</b> switches the backlight.</li>
+</ul>
+<p>Colors, backlight and the window frame are in Settings &gt; Theme (Detailed view).</p>"""),
+        ("Toolkit guide", f"""
+<h3>Media Toolkit</h3>
+<p>Open it from Tools &gt; Media &gt; Media Toolkit. Preview a video, pick a range on the
+timeline with the two draggable handles, then use one of the tabs:</p>
+<ul>
+<li><b>Compress</b> re-encodes the video smaller, optionally only the selected range.</li>
+<li><b>Trim</b> cuts the Start to End range. <i>Exact Cut</i> re-encodes for a frame-accurate
+cut.</li>
+<li><b>Make GIF</b> turns the range into a GIF (Web Optimized 480p or High Quality 1080p).</li>
+</ul>
+<p>Results land next to the original and never overwrite it (<i>name</i>_compressed.mp4,
+<i>name</i>_trimmed, <i>name</i>_clip.gif; a "(2)" is added if the name is taken).</p>
+<p><b>Keys:</b> Space play/pause, I set start, O set end, comma and period step one frame.</p>"""),
+    ]
+
+
+class HelpDialog(QDialog):
+    """Help with sections: capabilities, FAQ, troubleshooting and guides."""
+
+    def __init__(self, parent, pair_fn=None, whats_new_fn=None):
+        super().__init__(parent)
+        self.setWindowTitle("Help")
+        self.resize(780, 540)
+        root = QVBoxLayout(self)
+        body = QHBoxLayout()
+        self.nav = QListWidget()
+        self.nav.setObjectName("SettingsNav")
+        self.nav.setFixedWidth(170)
+        self.stack = QStackedWidget()
+        for title, html in _help_pages():
+            self.nav.addItem(title)
+            view = QTextBrowser()
+            view.setOpenExternalLinks(True)
+            view.setHtml(html)
+            self.stack.addWidget(view)
+        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.setCurrentRow(0)
+        body.addWidget(self.nav)
+        body.addWidget(self.stack, 1)
+        root.addLayout(body, 1)
+        row = QHBoxLayout()
+        if pair_fn:
+            pair = QPushButton("Pair Extension\u2026")
+            pair.setObjectName("primary")
+            pair.clicked.connect(pair_fn)
+            row.addWidget(pair)
+        if whats_new_fn:
+            wn = QPushButton("What's New\u2026")
+            wn.clicked.connect(whats_new_fn)
+            row.addWidget(wn)
+        row.addStretch(1)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        root.addLayout(row)
 
 
 class UpdateDialog(QDialog):
@@ -2670,6 +3386,7 @@ class MainWindow(QMainWindow):
         self._logs_worker = None
         self._diskspace_worker = None
         self._queue_worker = None
+        self._pref_workers = set()   # v5.5: short save-setting calls (sidebar collapse)
         self._update_tag = ""
         self._batch = {"seeded": False, "busy": False, "done": 0, "failed": 0,
                        "known_done": set(), "known_err": set()}
@@ -2940,7 +3657,7 @@ class MainWindow(QMainWindow):
         # hangs the app.
         self._save_header_state()
         for w in (self._refresh_worker, self._logs_worker, self._diskspace_worker,
-                  self._queue_worker):
+                  self._queue_worker, *list(self._pref_workers), *list(_COMPONENT_WORKERS)):
             if w is not None:
                 w.wait(2000)
         if self._tray:
@@ -3000,13 +3717,15 @@ class MainWindow(QMainWindow):
         self.sidebar = Sidebar()
         self.sidebar.category_selected.connect(self.select_category)
         self.sidebar.tool_clicked.connect(self._on_tool)
+        self.sidebar.collapsed_changed.connect(self._on_sidebar_collapsed)
+        self.sidebar.set_collapsed(bool(load_settings().get("sidebar_collapsed", False)))
         bl.addWidget(self.sidebar)
         content = QWidget()
         content.setObjectName("Content")
         cl = QVBoxLayout(content)
         cl.setContentsMargins(12, 12, 12, 10)
         cl.setSpacing(8)
-        self.table = QTableView()
+        self.table = DownloadTable()
         self.table.setModel(self.model)
         self.table.setItemDelegate(ProgressDelegate(self.table))
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -3033,10 +3752,17 @@ class MainWindow(QMainWindow):
         hh.sectionResized.connect(lambda *_: self._hdr_timer.start(800))
         hh.sectionMoved.connect(lambda *_: self._hdr_timer.start(800))
         self.table.setShowGrid(False)
-        self.table.setDragEnabled(True)
         self.table.setDragDropMode(QAbstractItemView.DragOnly)
+        self.table.setDragEnabled(False)   # file drags are started by DownloadTable itself
         self.table.doubleClicked.connect(self._on_double_click)
-        cl.addWidget(self.table, 1)
+        # Batch 4 #2: table and details panel share a vertical splitter, so the
+        # divider between them can be dragged (the height is remembered).
+        self.split = QSplitter(Qt.Vertical)
+        self.split.setChildrenCollapsible(False)
+        self.split.setHandleWidth(8)
+        self.table.setMinimumHeight(120)
+        self.split.addWidget(self.table)
+        cl.addWidget(self.split, 1)
         self.empty_label = QLabel("", self.table.viewport())
         self.empty_label.setObjectName("EmptyState")
         self.empty_label.setAlignment(Qt.AlignCenter)
@@ -3050,7 +3776,6 @@ class MainWindow(QMainWindow):
         self.details.setWordWrap(True)
         self.details.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.details.setVisible(False)
-        cl.addWidget(self.details)
         self._log_lines = []
         self._thumb_req = None
         self.detail_pane = DetailPane(tabs_open=bool(_read_gui_state().get("detail_tabs_open", False)))
@@ -3064,7 +3789,24 @@ class MainWindow(QMainWindow):
         self.detail_pane.tabs_toggled.connect(lambda on: _write_gui_state({"detail_tabs_open": bool(on)}))
         self._thumbs = ThumbLoader(HOME / "thumbs", self)
         self._thumbs.ready.connect(self._on_thumb_ready, Qt.QueuedConnection)
-        cl.addWidget(self.detail_pane)
+        # The details label (several rows selected) and the detail pane share
+        # the splitter's bottom half; it is hidden while neither is showing.
+        self._bottom = QWidget()
+        self._bottom.setObjectName("Plain")
+        _bl = QVBoxLayout(self._bottom)
+        _bl.setContentsMargins(0, 0, 0, 0)
+        _bl.setSpacing(8)
+        _bl.addWidget(self.details)
+        _bl.addWidget(self.detail_pane, 1)
+        self.split.addWidget(self._bottom)
+        self.split.setStretchFactor(0, 1)
+        self.split.setStretchFactor(1, 0)
+        self._bottom.setVisible(False)
+        self._bottom_shown = False
+        self._split_timer = QTimer(self)
+        self._split_timer.setSingleShot(True)
+        self._split_timer.timeout.connect(self._save_split)
+        self.split.splitterMoved.connect(lambda *_: self._split_timer.start(600))
         self.table.selectionModel().selectionChanged.connect(lambda *_: self._update_details())
         from PySide6.QtGui import QShortcut, QKeySequence
         for seq, act in (("Alt+Up", "up"), ("Alt+Down", "down")):
@@ -3073,6 +3815,7 @@ class MainWindow(QMainWindow):
             sc.activated.connect(lambda a=act: self._reorder_selected(a))
         log_label = QLabel("ACTIVITY LOG")
         log_label.setObjectName("SectionLabel")
+        self._log_label = log_label
         cl.addWidget(log_label)
         self.log = QLineEdit()
         self.log.setReadOnly(True)
@@ -3102,8 +3845,10 @@ class MainWindow(QMainWindow):
         self.update_btn.clicked.connect(self._on_update_badge)
         status.addPermanentWidget(self.update_btn)
         status.addPermanentWidget(self.diskspace_label)
-        status.addPermanentWidget(QLabel(f"v{DISPLAY_VERSION} · PySide6 · Flask API"))
+        self.version_label = QLabel(f"v{DISPLAY_VERSION} · PySide6 · Flask API")
+        status.addPermanentWidget(self.version_label)
         self.setStatusBar(status)
+        self._apply_blanc()
         menu = self.menuBar()
         menu.setNativeMenuBar(False)
         f = menu.addMenu("File")
@@ -3115,21 +3860,27 @@ class MainWindow(QMainWindow):
         f.addSeparator()
         a = QAction("Exit", self); a.triggered.connect(self._real_quit); f.addAction(a)
         t = menu.addMenu("Tools")
-        a = QAction("Check for updates…", self); a.triggered.connect(self.check_for_updates); t.addAction(a)
-        t.addSeparator()
-        a = QAction("Copy pairing token", self); a.triggered.connect(self.copy_token); t.addAction(a)
-        a = QAction("Reload token", self); a.triggered.connect(self.reload_token); t.addAction(a)
-        a = QAction("Bandwidth profiles…", self); a.triggered.connect(self.open_bandwidth_profiles); t.addAction(a)
-        t.addSeparator()
-        a = QAction("Retry all failed", self); a.triggered.connect(self.retry_all_failed); t.addAction(a)
-        a = QAction("Clear failed downloads", self); a.triggered.connect(self.clear_failed); t.addAction(a)
-        a = QAction("Open logs folder", self); a.triggered.connect(self._open_logs_folder); t.addAction(a)
-        t.addSeparator()
-        a = QAction("Media Toolkit\u2026", self); a.triggered.connect(lambda: self.open_toolkit()); t.addAction(a)
-        a = QAction("Toggle handheld shell", self); a.setShortcut("Ctrl+Shift+S"); a.triggered.connect(self.toggle_shell); t.addAction(a)
-        a = QAction("Trim UI memory", self); a.triggered.connect(lambda: self.trim_ui_memory()); t.addAction(a)
-        t.addSeparator()
-        a = QAction("About Video Grabber…", self); a.triggered.connect(self.show_about); t.addAction(a)
+        # v5.5: grouped into submenus. Every action keeps its handler, and the
+        # Toggle handheld shell action keeps its Ctrl+Shift+S shortcut.
+        tm = t.addMenu("Updates")
+        a = QAction("Check for updates…", self); a.triggered.connect(self.check_for_updates); tm.addAction(a)
+        a = QAction("Roll back yt-dlp…", self); a.triggered.connect(self.rollback_ytdlp); tm.addAction(a)
+        tm = t.addMenu("Pairing")
+        a = QAction("Pair Extension\u2026", self); a.triggered.connect(self.show_pair_dialog); tm.addAction(a)
+        a = QAction("Copy pairing token", self); a.triggered.connect(self.copy_token); tm.addAction(a)
+        a = QAction("Reload token", self); a.triggered.connect(self.reload_token); tm.addAction(a)
+        tm = t.addMenu("Downloads")
+        a = QAction("Bandwidth profiles…", self); a.triggered.connect(self.open_bandwidth_profiles); tm.addAction(a)
+        a = QAction("Retry all failed", self); a.triggered.connect(self.retry_all_failed); tm.addAction(a)
+        a = QAction("Clear failed downloads", self); a.triggered.connect(self.clear_failed); tm.addAction(a)
+        a = QAction("Open logs folder", self); a.triggered.connect(self._open_logs_folder); tm.addAction(a)
+        tm = t.addMenu("Media")
+        a = QAction("Media Toolkit\u2026", self); a.triggered.connect(lambda: self.open_toolkit()); tm.addAction(a)
+        a = QAction("Trim UI memory", self); a.triggered.connect(lambda: self.trim_ui_memory()); tm.addAction(a)
+        tm = t.addMenu("App")
+        a = QAction("Toggle handheld shell", self); a.setShortcut("Ctrl+Shift+S"); a.triggered.connect(self.toggle_shell); tm.addAction(a)
+        a = QAction("What's New\u2026", self); a.triggered.connect(self.show_whats_new); tm.addAction(a)
+        a = QAction("About Video Grabber…", self); a.triggered.connect(self.show_about); tm.addAction(a)
 
     def _apply_styles(self):
         # All styling now comes from gui_style.build_qss (app-wide), so the
@@ -3139,6 +3890,7 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- v5 ---
     _EMPTY_TEXT = {
         "Active": "Nothing is downloading right now.",
+        "Queue": "Nothing is active or queued.",
         "Failed": "No failed downloads.",
         "Finished": "Nothing has finished yet.",
         "Unfinished": "No unfinished downloads.",
@@ -3208,24 +3960,45 @@ class MainWindow(QMainWindow):
                 md = event.mimeData()
                 if md.hasUrls():
                     if event.type() == event.Type.Drop:
+                        self._set_drop_cue(False)
                         self.dropEvent(event)
                     else:
+                        self._set_drop_cue(True)
                         event.acceptProposedAction()
                     return True
+            elif obj is self.table.viewport() and event.type() == event.Type.DragLeave:
+                self._set_drop_cue(False)
         except Exception:
             pass
         return super().eventFilter(obj, event)
 
     # ---- drag and drop: local media -> Media Toolkit, links -> download queue
+    def _set_drop_cue(self, on):
+        """Batch 4 #5b: outline the table while a link or file is dragged over
+        it (QSS: QTableView[dropActive="true"])."""
+        on = bool(on)
+        if bool(self.table.property("dropActive")) == on:
+            return
+        self.table.setProperty("dropActive", on)
+        self.table.style().unpolish(self.table)
+        self.table.style().polish(self.table)
+        self.table.update()
+
     def dragEnterEvent(self, event):
         md = event.mimeData()
         if md.hasUrls() or md.hasText():
+            self._set_drop_cue(True)
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
         self.dragEnterEvent(event)
 
+    def dragLeaveEvent(self, event):
+        self._set_drop_cue(False)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event):
+        self._set_drop_cue(False)
         from gui_toolkit import is_media_file
         md = event.mimeData()
         files, links = [], []
@@ -3261,9 +4034,21 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Not a media file: {Path(files[0]).name}", 5000)
 
+    def _apply_blanc(self):
+        """Blanc minimal mode (Settings > General). Hides the Activity Log,
+        the toolbar text labels (icons stay) and the status-bar extras (hold
+        notice and version text); the connection indicator and disk space
+        stay. The sidebar, detail pane, table and search are never touched,
+        so this can't fight sidebar collapse or the Queue view."""
+        on = bool(load_settings().get("blanc_mode", False))
+        self._blanc = on
+        for w in (self._log_label, self.log, self.hold_label, self.version_label):
+            w.setVisible(not on)
+        self._apply_toolbar_text()
+
     def _apply_toolbar_text(self):
         extra = 262 if getattr(self, "shell", None) else 0   # the shell eats width
-        compact = (self.width() - extra) < 1240
+        compact = getattr(self, "_blanc", False) or (self.width() - extra) < 1240
         for btn, icon, label in getattr(self, "_tb", []):
             btn.setText(icon if compact else f"{icon}  {label}")
             btn.setToolTip(label)
@@ -3293,7 +4078,36 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _sync_bottom(self):
+        """Show the splitter's bottom half only while the details label or the
+        detail pane is showing; restore the saved divider position when it
+        first appears."""
+        show = (self.details.isVisibleTo(self._bottom)
+                or self.detail_pane.isVisibleTo(self._bottom))
+        self._bottom.setVisible(show)
+        if show and not self._bottom_shown:
+            self._bottom_shown = True
+            QTimer.singleShot(0, self._restore_split)
+        elif not show:
+            self._bottom_shown = False
+
+    def _restore_split(self):
+        h = int(_read_gui_state().get("detail_height", 0) or 0)
+        total = self.split.height()
+        if h > 0 and total > 0:
+            h = max(self._bottom.minimumSizeHint().height(), min(h, total - 120))
+            self.split.setSizes([total - h, h])
+
+    def _save_split(self):
+        sizes = self.split.sizes()
+        if self._bottom.isVisible() and len(sizes) == 2 and sizes[1] > 0:
+            _write_gui_state({"detail_height": int(sizes[1])})
+
     def _update_details(self):
+        self._update_details_inner()
+        self._sync_bottom()
+
+    def _update_details_inner(self):
         """Panel under the table: the detail pane for one selected row, a
         one-line count for several."""
         try:
@@ -3335,21 +4149,48 @@ class MainWindow(QMainWindow):
         if len(rows) == 1:
             QApplication.clipboard().setText(str(rows[0].get("url") or ""))
 
+    def rollback_ytdlp(self):
+        """Tools > Updates > Roll back yt-dlp (same action as Settings > Updates)."""
+        if QMessageBox.question(self, "Roll back yt-dlp",
+                                "Go back to the yt-dlp version that shipped with the app? "
+                                "This applies the next time Video Grabber starts.",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        w = _ApiFetchWorker(self.api.ytdlp_rollback, self)
+        w.result.connect(lambda d: QMessageBox.information(
+            self, "Roll back yt-dlp",
+            "Override removed. The bundled yt-dlp is used after restart."
+            if (d or {}).get("removed") else
+            "Nothing to roll back; already on the bundled version."), Qt.QueuedConnection)
+        w.failed.connect(lambda: QMessageBox.warning(
+            self, "Roll back yt-dlp", "Couldn't reach the app backend."), Qt.QueuedConnection)
+        self._rb_worker = w
+        w.start()
+
+    def _save_pref(self, key, value):
+        """Persist one setting through the backend without blocking the UI."""
+        w = _ApiFetchWorker(lambda: self.api.save_setting(key, value), self)
+        self._pref_workers.add(w)
+        w.finished.connect(lambda w=w: self._pref_workers.discard(w))
+        w.start()
+
+    def _on_sidebar_collapsed(self, flag):
+        self._save_pref("sidebar_collapsed", bool(flag))
+
     def _on_tool(self, key):
         {"settings": self.open_settings, "help": self.show_help, "about": self.show_about}[key]()
 
     def show_help(self):
-        QMessageBox.information(
-            self, "Help",
-            "<h3 style='margin-bottom:2px;'>Video Grabber</h3>"
-            "<p><b>Downloads</b><br>Click a row to see its details below. Double-click a "
-            "finished file to open it. Right-click a row for the full menu, and drag finished "
-            "files out into other apps. Alt+Up / Alt+Down reorder queued downloads.</p>"
-            "<p><b>Browser extension</b><br>Tools &gt; Copy pairing token, then paste it on the "
-            "extension's Options page.</p>"
-            "<p><b>Handheld shell</b><br>D-pad up/down moves the selection and left/right changes "
-            "the filter. A resumes and B pauses the selected download. START pauses or resumes "
-            "the whole queue. SELECT jumps to search. The power light switches the backlight.</p>")
+        # v5.5: sectioned Help dialog (capabilities, FAQ, troubleshooting, guides).
+        HelpDialog(self, pair_fn=self.show_pair_dialog, whats_new_fn=self.show_whats_new).exec()
+
+    def show_pair_dialog(self):
+        """Pair Extension: Help dialog button and Tools > Pairing."""
+        PairDialog(self, getattr(self.api, "token", "")).exec()
+
+    def show_whats_new(self):
+        """What's New: Help dialog button and Tools > App."""
+        WhatsNewDialog(self, self.api).exec()
 
     def refresh_queue_status(self):
         if self._queue_worker is not None:
@@ -3598,6 +4439,8 @@ class MainWindow(QMainWindow):
         # within ~1s; nothing is cached from startup.
         self._gui_settings = settings
         self.animations_enabled = bool(settings.get("animations_enabled", True))
+        self.detail_pane.set_play_prefs(bool(settings.get("inline_play_muted", False)),
+                                        settings.get("thumb_click_mode", "inline"))
         delegate = self.table.itemDelegate()
         if delegate is not None:
             delegate.animations_enabled = self.animations_enabled
@@ -3946,6 +4789,8 @@ class MainWindow(QMainWindow):
                                and (x.get("failed_ts") or x.get("created_ts") or 0) < cutoff)]
         if f == "Active":
             src = [x for x in src if _is_active(x)]
+        elif f == "Queue":
+            src = [x for x in src if _in_queue_view(x)]
         elif f == "Failed":
             src = [x for x in src if x["status"] == "error"]
         elif f == "Finished":
@@ -4458,6 +5303,10 @@ def launch_gui(new_job_hook=None, home_dir=None, show_dialog_hook=None):
     _app.setApplicationName("Video Grabber")
     _app.setFont(QFont("Segoe UI", 10))
     _app.setQuitOnLastWindowClosed(False)
+    # Batch 4 #4: dark native title bars on the main window and every dialog.
+    from gui_shell import DarkTitleBarFilter
+    _app._vg_dark_filter = DarkTitleBarFilter(_title_bar_dark, _app)
+    _app.installEventFilter(_app._vg_dark_filter)
     _window = MainWindow()
     _window.show()
     if new_job_hook is not None:

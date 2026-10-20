@@ -156,6 +156,14 @@ def download():
     if not url:
         return jsonify({"error": "missing url"}), 400
     dup = _find_duplicate(url)
+    # v5.5 duplicate guard: the exact same URL already queued or downloading is
+    # not queued a second time (HLS pills sent the same stream twice). The
+    # existing job's id is returned with 200, so callers treat it as success.
+    for _j in list(JOBS.values()):
+        if _j.get("url") == url and _j.get("status") in ("queued", "downloading"):
+            log(f"download: {url} is already {_j['status']} as job {_j['id']}; not queuing a duplicate")
+            return jsonify({"job_id": _j["id"], "duplicate_of": _j["id"],
+                            "already_queued": True, "status": _j["status"]})
     jid = new_job(
         url, filename=data.get("filename"), category=data.get("category"),
         referer=data.get("referer"), cookie=data.get("cookie"),
@@ -437,12 +445,35 @@ def delete_job_and_file(job_id):
                                      "refusing to delete it. The job was kept."}), 403
         if safe not in targets:
             targets.append(safe)
+    # v5.5 safe deletion: another job can point at the same file (duplicate or
+    # HLS rows). A shared file is never removed from disk; only this job goes.
+    _shared = set()
+    for _oid, _other in list(JOBS.items()):
+        if _oid == job_id:
+            continue
+        _oc = []
+        if _other.get("dest"):
+            _oc.append(Path(_other["dest"]))
+        try:
+            _oc.append(_dest_for(_other))
+        except Exception:
+            pass
+        for _c in _oc:
+            try:
+                _shared.add(Path(_c).resolve())
+            except (OSError, ValueError):
+                pass
+    _kept = [t for t in targets if t in _shared]
+    if _kept:
+        log(f"delete-file: job {job_id} shares {[str(t) for t in _kept]} with another job; "
+            "keeping the file on disk and removing only the job")
+        targets = [t for t in targets if t not in _shared]
     job["stop_evt"].set()
     try:
         _inside = _safe_in_roots(_dest_for(job)) is not None
     except Exception:
         _inside = False
-    if _inside:
+    if _inside and not _kept:
         cleanup_partial_files(job)   # .part leftovers, only when dest is inside the root
     removed = []
     for t in targets:
@@ -456,7 +487,7 @@ def delete_job_and_file(job_id):
     JOBS.pop(job_id, None)
     save_jobs_snapshot()
     log(f"deleted job {job_id} and file(s): {removed or 'none on disk'}")
-    return jsonify({"ok": True, "removed": removed})
+    return jsonify({"ok": True, "removed": removed, "kept_shared": [str(t) for t in _kept]})
 
 
 # ---- Open folder: popup "done" link on Recent downloads -------------------
