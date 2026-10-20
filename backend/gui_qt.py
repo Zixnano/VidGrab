@@ -23,7 +23,7 @@ import requests
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, Qt, QTimer, QThread, Signal, QMimeData, QUrl,
     QItemSelectionModel, QPropertyAnimation, QEasingCurve, QAbstractAnimation,
-    QElapsedTimer, QByteArray,
+    QElapsedTimer, QByteArray, QRect, QPoint,
 )
 from PySide6.QtGui import QAction, QColor, QDrag, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QTextEdit, QTextBrowser
@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QFileDialog, QCheckBox, QSystemTrayIcon, QStyle,
     QSpinBox, QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
     QStackedWidget, QScrollArea, QGroupBox, QBoxLayout, QGridLayout, QSplitter,
+    QRubberBand,
 )
 
 BACKEND_BASE = "http://127.0.0.1:5757"
@@ -787,30 +788,94 @@ class DownloadModel(QAbstractTableModel):
 
 
 class DownloadTable(QTableView):
-    """The downloads table. Dragging finished files out is started here, not
-    by the stock Qt drag, so that:
-      (a) the row under the mouse PRESS is what gets dragged, found by job id
-          (the model refreshes every second and rows can move before Qt would
-          have started its own drag), and
-      (c) a real movement threshold applies, so a click is never a drag."""
+    """The downloads table, with Windows-Explorer style mouse behaviour:
+      * Press + drag on an UNSELECTED row, or on empty space, never starts a
+        file drag. It selects (rows between press and cursor) and draws a
+        rubber-band box.
+      * A file drag starts only when the press lands on an ALREADY-SELECTED
+        finished row and the mouse then moves past a threshold.
+      * Pressing an already-selected row keeps the whole selection until the
+        button is released (so a multi-row selection can be dragged out);
+        a plain click without a drag then collapses it to that row.
+    The dragged row is found by job id at press time, because the model
+    refreshes every second and rows can move before Qt would start a drag."""
     DRAG_THRESHOLD = 5   # pixels
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._press_pos = None
-        self._press_id = None
+        self._press_pos = None      # press position, only set when a drag may start
+        self._press_id = None       # job id under the press, only set when a drag may start
+        self._deferred_idx = None   # selected row pressed without modifiers; collapse on release
+        self._rb_origin = None      # rubber-band start, in content (scroll-independent) coords
+        self._rb_last = None        # last mouse position in viewport coords
+        self._rubber = None         # QRubberBand, created lazily
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.DragOnly)
+        self.setDragEnabled(False)  # file drags are started by this class, not stock Qt
 
+    # ---- rubber band -------------------------------------------------
+    def _scroll_offset(self):
+        return self.horizontalScrollBar().value(), self.verticalScrollBar().value()
+
+    def _band_begin(self, pos):
+        ox, oy = self._scroll_offset()
+        self._rb_origin = (pos.x() + ox, pos.y() + oy)
+        self._rb_last = pos
+
+    def _band_update(self):
+        if self._rb_origin is None or self._rb_last is None:
+            return
+        ox, oy = self._scroll_offset()
+        a = self._rb_origin
+        start = QPoint(a[0] - ox, a[1] - oy)
+        rect = QRect(start, self._rb_last).normalized()
+        if rect.width() < self.DRAG_THRESHOLD and rect.height() < self.DRAG_THRESHOLD:
+            return   # still just a click
+        if self._rubber is None:
+            self._rubber = QRubberBand(QRubberBand.Rectangle, self.viewport())
+        self._rubber.setGeometry(rect.intersected(self.viewport().rect()))
+        self._rubber.show()
+
+    def _band_end(self):
+        self._rb_origin = self._rb_last = None
+        if self._rubber is not None:
+            self._rubber.hide()
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        self._band_update()   # keep the box anchored while autoscrolling
+
+    # ---- mouse -------------------------------------------------------
     def mousePressEvent(self, e):
         self._press_pos = None
         self._press_id = None
-        if e.button() == Qt.LeftButton:
-            idx = self.indexAt(e.position().toPoint())
-            items = getattr(self.model(), "items", [])
-            if idx.isValid() and idx.row() < len(items):
-                j = items[idx.row()]
-                if j.get("status") == "done":          # only finished files can be dragged out
-                    self._press_pos = e.position().toPoint()
-                    self._press_id = j.get("id")
+        self._deferred_idx = None
+        self._band_end()
+        if e.button() != Qt.LeftButton:
+            super().mousePressEvent(e)       # right-click etc.: standard handling (context menu)
+            return
+        pos = e.position().toPoint()
+        idx = self.indexAt(pos)
+        mods = e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
+        items = getattr(self.model(), "items", [])
+        on_selected = (idx.isValid() and not mods
+                       and self.selectionModel().isRowSelected(idx.row(), idx.parent()))
+        if on_selected and idx.row() < len(items):
+            # Possible drag. Leave the selection alone for now so a multi-row
+            # selection survives until we know whether this is a drag or a click.
+            self._deferred_idx = idx
+            self.setFocus(Qt.MouseFocusReason)
+            self.selectionModel().setCurrentIndex(idx, QItemSelectionModel.NoUpdate)
+            j = items[idx.row()]
+            if j.get("status") == "done":    # only finished files can be dragged out
+                self._press_pos = pos
+                self._press_id = j.get("id")
+            e.accept()
+            return
+        # Unselected row, empty space, or Ctrl/Shift: standard selection and
+        # rubber band. No drag intent.
+        self._band_begin(pos)
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
@@ -819,24 +884,40 @@ class DownloadTable(QTableView):
                 and (e.position().toPoint() - self._press_pos).manhattanLength() >= self.DRAG_THRESHOLD):
             pid = self._press_id
             self._press_id = self._press_pos = None
+            self._deferred_idx = None        # it is a drag, keep the selection as is
             self._start_file_drag(pid)
             return
         super().mouseMoveEvent(e)
+        if self._rb_origin is not None and (e.buttons() & Qt.LeftButton):
+            self._rb_last = e.position().toPoint()
+            self._band_update()
 
     def mouseReleaseEvent(self, e):
+        deferred = self._deferred_idx
         self._press_id = self._press_pos = None
+        self._deferred_idx = None
+        self._band_end()
+        if deferred is not None and e.button() == Qt.LeftButton:
+            # Plain click on an already-selected row: collapse to just that row.
+            if deferred.isValid():
+                self.selectionModel().select(
+                    deferred,
+                    QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+            e.accept()
+            return
         super().mouseReleaseEvent(e)
 
     def _start_file_drag(self, pressed_id):
         model = self.model()
         rows = sorted({i.row() for i in self.selectionModel().selectedIndexes()})
         selected = [model.items[r].get("id") for r in rows if r < len(model.items)]
-        # Dragging a selected row carries the whole selection; dragging an
-        # unselected row carries just that row.
+        # Press only starts on a selected row, so this carries the whole selection.
         ids = selected if pressed_id in selected else [pressed_id]
         mime = model.mimeDataForJobs(ids)
         if not mime.hasUrls():
             return
+        # Windows drop fix: Explorer/Discord want plain text alongside the URLs.
+        mime.setText("\n".join(u.toLocalFile() for u in mime.urls()))
         drag = QDrag(self)
         drag.setMimeData(mime)
         drag.exec(Qt.CopyAction)
@@ -844,6 +925,7 @@ class DownloadTable(QTableView):
             self.setState(QAbstractItemView.NoState)   # the drag swallowed the mouse release
         except Exception:
             pass
+        self._band_end()
         self.viewport().update()
 
 
