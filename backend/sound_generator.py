@@ -32,6 +32,7 @@ from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -75,6 +76,19 @@ TEMP_PATH = Path(os.environ.get("TEMP", BASE_DIR)) / "temp_preview.wav"
 # Synthesis helpers
 # ---------------------------------------------------------------------------
 
+def _wave_sample(waveform: str, phase: float) -> float:
+    """One oscillator sample for `waveform` at `phase` radians (Batch 4)."""
+    if waveform == "square":
+        return 1.0 if math.sin(phase) > 0 else -1.0
+    if waveform == "sawtooth":
+        return 2.0 * ((phase / (2 * math.pi)) % 1.0) - 1.0
+    if waveform == "triangle":
+        return 2.0 * abs(2.0 * ((phase / (2 * math.pi)) % 1.0) - 1.0) - 1.0
+    if waveform == "noise":
+        return random.uniform(-1.0, 1.0)
+    return math.sin(phase)  # "sine" (and any unknown name) stays a sine
+
+
 def _add_tone(
     buffer: list[float],
     start_seconds: float,
@@ -84,6 +98,7 @@ def _add_tone(
     decay: float = 6.0,
     overtones: tuple[tuple[float, float], ...] = ((1.0, 1.0),),
     sweep_to: float | None = None,
+    waveform: str = "sine",
 ) -> None:
     """Mix one tone into ``buffer`` (a list of float samples).
 
@@ -98,7 +113,9 @@ def _add_tone(
         overtones: (frequency_multiplier, relative_amplitude) pairs.
                    (1.0, 1.0) is a pure sine; extra pairs add harmonics.
         sweep_to:  If given, glide the frequency to this value over the
-                   tone's duration (used for the "Pop" blip).
+                   tone's duration (used by the laser / thump sweeps).
+        waveform:  Oscillator shape for this tone (Batch 4): "sine",
+                   "square", "sawtooth", "triangle" or "noise".
     """
     start = int(start_seconds * SAMPLE_RATE)
     length = int(duration_seconds * SAMPLE_RATE)
@@ -132,52 +149,106 @@ def _add_tone(
         # Sum the fundamental and any overtones.
         sample = 0.0
         for multiplier, relative_amp in overtones:
-            sample += relative_amp * math.sin(phase * multiplier)
+            sample += relative_amp * _wave_sample(waveform, phase * multiplier)
 
         buffer[index] += amplitude * envelope * sample
 
 
-def _render_style(style: str) -> list[float]:
-    """Render one of the four styles into a float sample buffer."""
-    if style == "Arpeggio":
-        # 3 quick rising notes: root, major third (+4 semitones), fifth (+7).
+PROFILES = ("Random", "Retro 8-Bit", "16-Bit Console", "Modern UI",
+            "Sci-Fi / Laser", "Chime / Marimba", "Noise / Impact")
+_CONCRETE_PROFILES = PROFILES[1:]
+
+
+def _render_style(profile: str) -> tuple[list[float], int]:
+    """Render one Batch 4 profile into a float sample buffer.
+
+    Returns (buffer, num_layers) -- num_layers is the number of
+    _add_tone layers mixed into the buffer, which the UI reports next
+    to the profile name.
+    """
+    if profile == "Retro 8-Bit":
+        # 3 square-wave notes stepping up: root, major third (+4
+        # semitones), fifth (+7) -- the classic 8-bit arpeggio.
         buffer = [0.0] * int(0.55 * SAMPLE_RATE)
         base = random.choice([523.25, 587.33, 659.25])  # C5 / D5 / E5
         for step, semitones in enumerate((0, 4, 7)):
             freq = base * (2.0 ** (semitones / 12.0))
             _add_tone(buffer, start_seconds=step * 0.09, duration_seconds=0.22,
-                      frequency=freq, amplitude=0.8, decay=7.0)
+                      frequency=freq, amplitude=0.7, decay=8.0,
+                      waveform="square")
+        return buffer, 3
 
-    elif style == "Bell":
-        # 1 note, long decay. Inharmonic partials (1, 2.76, 5.4) are what
-        # make a sine stack sound like a bell rather than an organ.
+    if profile == "16-Bit Console":
+        # Sawtooth lead, a triangle harmony a fifth up (+7 semitones),
+        # and a soft triangle root an octave down -- a 16-bit chord stab.
+        buffer = [0.0] * int(0.80 * SAMPLE_RATE)
+        base = random.choice([392.00, 440.00, 523.25])  # G4 / A4 / C5
+        _add_tone(buffer, start_seconds=0.0, duration_seconds=0.50,
+                  frequency=base, amplitude=0.65, decay=5.0,
+                  waveform="sawtooth")
+        _add_tone(buffer, start_seconds=0.0, duration_seconds=0.50,
+                  frequency=base * (2.0 ** (7 / 12.0)), amplitude=0.5,
+                  decay=5.0, waveform="triangle")
+        _add_tone(buffer, start_seconds=0.02, duration_seconds=0.60,
+                  frequency=base / 2.0, amplitude=0.55, decay=4.0,
+                  waveform="triangle")
+        return buffer, 3
+
+    if profile == "Modern UI":
+        # 1-2 short triangle blips, the second (when present) a fourth
+        # up (+5 semitones) -- clean, soft UI confirmation chirps.
+        buffer = [0.0] * int(0.40 * SAMPLE_RATE)
+        base = random.choice([880.00, 1046.50])  # A5 / C6
+        layers = random.choice([1, 2])
+        _add_tone(buffer, start_seconds=0.0, duration_seconds=0.12,
+                  frequency=base, amplitude=0.8, decay=11.0,
+                  waveform="triangle")
+        if layers == 2:
+            _add_tone(buffer, start_seconds=0.08, duration_seconds=0.16,
+                      frequency=base * (2.0 ** (5 / 12.0)), amplitude=0.8,
+                      decay=10.0, waveform="triangle")
+        return buffer, layers
+
+    if profile == "Sci-Fi / Laser":
+        # Sawtooth pitch sweep diving down, with a short noise burst
+        # layered over it for the zap's edge.
+        buffer = [0.0] * int(0.60 * SAMPLE_RATE)
+        _add_tone(buffer, start_seconds=0.0, duration_seconds=0.45,
+                  frequency=random.uniform(1200.0, 1600.0), sweep_to=110.0,
+                  amplitude=0.75, decay=3.5, waveform="sawtooth")
+        _add_tone(buffer, start_seconds=0.05, duration_seconds=0.18,
+                  frequency=2000.0, amplitude=0.35, decay=16.0,
+                  waveform="noise")
+        return buffer, 2
+
+    if profile == "Chime / Marimba":
+        # Sine base plus two higher sine overtone layers, each decaying
+        # faster than the one below it -- a struck-bar chime.
         buffer = [0.0] * int(1.20 * SAMPLE_RATE)
         base = random.choice([659.25, 783.99, 880.00, 1046.50])
         _add_tone(buffer, start_seconds=0.0, duration_seconds=1.20,
-                  frequency=base, amplitude=1.0, decay=4.0,
-                  overtones=((1.0, 1.0), (2.76, 0.45), (5.40, 0.18)))
+                  frequency=base, amplitude=1.0, decay=4.0, waveform="sine")
+        _add_tone(buffer, start_seconds=0.0, duration_seconds=0.80,
+                  frequency=base * 2.0, amplitude=0.40, decay=6.5,
+                  waveform="sine")
+        _add_tone(buffer, start_seconds=0.0, duration_seconds=0.50,
+                  frequency=base * 2.76, amplitude=0.18, decay=9.0,
+                  waveform="sine")
+        return buffer, 3
 
-    elif style == "Pop":
-        # 1 very short, low-frequency blip with a downward pitch sweep --
-        # the sweep is what gives it that "bloop" character.
-        buffer = [0.0] * int(0.14 * SAMPLE_RATE)
-        _add_tone(buffer, start_seconds=0.0, duration_seconds=0.10,
-                  frequency=random.uniform(280.0, 360.0), sweep_to=90.0,
-                  amplitude=1.0, decay=10.0)
+    if profile == "Noise / Impact":
+        # Deep sine thump gliding down, plus a white-noise burst --
+        # a soft impact / thud.
+        buffer = [0.0] * int(0.50 * SAMPLE_RATE)
+        _add_tone(buffer, start_seconds=0.0, duration_seconds=0.35,
+                  frequency=110.0, sweep_to=48.0, amplitude=1.0, decay=5.0,
+                  waveform="sine")
+        _add_tone(buffer, start_seconds=0.0, duration_seconds=0.22,
+                  frequency=1500.0, amplitude=0.45, decay=14.0,
+                  waveform="noise")
+        return buffer, 2
 
-    elif style == "Double Beep":
-        # 2 quick identical notes, clean sine with a hint of 2nd harmonic.
-        buffer = [0.0] * int(0.42 * SAMPLE_RATE)
-        freq = random.choice([880.00, 987.77, 1046.50])
-        for step in range(2):
-            _add_tone(buffer, start_seconds=step * 0.17, duration_seconds=0.11,
-                      frequency=freq, amplitude=0.85, decay=1.5,
-                      overtones=((1.0, 1.0), (2.0, 0.12)))
-
-    else:  # pragma: no cover - styles are only chosen from the list below
-        raise ValueError(f"Unknown style: {style}")
-
-    return buffer
+    raise ValueError(f"Unknown profile: {profile}")
 
 
 def _normalise(buffer: list[float]) -> None:
@@ -202,27 +273,33 @@ def _write_wav(path: Path, buffer: list[float]) -> None:
         wav.writeframes(frames)
 
 
-def generate_sound(output_path: str | Path) -> tuple[Path, str]:
-    """Synthesise a random notification sound and write it as a .wav.
+def generate_sound(
+    output_path: str | Path, profile: str = "Random",
+) -> tuple[Path, str, int]:
+    """Synthesise a notification sound for `profile` and write a .wav.
 
-    Randomly picks one of: "Arpeggio", "Bell", "Pop", "Double Beep".
+    `profile` is one of PROFILES (see the generator window's combo);
+    "Random" (or an unknown name) picks a concrete profile at random.
     A 4 ms attack is applied to every note and the result is normalised.
 
     Args:
         output_path: Where to write the .wav file.
+        profile:     Which Batch 4 profile to render.
 
     Returns:
-        (path, style_name) -- so the UI can tell you what it generated.
+        (path, profile_name, num_layers) -- so the UI can tell you what
+        it generated and how many layers were mixed into it.
     """
     output_path = Path(output_path)
     if output_path.parent != Path(""):
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    style = random.choice(["Arpeggio", "Bell", "Pop", "Double Beep"])
-    buffer = _render_style(style)
+    if profile not in _CONCRETE_PROFILES:
+        profile = random.choice(_CONCRETE_PROFILES)
+    buffer, num_layers = _render_style(profile)
     _normalise(buffer)
     _write_wav(output_path, buffer)
-    return output_path, style
+    return output_path, profile, num_layers
 
 
 def read_wav_samples(path: str | Path) -> list[float]:
@@ -393,6 +470,12 @@ class SoundGeneratorWindow(QMainWindow):
         self.sounds_dir.mkdir(parents=True, exist_ok=True)
 
         # --- Left side: generation + preview + saving -------------------
+        # Batch 4: profile picker above Generate.
+        self.profile_combo = QComboBox()
+        self.profile_combo.addItems(PROFILES)
+        self.profile_combo.setToolTip(
+            "Sound profile for the next generated sound")
+
         self.generate_button = QPushButton("Generate New Sound")
         self.generate_button.setMinimumHeight(56)
         self.generate_button.setStyleSheet("font-size: 18px; font-weight: bold;")
@@ -413,8 +496,21 @@ class SoundGeneratorWindow(QMainWindow):
         self.save_button.clicked.connect(self.on_save)
 
         left_layout = QVBoxLayout()
+        left_layout.addWidget(self.profile_combo)
         left_layout.addWidget(self.generate_button)
         left_layout.addWidget(self.waveform)
+        # Batch 4: preview transport for the unsaved sound, below the
+        # waveform. Disabled until a sound has been generated.
+        preview_row = QHBoxLayout()
+        self.preview_play_btn = QPushButton("▶ Play Preview")
+        self.preview_play_btn.setEnabled(False)
+        self.preview_play_btn.clicked.connect(self._preview_play)
+        self.preview_stop_btn = QPushButton("⏹ Stop")
+        self.preview_stop_btn.setEnabled(False)
+        self.preview_stop_btn.clicked.connect(self._preview_stop)
+        preview_row.addWidget(self.preview_play_btn)
+        preview_row.addWidget(self.preview_stop_btn)
+        left_layout.addLayout(preview_row)
         left_layout.addWidget(self.style_label)
         left_layout.addLayout(name_row)
         left_layout.addWidget(self.save_button)
@@ -468,15 +564,19 @@ class SoundGeneratorWindow(QMainWindow):
         stop_playback(self._fallback_player)
 
         try:
-            self.temp_path, style = generate_sound(TEMP_PATH)
+            self.temp_path, profile, num_layers = generate_sound(
+                TEMP_PATH, self.profile_combo.currentText())
         except OSError as exc:
             QMessageBox.warning(self, "Generation failed",
                                 f"Could not write the preview file:\n{exc}")
             return
 
         self.waveform.load_wav(self.temp_path)
-        self.style_label.setText(f"Style: {style}  --  press Save to keep it")
+        self.style_label.setText(
+            f"Profile: {profile} (Layers: {num_layers}) -- press Save to keep it")
         self.save_button.setEnabled(True)
+        self.preview_play_btn.setEnabled(True)
+        self.preview_stop_btn.setEnabled(True)
         play_wav_async(self.temp_path, self._fallback_player)
 
     def _re_enable_generate(self) -> None:
@@ -484,6 +584,15 @@ class SoundGeneratorWindow(QMainWindow):
             self.generate_button.setEnabled(True)
         except RuntimeError:
             pass  # window closed before the debounce fired
+
+    def _preview_play(self) -> None:
+        """Replay the current unsaved preview (Batch 4)."""
+        if self.temp_path is not None:
+            play_wav_async(self.temp_path, self._fallback_player)
+
+    def _preview_stop(self) -> None:
+        """Stop the preview playback (Batch 4)."""
+        stop_playback(self._fallback_player)
 
     # -- Saving -------------------------------------------------------------
 
@@ -575,6 +684,8 @@ class SoundGeneratorWindow(QMainWindow):
 
         self.temp_path = None
         self.save_button.setEnabled(False)
+        self.preview_play_btn.setEnabled(False)
+        self.preview_stop_btn.setEnabled(False)
         self.style_label.setText(f"Saved as {destination.name}")
 
         # Fresh default name for the next sound, then refresh + select it.

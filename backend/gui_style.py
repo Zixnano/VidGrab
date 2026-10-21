@@ -19,8 +19,10 @@ def _shade(hexc, f):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def build_qss(settings_state=None):
+def build_qss(settings_state=None, override_tokens=None):
     p = resolve_palette(settings_state)
+    if override_tokens:
+        p.update(override_tokens)
     # v5.5 layout layer: padding is scaled by the preset's density token and
     # corner radii come from the radius tokens. At the default preset every
     # value is identical to the old hardcoded one.

@@ -1097,19 +1097,12 @@ def changelog_route():
         return jsonify({"ok": False, "error": str(e)}), 502
     # Batch 3: clean the notes for the app. The release plumbing is noise
     # in the Activity Log, so drop the "Automatic build from commit ..."
-    # line and any asset lines that point at the .zip download. An asset
-    # line is a line whose ONLY content is a .zip filename, a URL ending
-    # in .zip, or a markdown link to one — prose that merely mentions a
-    # zip (even with a URL in it) is a real changelog note and is kept.
+    # line and asset lines. Batch 4: an asset line is one that STARTS
+    # with a .zip filename (after an optional list marker), even when
+    # more text follows it; a line that merely mentions a zip later in
+    # prose is a real changelog note and is kept.
     _ZIP_ASSET_RE = re.compile(
-        r"^[\s\-\*\+]*"                       # optional list marker / whitespace
-        r"(?:"
-            r"[\w.\-]+\.zip\b"                # bare "name.zip"
-            r"|https?://\S+\.zip\b"           # bare URL ending in .zip
-            r"|\[[^\]]*\]\(\s*https?://\S+\.zip\s*\)"   # [label](url.zip)
-        r")\s*$",                             # nothing else on the line
-        re.IGNORECASE,
-    )
+        r"^[\s\-\*\+]*[\w.\-]+\.zip\b.*$", re.IGNORECASE)
 
     def _clean_changelog(body):
         kept = []

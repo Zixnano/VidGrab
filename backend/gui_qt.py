@@ -26,7 +26,7 @@ from PySide6.QtCore import (
     QElapsedTimer, QByteArray, QRect, QPoint, QSize,
 )
 from PySide6.QtGui import QAction, QColor, QDrag, QFont, QFontDatabase, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QGraphicsOpacityEffect, QTextEdit, QTextBrowser
+from PySide6.QtWidgets import QGraphicsOpacityEffect, QGraphicsDropShadowEffect, QTextEdit, QTextBrowser
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
     QLabel, QPushButton, QToolButton, QLineEdit, QTableView, QHeaderView,
@@ -126,7 +126,7 @@ _SB_ICONS = {
 
 def _qicon(name, color):
     """qtawesome icon in `color`, or None when qtawesome (or the name) is
-    unavailable, so callers fall back to the text glyphs."""
+    unavailable. Callers show the plain label (or its first letter)."""
     if _qta is None or not name:
         return None
     key = (name, color)
@@ -1140,10 +1140,13 @@ def _detail_info(j):
     }
 
 
+_PROGRESS_EASE = QEasingCurve(QEasingCurve.OutQuart)
+
+
 class ProgressDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
-        # 12.2: per-row interpolation toward the newest value over 100 ms.
+        # 12.2: per-row interpolation toward the newest value over 150 ms.
         self._shown = {}  # job id -> [from_value, to_value, QElapsedTimer]
         self.animations_enabled = True  # 12.5: refreshed by MainWindow
 
@@ -1163,8 +1166,8 @@ class ProgressDelegate(QStyledItemDelegate):
         if not self.animations_enabled:
             entry[0] = target
             return target
-        f = min(1.0, timer.elapsed() / 100.0)
-        f = 1.0 - (1.0 - f) ** 3  # ease-out across the 100 ms window
+        f = min(1.0, timer.elapsed() / 150.0)
+        f = _PROGRESS_EASE.valueForProgress(f)  # OutQuart across the 150 ms window
         return entry[0] + (entry[1] - entry[0]) * f
 
     def paint(self, painter, option, index):
@@ -2161,6 +2164,11 @@ class SettingsDialog(QDialog):
         _ts_lay.setContentsMargins(0, 0, 0, 0)
         _ts_lay.addWidget(self.text_scale, 1)
         _ts_lay.addWidget(self.text_scale_label)
+        # Batch 4: live text preview next to the slider.
+        self.text_preview = QLabel("Aa Preview")
+        _ts_lay.addWidget(self.text_preview)
+        self.text_scale.valueChanged.connect(self._update_text_preview)
+        self._update_text_preview(_cur)
         gl.addRow("Text size", _ts_row)
         # Batch 2: App Font. Every installed family; "Theme default" keeps the
         # preset's own font. Saved as settings "app_font".
@@ -2787,6 +2795,11 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
+    def _update_text_preview(self, val):
+        """Batch 4: scale the "Aa Preview" label with the Text size slider."""
+        self.text_preview.setStyleSheet(
+            f"font-size: {max(9, int(10 * (val / 100)))}pt;")
+
     def done(self, r):
         # Batch 3: closing this dialog without saving (Cancel, Esc, the
         # window X — all of them end here as Rejected) after a font preview
@@ -3029,11 +3042,6 @@ class Sidebar(QFrame):
     collapsed_changed = Signal(bool)   # v5.5: the user pressed the collapse button
 
     WIDTH_FULL, WIDTH_COLLAPSED = 200, 56
-    # v5.5: glyph shown for each entry while the sidebar is collapsed.
-    ICONS = {"All": "\u2630", "Active": "\u2193", "Queue": "\u2261", "Finished": "\u2713",
-             "Unfinished": "\u25d4", "Failed": "\u26a0", "Video": "\u25b6", "Music": "\u266a",
-             "Images": "\u25a3", "Compressed": "\u25a5", "Documents": "\u25a4",
-             "Programs": "\u2699", "Fonts": "Aa", "Other": "\u2022"}
     TOOL_ICONS = {"settings": "\u2699", "help": "?", "about": "i"}
 
     def __init__(self):
@@ -3120,7 +3128,7 @@ class Sidebar(QFrame):
         label = f"{name}  ({n})" if n else name
         ic = _qicon(_SB_ICONS.get(name), SOFT) if self._collapsed else None
         if self._collapsed:
-            text = "" if ic is not None else self.ICONS.get(name, name[:1])
+            text = "" if ic is not None else name[:1]
             tip = label
             css = "QToolButton { text-align: center; padding: 0; }"
         else:
@@ -3594,6 +3602,7 @@ class MainWindow(QMainWindow):
         self._tray = None
         self._tray_hint_shown = False
         self._done_seen = set()
+        self._error_seen = set()
         self._recently_done = {}
         self._sort_column = None
         self._refresh_worker = None
@@ -3648,7 +3657,7 @@ class MainWindow(QMainWindow):
             pass
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
-        self.timer.start(1000)
+        self.timer.start(500)
         self.log_timer = QTimer(self)
         self.log_timer.timeout.connect(self.refresh_logs)
         self.log_timer.start(1500)
@@ -3897,23 +3906,27 @@ class MainWindow(QMainWindow):
         tl.addWidget(title)
         tl.addSpacing(16)
         self._tb = []  # [button, icon, label]: compact mode swaps text for icon
-        for label, icon, action in [
-            ("Add URL", "+", self.add_download),
-            ("Batch", "☰", self.add_batch),
-            ("Playlist", "☷", self.add_playlist),
-            ("Resume", "▶", lambda: self._selected("resume")),
-            ("Pause", "Ⅱ", lambda: self._selected("pause")),
-            ("Stop", "■", lambda: self._selected("stop")),
-            ("Delete", "⌫", self.remove_selected),
-            ("Queue", "⏯", self.toggle_queue),
-            ("Settings", "⚙", self.open_settings),
+        for label, action in [
+            ("Add URL", self.add_download),
+            ("Batch", self.add_batch),
+            ("Playlist", self.add_playlist),
+            ("Resume", lambda: self._selected("resume")),
+            ("Pause", lambda: self._selected("pause")),
+            ("Stop", lambda: self._selected("stop")),
+            ("Delete", self.remove_selected),
+            ("Queue", self.toggle_queue),
+            ("Settings", self.open_settings),
         ]:
-            b = QPushButton(f"{icon}  {label}")
+            b = QPushButton(label)
             b.setObjectName("ToolbarButton")
             b.setToolTip(label)
             b.clicked.connect(action)
+            ic = _qicon(_TB_ICONS.get(label), _toolbar_icon_color())
+            if ic is not None:
+                b.setIcon(ic)
+                b.setIconSize(QSize(16, 16))
             tl.addWidget(b)
-            self._tb.append([b, icon, label])
+            self._tb.append([b, ic, label])
             if label == "Queue":
                 self.queue_btn = b
         self._update_queue_btn()
@@ -3942,6 +3955,11 @@ class MainWindow(QMainWindow):
         cl.setContentsMargins(12, 12, 12, 10)
         cl.setSpacing(8)
         self.table = DownloadTable()
+        _table_shadow = QGraphicsDropShadowEffect(self.table)
+        _table_shadow.setBlurRadius(16)
+        _table_shadow.setOffset(0, 4)
+        _table_shadow.setColor(QColor(0, 0, 0, 80))
+        self.table.setGraphicsEffect(_table_shadow)
         self.table.setModel(self.model)
         self.table.setItemDelegate(ProgressDelegate(self.table))
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -3978,7 +3996,7 @@ class MainWindow(QMainWindow):
         # divider between them can be dragged (the height is remembered).
         self.split = QSplitter(Qt.Vertical)
         self.split.setChildrenCollapsible(False)
-        self.split.setHandleWidth(8)
+        self.split.setHandleWidth(4)
         self.table.setMinimumHeight(120)
         self.split.addWidget(self.table)
         cl.addWidget(self.split, 1)
@@ -4298,14 +4316,14 @@ class MainWindow(QMainWindow):
                    or getattr(self, "_scale_compact", False)
                    or (self.width() - extra) < 1240)
         col = _toolbar_icon_color()
-        for btn, icon, label in getattr(self, "_tb", []):
+        for entry in getattr(self, "_tb", []):
+            btn, label = entry[0], entry[2]
             ic = _qicon(_TB_ICONS.get(label), col)
             if ic is not None:
+                entry[1] = ic
                 btn.setIcon(ic)
                 btn.setIconSize(QSize(16, 16))
-                btn.setText("" if compact else label)
-            else:
-                btn.setText(icon if compact else f"{icon}  {label}")
+            btn.setText("" if compact else label)
             btn.setToolTip(label)
 
     def resizeEvent(self, event):
@@ -4730,6 +4748,13 @@ class MainWindow(QMainWindow):
                 if getattr(self, "_done_seeded", False):
                     self._recently_done[jid] = 1.0
         self._done_seeded = True
+        for j in self.all_items:
+            jid = j.get("id")
+            if j.get("status") == "error" and jid not in self._error_seen:
+                self._error_seen.add(jid)
+                if getattr(self, "_error_seeded", False):
+                    self._apply_reactive_color("error")
+        self._error_seeded = True
         # Tray icon reflects download activity (cached icon swap, ~1/sec).
         if getattr(self, "_tray", None):
             active = any(j.get("status") == "downloading" for j in self.all_items)
@@ -4750,6 +4775,24 @@ class MainWindow(QMainWindow):
             self._last_visible_ids = visible_ids
             _fade_widget(self.table.viewport(), self.animations_enabled)
         self._update_details()
+
+    def _apply_reactive_color(self, status):
+        """Batch 4 reactivity: while a job is in the error state, flash
+        the theme accent red, then restore the saved theme after 3 s."""
+        if status != "error":
+            return
+        from gui_style import build_qss
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_qss(load_settings(), override_tokens={
+                "accent": "#ef5350", "accent_dim": "#b71c1c"}))
+        QTimer.singleShot(3000, self._reset_reactive_color)
+
+    def _reset_reactive_color(self):
+        try:
+            reapply_theme()
+        except RuntimeError:
+            pass  # window closed before the reset fired
 
     def _tick_fade(self):
         if not self._recently_done:
@@ -5035,7 +5078,8 @@ class MainWindow(QMainWindow):
             running = bool(load_settings().get("queue_running", True))
         for entry in getattr(self, "_tb", []):
             if entry[0] is self.queue_btn:
-                entry[1], entry[2] = ("⏸", "Pause Queue") if running else ("⏵", "Start Queue")
+                entry[2] = "Pause Queue" if running else "Start Queue"
+                entry[1] = _qicon(_TB_ICONS.get(entry[2]), _toolbar_icon_color())
         self._apply_toolbar_text()
         self.queue_btn.setToolTip(
             "Pause the whole download queue" if running
