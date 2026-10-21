@@ -4,9 +4,11 @@ resolve_palette(settings_state) = preset + accent + per-token overrides,
 then the derived tokens (sidebar, input, hover, selection, soft text) are
 computed from the result, so a preset only has to define the base colors.
 """
+import re
 
 _MONO = '"JetBrains Mono", "Cascadia Mono", Consolas, "Courier New", monospace'
 _SANS = '-apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif'
+_SEGOE = '"Segoe UI", -apple-system, Roboto, "Helvetica Neue", sans-serif'
 
 
 def build_palette():
@@ -46,36 +48,61 @@ def build_palette():
         "radius_sm":   "6px",       # menu items, list items, menu-bar hover
         "radius_chip": "10px",      # small chips
         "pad_scale":   1.0,         # density: multiplies every padding in gui_style
+        # Batch 2 layout tokens: border thickness (px), font size multiplier
+        # (on top of the Text size zoom) and the global font weight.
+        "border_w":    1,
+        "font_scale":  1.0,
+        "font_weight": "normal",
         "font":        _SANS,
         "font_mono":   '"JetBrains Mono", "Consolas", monospace',
     }
 
 
-# Presets only list what differs from the default.
+# Presets only list what differs from the default. Batch 2: each one has its
+# own shape, density and type (radius / pad_scale / font ...), not just colors.
 _PRESET_DIFFS = {
-    "amoled_black": {},
+    # Default: tight corners, standard density, Segoe UI.
+    "amoled_black": dict(radius="4px", radius_sm="3px", radius_chip="6px",
+                         pad_scale=1.0, font=_SEGOE),
     # Softer and roomier.
     "dark_gray": dict(bg_base="#16161c", bg_panel="#1d1d26", bg_elevated="#262630",
                       border="#30303c", border_hi="#3f3f4b",
                       radius="12px", radius_sm="8px", radius_chip="12px", pad_scale=1.08),
+    # Square corners, thick bright borders, bold type.
     "high_contrast": dict(bg_base="#000000", bg_panel="#0d0d0d", bg_elevated="#1a1a1a",
-                          border="#555555", border_hi="#777777", text="#ffffff",
+                          border="#cccccc", border_hi="#ffffff", text="#ffffff",
                           text_muted="#cccccc", text_dim="#999999", accent="#00e5ff",
-                          radius="4px", radius_sm="3px", radius_chip="6px", pad_scale=1.1),
+                          radius="0px", radius_sm="0px", radius_chip="0px",
+                          pad_scale=1.05, border_w=2, font_weight="bold"),
     # Dark LCD screen, muted green, monospace type (the handheld screen).
+    # Selecting it also turns the handheld shell on (see gui_theme_page).
     "handheld": dict(bg_base="#101412", bg_panel="#171c19", bg_elevated="#222925",
                      border="#39413b", border_hi="#59625a", text="#f0ede2",
                      text_muted="#a3aaa0", text_dim="#6f786f", accent="#8ccf72",
                      accent_dim="#4e8b45", success="#8ccf72", warning="#d6b85a",
-                     error="#e56a62", info="#7894c8", radius="8px", font=_MONO,
-                     radius_sm="4px", radius_chip="8px", pad_scale=0.9),
-    # Light four-shade green LCD.
+                     error="#e56a62", info="#7894c8", radius="14px", font=_MONO,
+                     radius_sm="8px", radius_chip="14px", pad_scale=1.2),
+    # Light four-shade green LCD: square, monospace, thick borders.
     "classic_lcd": dict(bg_base="#9bbc0f", bg_panel="#8bac0f", bg_elevated="#7d9d0e",
                         border="#306230", border_hi="#0f380f", text="#0f380f",
                         text_muted="#306230", text_dim="#4a7a2a", accent="#0f380f",
                         accent_dim="#306230", success="#0f380f", warning="#5c5a0a",
-                        error="#7a1f12", info="#306230", radius="4px", font=_MONO,
-                        radius_sm="2px", radius_chip="4px", pad_scale=0.85),
+                        error="#7a1f12", info="#306230", radius="0px", font=_MONO,
+                        radius_sm="0px", radius_chip="0px", pad_scale=0.9, border_w=3),
+    # Lighter, frosted-looking blue-grey panels and big soft corners.
+    "glass": dict(bg_base="#1b2230", bg_panel="#273247", bg_elevated="#34425b",
+                  border="#4b5a77", border_hi="#6f82a6", text="#f2f6ff",
+                  text_muted="#b6c2da", text_dim="#8696b3", accent="#7fd4ff",
+                  accent_dim="#4a9fc8", success="#6fe0a8", warning="#ffd479",
+                  error="#ff8a8a", info="#8fb4ff", radius="16px", font=_SEGOE,
+                  radius_sm="10px", radius_chip="16px", pad_scale=1.1),
+    # Very dense: small type, tight corners, thin borders.
+    "compact": dict(bg_base="#111113", bg_panel="#18181b", bg_elevated="#222226",
+                    border="#2c2c31", border_hi="#3d3d44", text="#e4e4e8",
+                    text_muted="#9a9aa4", text_dim="#6a6a74", accent="#4fc3f7",
+                    accent_dim="#2f87b0", radius="2px", font=_SEGOE,
+                    radius_sm="1px", radius_chip="2px", pad_scale=0.75,
+                    border_w=1, font_scale=0.88),
 }
 
 PRESET_NAMES = {
@@ -84,6 +111,8 @@ PRESET_NAMES = {
     "high_contrast": "High Contrast",
     "handheld": "Handheld",
     "classic_lcd": "Classic LCD",
+    "glass": "Glass / Acrylic",
+    "compact": "Compact / Minimal",
 }
 
 THEME_PRESETS = {k: dict(build_palette(), **v) for k, v in _PRESET_DIFFS.items()}
@@ -91,10 +120,28 @@ PALETTE = THEME_PRESETS["amoled_black"]
 
 # The layout layer (shape and spacing). A color-only preset or theme file
 # simply inherits the defaults above, so older themes keep working.
-LAYOUT_KEYS = ("radius", "radius_sm", "radius_chip", "radius_pill", "pad_scale")
+LAYOUT_KEYS = ("radius", "radius_sm", "radius_chip", "radius_pill", "pad_scale",
+               "border_w", "font_scale", "font_weight")
 
 # Computed from the base tokens; the user can still override them.
 DERIVED = ("bg_side", "bg_input", "bg_hover", "bg_sel", "text_soft", "text_on_accent")
+
+
+def zoom_factor(settings_state=None):
+    """Global zoom from General > Text size (percent), clamped 0.7..2.0.
+    gui_style multiplies fonts, paddings, margins, radii and control sizes by it."""
+    try:
+        return max(0.7, min(2.0, float((settings_state or {}).get("text_scale", 100) or 100) / 100.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def scale_px(v, f=1.0):
+    """Scale a "12px" style length by f; anything else is returned unchanged."""
+    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*px\s*$", str(v))
+    if not m:
+        return v
+    return f"{round(float(m.group(1)) * f)}px"
 
 
 def _rgb(h):

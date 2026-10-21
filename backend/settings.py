@@ -72,29 +72,32 @@ CATEGORIES = ("Video", "Music", "Images", "Compressed", "Documents", "Programs",
 _CATEGORY_EXTS = {
     "Video": {"mp4", "m4v", "mov", "webm", "mkv", "avi", "flv", "wmv", "mpg", "mpeg",
               "ts", "m2ts", "mts", "vob", "ogv", "divx", "rm", "rmvb", "asf", "mxf",
-              "3gp", "3g2"},
+              "3gp", "3g2", "f4v", "ogm", "mk3d"},
     "Music": {"mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma", "aiff", "aif",
-              "alac", "ape", "m4b", "mid", "midi", "amr"},
+              "alac", "ape", "m4b", "mid", "midi", "amr",
+              "weba", "mka", "oga", "ac3", "dts", "spx"},
     "Images": {"jpg", "jpeg", "jpe", "png", "gif", "webp", "avif", "heic", "heif", "bmp",
                "svg", "ico", "tif", "tiff", "jxl", "dng", "cr2", "nef", "raw", "psd",
-               "xcf"},
+               "xcf", "apng", "jfif", "svgz", "eps", "ai"},
     "Compressed": {"zip", "rar", "7z", "tar", "gz", "bz2", "xz", "lz", "lzma", "zst",
                    "cab", "iso", "img", "tgz",
                    # compound forms, matched longest-first by split_ext():
-                   "tar.gz", "tar.bz2", "tar.xz"},
+                   "tar.gz", "tar.bz2", "tar.xz", "tar.zst", "tar.lz", "tar.lzma",
+                   "z", "wim", "001"},
     "Documents": {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md",
                   "rtf", "odt", "ods", "odp", "csv", "tsv", "json", "xml", "yaml",
-                  "yml", "epub", "mobi", "azw3"},
+                  "yml", "epub", "mobi", "azw3", "srt", "vtt", "ass", "ssa", "docm",
+                  "xlsm", "pptm", "html", "htm", "log", "ini"},
     "Programs": {"exe", "msi", "dmg", "deb", "rpm", "apk", "appimage", "bat", "cmd",
-                 "sh", "ps1", "jar", "py", "js", "appx"},
-    "Fonts": {"ttf", "otf", "woff", "woff2", "eot"},
+                 "sh", "ps1", "jar", "py", "js", "appx", "msix", "pkg", "scr"},
+    "Fonts": {"ttf", "otf", "woff", "woff2", "eot", "ttc", "fon"},
 }
 CATEGORY_MAP = {("." + ext): cat for cat, exts in _CATEGORY_EXTS.items()
                 for ext in exts}
 
 # Compound suffixes matched longest-first: os.path.splitext("file.tar.gz")
 # returns ".gz", hiding the real archive type. ".tgz" is tar+gzip too.
-_COMPOUND_EXTS = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")
+_COMPOUND_EXTS = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lz", ".tar.lzma", ".tgz")
 
 
 def split_ext(name):
@@ -233,6 +236,9 @@ _V5_DEFAULTS = {
     "thumb_click_mode": "inline",
     # Text size in percent (General). Scales the stylesheet's font sizes.
     "text_scale": 100,
+    # App Font (General): installed font family that overrides the theme's
+    # font. "" = use the theme's own font.
+    "app_font": "",
     # Theme page view: "simple" (presets, accent, shell toggle) or "detailed".
     "theme_detail_mode": "simple",
 }
@@ -542,6 +548,10 @@ _STREAM_EXT_CATEGORY = {".m3u8": "Video", ".m3u": "Video", ".mpd": "Video"}
 
 
 def category_for(filename):
+    # Batch 5: tolerate query/fragment leftovers and trailing dots/spaces so a
+    # name like "clip.mp4?x=1" or "song.mp3 " still lands in the right folder.
+    # New jobs only: nothing here relabels existing jobs or moves files.
+    filename = re.split(r"[?#]", str(filename or ""), maxsplit=1)[0].rstrip(". ")
     _, ext = split_ext(filename)
     ext = ext.lower()
     return CATEGORY_MAP.get(ext) or _STREAM_EXT_CATEGORY.get(ext, "Other")

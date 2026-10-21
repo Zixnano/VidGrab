@@ -9,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QRect, QRectF, QSize, QPoint, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QAbstractButton, QButtonGroup, QCheckBox, QColorDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QAbstractButton, QButtonGroup, QCheckBox, QColorDialog, QDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QLabel, QLayout, QMessageBox, QPushButton, QSizePolicy, QToolButton,
     QVBoxLayout, QWidget, QWidgetItem,
 )
@@ -48,6 +48,33 @@ def _family(font_stack):
         if part and not part.startswith("-"):
             return part
     return "Segoe UI"
+
+
+def _px(v, d=0.0):
+    """'14px' -> 14.0"""
+    try:
+        return float(str(v).lower().replace("px", "").strip())
+    except (TypeError, ValueError):
+        return d
+
+
+def _num(v, d=1.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return d
+
+
+def _pick_color(initial, parent, title):
+    """Color dialog with Qt's own dialog forced, so its "Pick Screen Color"
+    eye dropper (sample any pixel on screen) is always there; a native
+    dialog would not have it. Returns an invalid QColor when cancelled."""
+    dlg = QColorDialog(QColor(initial), parent)
+    dlg.setWindowTitle(title)
+    dlg.setOption(QColorDialog.DontUseNativeDialog, True)
+    if dlg.exec() == QDialog.Accepted:
+        return dlg.currentColor()
+    return QColor()
 
 
 class FlowLayout(QLayout):
@@ -138,11 +165,22 @@ class MiniPreview(QWidget):
         h = int(w * 0.43)
         s = w / 560.0
         fam = _family(t["font"])
+        # Batch 2: the preview follows the preset's shape tokens. This card is
+        # about half the size of the app window, so lengths are halved.
+        K = 0.5
+        rad = _px(t.get("radius"), 10) * K
+        rad_sm = _px(t.get("radius_sm"), 6) * K
+        ps = _num(t.get("pad_scale"), 1.0)
+        bw = _num(t.get("border_w"), 1.0)
+        fmul = _num(t.get("font_scale"), 1.0)
+        bold_all = str(t.get("font_weight") or "normal").lower() in ("bold", "600", "700")
+        pf = 0.6 + 0.4 * ps                       # row pitch follows the density
+        bpen = max(1.0, bw * max(1.0, s * 0.7))   # border thickness
 
         def font(px, bold=False, mono=False):
             f = QFont(_family(t["font_mono"]) if mono else fam)
-            f.setPixelSize(max(7, int(px * s)))
-            f.setBold(bold)
+            f.setPixelSize(max(7, int(px * s * fmul)))
+            f.setBold(bold or (bold_all and not mono))
             return f
 
         def text(x, y, wd, ht, s_, color, fnt, flags=Qt.AlignVCenter | Qt.AlignLeft):
@@ -151,31 +189,32 @@ class MiniPreview(QWidget):
             p.drawText(QRectF(x * s, y * s, wd * s, ht * s), int(flags), s_)
 
         def box(x, y, wd, ht, fill, border=None, r=6):
-            p.setPen(QPen(QColor(border), 1) if border else Qt.NoPen)
+            r = max(0.0, min(r, wd / 2.0, ht / 2.0))
+            p.setPen(QPen(QColor(border), bpen) if border else Qt.NoPen)
             p.setBrush(QColor(fill) if fill else Qt.NoBrush)
             p.drawRoundedRect(QRectF(x * s, y * s, wd * s, ht * s), r * s, r * s)
 
-        box(0.5, 0.5, 559, h / s - 1, t["bg_base"], t["border"], 10)
+        box(0.5, 0.5, 559, h / s - 1, t["bg_base"], t["border"], rad * 1.5)
         # sidebar
-        box(1, 1, 120, h / s - 2, t["bg_side"], None, 9)
+        box(1, 1, 120, h / s - 2, t["bg_side"], None, rad * 1.5)
         text(12, 10, 100, 16, "\u2193 VIDEO GRABBER", t["text"], font(8, True))
         for i, name in enumerate(["All", "Active", "Finished", "Failed", "Video"]):
-            y = 36 + i * 24
+            y = 36 + i * 24 * pf
             if i == 0:
-                box(8, y, 104, 20, t["bg_sel"], None, 6)
+                box(8, y, 104, 20, t["bg_sel"], None, rad_sm)
             text(18, y, 90, 20, name, t["text"] if i == 0 else t["text_soft"], font(9, i == 0))
         # toolbar
         box(122, 1, 437, 36, t["bg_panel"], None, 0)
-        box(132, 8, 70, 22, t["accent"], None, 6)
+        box(132, 8, 70, 22, t["accent"], None, rad)
         text(132, 8, 70, 22, "+ Add URL", t["text_on_accent"], font(9, True), Qt.AlignCenter)
         for i, name in enumerate(["Start", "Pause", "Stop"]):
             text(212 + i * 48, 8, 46, 22, name, t["text_soft"], font(9), Qt.AlignCenter)
-        box(440, 8, 108, 22, t["bg_input"], t["border"], 6)
+        box(440, 8, 108, 22, t["bg_input"], t["border"], rad)
         text(448, 8, 90, 22, "Search\u2026", t["text_dim"], font(8))
         # table
         top = 46
-        box(130, top, 420, 150, t["bg_panel"], t["border"], 6)
-        box(131, top + 1, 418, 22, t["bg_elevated"], None, 5)
+        box(130, top, 420, 150, t["bg_panel"], t["border"], rad)
+        box(131, top + 1, 418, 22, t["bg_elevated"], None, rad_sm)
         for x, label in ((140, "Name"), (300, "Size"), (350, "Progress"), (480, "Status")):
             text(x, top + 1, 70, 22, label, t["text_muted"], font(8, True))
         rows = [("Studio session part 4.mp4", "212 MB", 62, "Loading", t["text_soft"]),
@@ -183,18 +222,18 @@ class MiniPreview(QWidget):
                 ("watch (2) (1).mp4", "48 MB", 30, "Paused", t["warning"]),
                 ("clip-0412.mp4", "0 B", 0, "Error", t["error"])]
         for i, (n, sz, pct, st, col) in enumerate(rows):
-            y = top + 26 + i * 30
+            y = top + 26 + i * 30 * pf
             if i == 1:
-                box(132, y - 2, 416, 28, t["bg_sel"], None, 4)
+                box(132, y - 2, 416, 28, t["bg_sel"], None, rad_sm)
             text(140, y, 150, 24, n if len(n) < 24 else n[:22] + "\u2026", t["text"], font(9))
             text(300, y, 50, 24, sz, t["text_muted"], font(9))
-            box(350, y + 8, 80, 8, t["bg_elevated"], None, 4)
+            box(350, y + 8, 80, 8, t["bg_elevated"], None, min(rad_sm, 4))
             if pct:
-                box(350, y + 8, 80 * pct / 100.0, 8, t["accent"], None, 4)
+                box(350, y + 8, 80 * pct / 100.0, 8, t["accent"], None, min(rad_sm, 4))
             text(440, y, 36, 24, "%d%%" % pct, t["text_soft"], font(8))
             text(480, y, 60, 24, st, col, font(9, True))
         # log
-        box(130, 204, 420, 22, t["bg_input"], t["border"], 6)
+        box(130, 204, 420, 22, t["bg_input"], t["border"], rad)
         text(138, 204, 400, 22, "18:35:10  Job 564 started: Studio session part 4.mp4",
              t["text_muted"], font(8, mono=True))
         p.end()
@@ -236,7 +275,8 @@ class PresetTile(QAbstractButton):
         p.setPen(QPen(QColor(self.ring if self.isChecked() else t["border_hi"]),
                       2.5 if self.isChecked() else 1))
         p.setBrush(QColor(t["bg_base"]))
-        p.drawRoundedRect(r, 8, 8)
+        _rr = max(0.0, min(10.0, _px(t.get("radius"), 10) * 0.7))
+        p.drawRoundedRect(r, _rr, _rr)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(t["bg_panel"]))
         p.drawRoundedRect(QRectF(10, 10, 34, 40), 4, 4)
@@ -256,6 +296,9 @@ class PresetTile(QAbstractButton):
         p.end()
 
 
+_NUM_TOKENS = {"pad_scale": (0.6, 1.5), "border_w": (1, 6), "font_scale": (0.7, 1.3)}
+
+
 def _theme_from_dict(d):
     """Normalize a theme file's JSON into a dict the page can preview and
     apply, or None when it holds nothing usable. Accepts the Export format
@@ -271,9 +314,14 @@ def _theme_from_dict(d):
     def clean(toks):
         out = {}
         for k, v in (toks or {}).items():
-            if k == "pad_scale":      # v5.5 layout token: density multiplier, a number
-                if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.6 <= v <= 1.5:
+            if k in _NUM_TOKENS:      # layout tokens that are plain numbers (v5.5, Batch 2)
+                lo, hi = _NUM_TOKENS[k]
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi:
                     out[k] = float(v)
+                continue
+            if k == "font_weight":
+                if isinstance(v, str) and v.strip().lower() in ("normal", "500", "600", "bold", "700"):
+                    out[k] = v.strip().lower()
                 continue
             if k == "accent" or k not in allowed or not isinstance(v, str) or not v.strip():
                 continue
@@ -560,6 +608,11 @@ class ThemePage(QWidget):
         self.count_chip = QLabel("")
         self.count_chip.setObjectName("Chip")
         head.addWidget(self.count_chip)
+        self.reset_preset_btn = QPushButton("Reset to Preset")
+        self.reset_preset_btn.setToolTip("Drop every color change and restore the preset's own colors "
+                                         "and accent")
+        self.reset_preset_btn.clicked.connect(self._reset_to_preset)
+        head.addWidget(self.reset_preset_btn)
         self.clear_btn = QPushButton("Clear tweaks")
         self.clear_btn.clicked.connect(self._clear_tweaks)
         head.addWidget(self.clear_btn)
@@ -677,7 +730,7 @@ class ThemePage(QWidget):
         return lay
 
     def _pick_shell_part(self, key):
-        c = QColorDialog.getColor(QColor(self._shell_part(key)), self, "Choose color")
+        c = _pick_color(self._shell_part(key), self, "Choose color")
         if c.isValid():
             self._shell_ov[key] = c.name()
             self._refresh()
@@ -712,6 +765,8 @@ class ThemePage(QWidget):
         n = len(self._ov)
         self.count_chip.setText(f"{n} customized" if n else "No tweaks")
         self.clear_btn.setVisible(n > 0)
+        self.reset_preset_btn.setEnabled(n > 0 or self._accent.lower()
+                                         != THEME_PRESETS[self._preset]["accent"].lower())
         self.fine_toggle.setText(("\u25BE " if self.fine_toggle.isChecked() else "\u25B8 ")
                                  + "Edit individual colors")
         self.accent_label.setText(f"Current accent: {self._accent.upper()}")
@@ -765,6 +820,8 @@ class ThemePage(QWidget):
         for k, tile in self._tiles.items():
             tile.setChecked(k == key)
             tile.update()
+        if key == "handheld" and not self.shell_check.isChecked():
+            self.shell_check.setChecked(True)     # Handheld brings its shell (still switchable)
         self._refresh()
 
     def _shell_toggled(self, on):
@@ -794,13 +851,13 @@ class ThemePage(QWidget):
         self._refresh()
 
     def _pick_accent(self):
-        c = QColorDialog.getColor(QColor(self._accent), self, "Custom accent color")
+        c = _pick_color(self._accent, self, "Custom accent color")
         if c.isValid():
             self._set_accent(c.name())
 
     def _pick_token(self, key):
         cur = QColor(self._tokens()[key])
-        c = QColorDialog.getColor(cur, self, "Choose color")
+        c = _pick_color(cur, self, "Choose color")
         if not c.isValid():
             return
         if key == "accent":
@@ -814,6 +871,12 @@ class ThemePage(QWidget):
             self._accent = THEME_PRESETS[self._preset]["accent"]
         else:
             self._ov.pop(key, None)
+        self._refresh()
+
+    def _reset_to_preset(self):
+        """Clear every override (and a changed accent): back to the base preset."""
+        self._ov = {}
+        self._accent = THEME_PRESETS[self._preset]["accent"]
         self._refresh()
 
     def _clear_tweaks(self):

@@ -23,9 +23,9 @@ import requests
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, Qt, QTimer, QThread, Signal, QMimeData, QUrl,
     QItemSelectionModel, QPropertyAnimation, QEasingCurve, QAbstractAnimation,
-    QElapsedTimer, QByteArray, QRect, QPoint,
+    QElapsedTimer, QByteArray, QRect, QPoint, QSize,
 )
-from PySide6.QtGui import QAction, QColor, QDrag, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QColor, QDrag, QFont, QFontDatabase, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QTextEdit, QTextBrowser
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
@@ -48,6 +48,11 @@ from palette import resolve_palette
 from settings import CATEGORIES, DISPLAY_VERSION, detect_type  # single source of truth: settings.py
 from gui_detail import IMAGE_EXT, VIDEO_EXT, DetailPane, ThumbLoader
 
+try:    # Batch 5: FontAwesome icons for the toolbar and the collapsed sidebar.
+    import qtawesome as _qta       # optional: without it the old glyphs are used
+except Exception:
+    _qta = None
+
 _PAL = resolve_palette()
 ACCENT = _PAL["accent"]
 BG = _PAL["bg_base"]
@@ -61,6 +66,7 @@ SUCCESS = _PAL["success"]
 TRACK = _PAL["bg_elevated"]   # progress-bar track
 
 _ICON_CACHE = {}
+_QTA_CACHE = {}
 
 
 _TRAY_ICONS = {}
@@ -80,6 +86,7 @@ def _sync_palette(settings=None):
     DANGER, WARN, SUCCESS = _PAL["error"], _PAL["warning"], _PAL["success"]
     TRACK, SEL, SOFT = _PAL["bg_elevated"], _PAL["bg_sel"], _PAL["text_soft"]
     _ICON_CACHE.clear()
+    _QTA_CACHE.clear()
     _TRAY_ICONS.clear()
     _STATUS_COLORS.update({"downloading": SUCCESS, "done": SUCCESS, "paused": WARN,
                            "stopped": DANGER, "error": DANGER, "queued": MUTED,
@@ -93,6 +100,53 @@ def _title_bar_dark():
         return luminance(_PAL["bg_base"]) < 0.4
     except Exception:
         return True
+
+
+# Batch 5: FontAwesome (qtawesome fa5s) icon names. Toolbar keys are the
+# toolbar labels (see MainWindow._build_ui); sidebar keys are nav names.
+_TB_ICONS = {
+    "Add URL": "fa5s.plus", "Batch": "fa5s.layer-group", "Playlist": "fa5s.list-ul",
+    "Resume": "fa5s.play", "Pause": "fa5s.pause", "Stop": "fa5s.stop",
+    "Delete": "fa5s.trash-alt", "Queue": "fa5s.stream",
+    "Pause Queue": "fa5s.pause-circle", "Start Queue": "fa5s.play-circle",
+    "Settings": "fa5s.cog",
+}
+_SB_ICONS = {
+    "All": "fa5s.th-list", "Active": "fa5s.download", "Queue": "fa5s.stream",
+    "Finished": "fa5s.check", "Unfinished": "fa5s.hourglass-half",
+    "Failed": "fa5s.exclamation-triangle", "Video": "fa5s.film", "Music": "fa5s.music",
+    "Images": "fa5s.image", "Compressed": "fa5s.file-archive", "Documents": "fa5s.file-alt",
+    "Programs": "fa5s.microchip", "Fonts": "fa5s.font", "Other": "fa5s.ellipsis-h",
+}
+
+
+def _qicon(name, color):
+    """qtawesome icon in `color`, or None when qtawesome (or the name) is
+    unavailable, so callers fall back to the text glyphs."""
+    if _qta is None or not name:
+        return None
+    key = (name, color)
+    if key in _QTA_CACHE:
+        return _QTA_CACHE[key]
+    try:
+        ic = _qta.icon(name, color=color)
+    except Exception:
+        ic = None
+    _QTA_CACHE[key] = ic
+    return ic
+
+
+def _toolbar_icon_color():
+    """Icon tint for the toolbar: the secondary text color, or the frame's
+    text color when the colored window frame is on."""
+    try:
+        if load_settings().get("frame_cream"):
+            from palette import contrast, luminance
+            fb = _PAL["frame"]
+            return BG if contrast(fb, BG) >= 4.5 else ("#000000" if luminance(fb) > 0.4 else "#ffffff")
+    except Exception:
+        pass
+    return SOFT
 
 
 def reapply_theme():
@@ -1121,8 +1175,11 @@ class ProgressDelegate(QStyledItemDelegate):
         painter.save()
         rect = option.rect.adjusted(6, 14, -6, -14)
         if rect.height() < 4:
-            # Very short rows: keep the bar drawable instead of negative-height.
-            rect.setHeight(4)
+            # Very short rows (Compact preset): keep the bar drawable and
+            # centred in the row instead of negative-height.
+            rect = QRect(option.rect.left() + 6,
+                         option.rect.top() + (option.rect.height() - 4) // 2,
+                         option.rect.width() - 12, 4)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(TRACK))
         painter.drawRoundedRect(rect, 5, 5)
@@ -2084,6 +2141,25 @@ class SettingsDialog(QDialog):
         _i = self.text_scale.findData(_cur)
         self.text_scale.setCurrentIndex(_i if _i >= 0 else 1)
         gl.addRow("Text size", self.text_scale)
+        # Batch 2: App Font. Every installed family; "Theme default" keeps the
+        # preset's own font. Saved as settings "app_font".
+        self.app_font = QComboBox()
+        self.app_font.addItem("Theme default", userData="")
+        try:
+            _fams = sorted({f for f in QFontDatabase.families() if f and not f.startswith("@")},
+                           key=str.lower)
+        except Exception:
+            _fams = []
+        for _fam in _fams:
+            self.app_font.addItem(_fam, userData=_fam)
+        _saved_font = str(s.get("app_font", "") or "")
+        if _saved_font and self.app_font.findData(_saved_font) < 0:
+            self.app_font.addItem(_saved_font, userData=_saved_font)   # not installed here: keep it
+        _i = self.app_font.findData(_saved_font)
+        self.app_font.setCurrentIndex(_i if _i >= 0 else 0)
+        self.app_font.setMaxVisibleItems(20)
+        self.app_font.setToolTip("Overrides the theme's font everywhere in the app.")
+        gl.addRow("App Font", self.app_font)
         tabs.addTab(g, "General")
 
         # ---- Theme tab (gui_theme_page.py) ----
@@ -2730,6 +2806,7 @@ class SettingsDialog(QDialog):
             self.api.save_setting("inline_play_muted", self.inline_play_muted.isChecked())
             self.api.save_setting("thumb_click_mode", self.thumb_click_mode.currentData() or "inline")
             self.api.save_setting("text_scale", int(self.text_scale.currentData() or 100))
+            self.api.save_setting("app_font", self.app_font.currentData() or "")
             # --- v4 (Session 6) ---
             tv = self.theme_page.values()
             self.api.save_setting("accent", tv["accent"])
@@ -2983,11 +3060,23 @@ class Sidebar(QFrame):
         btn = self.buttons[name]
         n = self._counts.get(name, 0)
         label = f"{name}  ({n})" if n else name
+        ic = _qicon(_SB_ICONS.get(name), SOFT) if self._collapsed else None
         if self._collapsed:
-            text, tip = self.ICONS.get(name, name[:1]), label
+            text = "" if ic is not None else self.ICONS.get(name, name[:1])
+            tip = label
             css = "QToolButton { text-align: center; padding: 0; }"
         else:
             text, tip, css = label, "", ""
+        mode = f"icon|{SOFT}" if ic is not None else "text"
+        if btn.property("_vg_mode") != mode:
+            btn.setProperty("_vg_mode", mode)
+            if ic is not None:
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(18, 18))
+                btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            else:
+                btn.setIcon(QIcon())
+                btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         if btn.text() != text:
             btn.setText(text)
         if btn.toolTip() != tip:
@@ -3802,17 +3891,21 @@ class MainWindow(QMainWindow):
         self.table.customContextMenuRequested.connect(self.context_menu)
         self.table.verticalHeader().setVisible(False)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        # Every other column is user-resizable (drag the header edge).
-        for c, w in {1: 80, 2: 120, 3: 90, 4: 140, 5: 90, 6: 120, 7: 70, 8: 120}.items():
+        # Batch 5: every column, Name included, is user-resizable. The last
+        # visual column absorbs spare width, and each column has a floor
+        # (_clamp_section) so none can be dragged shut.
+        for c in range(len(self.model.HEADERS)):
             hh.setSectionResizeMode(c, QHeaderView.Interactive)
+        for c, w in {0: 360, 1: 80, 2: 120, 3: 90, 4: 140, 5: 90, 6: 120, 7: 70, 8: 120}.items():
             self.table.setColumnWidth(c, w)
-        hh.setMinimumSectionSize(60)
-        hh.setStretchLastSection(False)
+        hh.setMinimumSectionSize(40)
+        hh.setStretchLastSection(True)
+        self._hdr_clamping = False
         hh.setSectionsMovable(True)
         hh.moveSection(7, 4)   # ETA shows after Speed; logical order is unchanged
         hh.moveSection(8, 1)   # Source sits right after Name
         self._restore_header_state()
+        hh.sectionResized.connect(self._clamp_section)
         self._hdr_timer = QTimer(self)
         self._hdr_timer.setSingleShot(True)
         self._hdr_timer.timeout.connect(self._save_header_state)
@@ -4115,31 +4208,60 @@ class MainWindow(QMainWindow):
     def _apply_toolbar_text(self):
         extra = 262 if getattr(self, "shell", None) else 0   # the shell eats width
         compact = getattr(self, "_blanc", False) or (self.width() - extra) < 1240
+        col = _toolbar_icon_color()
         for btn, icon, label in getattr(self, "_tb", []):
-            btn.setText(icon if compact else f"{icon}  {label}")
+            ic = _qicon(_TB_ICONS.get(label), col)
+            if ic is not None:
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(16, 16))
+                btn.setText("" if compact else label)
+            else:
+                btn.setText(icon if compact else f"{icon}  {label}")
             btn.setToolTip(label)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._apply_toolbar_text()
 
+    # Minimum width per logical column (Name, Size, Progress, Speed, Status,
+    # Category, Completed, ETA, Source).
+    _COL_MIN = {0: 160, 1: 60, 2: 100, 3: 70, 4: 110, 5: 70, 6: 100, 7: 60, 8: 80}
+
+    def _clamp_section(self, logical, old, new):
+        if getattr(self, "_hdr_clamping", False):
+            return
+        hh = self.table.horizontalHeader()
+        if hh.stretchLastSection() and hh.visualIndex(logical) == hh.count() - 1:
+            return      # the stretched column is sized by Qt
+        lo = self._COL_MIN.get(logical, 60)
+        if new < lo:
+            self._hdr_clamping = True
+            try:
+                hh.resizeSection(logical, lo)
+            finally:
+                self._hdr_clamping = False
+
     def _restore_header_state(self):
+        # Saved under "table_header_v2": the old "table_header" (Name was a
+        # fixed Stretch column) is ignored, which resets the layout once.
         try:
-            raw = _read_gui_state().get("table_header")
+            raw = _read_gui_state().get("table_header_v2")
             if not raw:
                 return
             hh = self.table.horizontalHeader()
             if hh.restoreState(QByteArray(base64.b64decode(raw))):
-                hh.setSectionResizeMode(0, QHeaderView.Stretch)
-                for c in range(1, len(self.model.HEADERS)):
+                for c in range(len(self.model.HEADERS)):
                     hh.setSectionResizeMode(c, QHeaderView.Interactive)
+                    if hh.sectionSize(c) < self._COL_MIN.get(c, 60):
+                        hh.resizeSection(c, self._COL_MIN.get(c, 60))
+                hh.setStretchLastSection(True)
         except Exception:
             pass
 
     def _save_header_state(self):
         try:
             hh = self.table.horizontalHeader()
-            _write_gui_state({"table_header": base64.b64encode(
+            _write_gui_state({"table_header_v2": base64.b64encode(
                 bytes(hh.saveState())).decode("ascii")})
         except Exception:
             pass
