@@ -29,7 +29,7 @@ except ImportError:  # Not on Windows
     winsound = None
 
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QAction, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -363,19 +363,34 @@ class WaveformWidget(QWidget):
 # ---------------------------------------------------------------------------
 
 class SoundGeneratorWindow(QMainWindow):
-    """Preview, name, save and manage procedurally generated sounds."""
+    """Preview, name, save and manage procedurally generated sounds.
 
-    def __init__(self) -> None:
-        super().__init__()
+    This works two ways:
+      * Standalone: run this file and it is the whole app (see main()).
+      * Embedded in Video Grabber: pass the app's main window as
+        ``parent`` and it opens as a child window of the app -- see
+        open_sound_generator() below, which is what a menu item /
+        toolbar button in Video Grabber should call.
+
+    Args:
+        parent:     Optional parent widget (Video Grabber's main window).
+        sounds_dir: Folder to save to / list from. Defaults to ./sounds/
+                    next to this file. Pass Video Grabber's real sounds
+                    folder here if sounds.py keeps sounds somewhere else.
+    """
+
+    def __init__(self, parent=None, sounds_dir: str | Path | None = None) -> None:
+        super().__init__(parent)
         self.setWindowTitle("Video Grabber -- Sound Generator")
         self.resize(760, 360)
 
+        self.sounds_dir = Path(sounds_dir) if sounds_dir else SOUNDS_DIR
         self.temp_path: Path | None = None
 
         # Fallback player (only actually used when winsound is missing).
         self._fallback_player = QSoundEffect(self) if QSoundEffect else None
 
-        SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
+        self.sounds_dir.mkdir(parents=True, exist_ok=True)
 
         # --- Left side: generation + preview + saving -------------------
         self.generate_button = QPushButton("Generate New Sound")
@@ -514,10 +529,10 @@ class SoundGeneratorWindow(QMainWindow):
                                 "Please enter a name for the sound.")
             return
 
-        destination = SOUNDS_DIR / f"{name}.wav"
+        destination = self.sounds_dir / f"{name}.wav"
         # Final safeguard, independent of _clean_name: the file we are
-        # about to write really must live directly inside ./sounds/.
-        if destination.parent.resolve() != SOUNDS_DIR.resolve():
+        # about to write really must live directly inside the sounds folder.
+        if destination.parent.resolve() != self.sounds_dir.resolve():
             QMessageBox.warning(self, "Invalid name",
                                 "That name would save outside the sounds folder.")
             return
@@ -565,7 +580,7 @@ class SoundGeneratorWindow(QMainWindow):
     def refresh_list(self, select_name: str | None = None) -> None:
         """Reload the list widget from ./sounds/."""
         self.sounds_list.clear()
-        for wav_path in sorted(SOUNDS_DIR.glob("*.wav")):
+        for wav_path in sorted(self.sounds_dir.glob("*.wav")):
             self.sounds_list.addItem(wav_path.name)
             if wav_path.name == select_name:
                 self.sounds_list.setCurrentRow(self.sounds_list.count() - 1)
@@ -578,7 +593,7 @@ class SoundGeneratorWindow(QMainWindow):
 
     def _selected_path(self) -> Path | None:
         item = self.sounds_list.currentItem()
-        return SOUNDS_DIR / item.text() if item else None
+        return self.sounds_dir / item.text() if item else None
 
     def on_play(self) -> None:
         """Play the selected saved sound (async) and preview its waveform."""
@@ -628,7 +643,101 @@ class SoundGeneratorWindow(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Integration: open this from inside Video Grabber
+# ---------------------------------------------------------------------------
+
+def open_sound_generator(
+    parent=None, sounds_dir: str | Path | None = None
+) -> SoundGeneratorWindow:
+    """Open the sound generator from inside Video Grabber. Call this
+    from a menu item or button in the app's main window, e.g.:
+
+        from sound_generator import open_sound_generator
+
+        # Tools menu (Video Grabber already has one in its menu bar):
+        action = QAction("Generate Sounds...", self)
+        action.triggered.connect(lambda: open_sound_generator(self))
+        tools_menu.addAction(action)
+
+    Behaviour notes:
+      * Non-modal -- the user can keep using Video Grabber while it is
+        open, and closing it returns them to the app, nothing restarts.
+      * Calling it again while it is already open just brings the
+        existing window to the front instead of opening a second copy
+        (which would fight over the same temp preview file).
+      * A reference is stored on the parent (``parent._sound_generator``).
+        Keep it: without a reference Qt can garbage-collect the window
+        and it will vanish as soon as the click handler returns.
+    """
+    existing = getattr(parent, "_sound_generator", None) if parent else None
+    if existing is not None:
+        try:
+            if existing.isVisible():
+                existing.raise_()
+                existing.activateWindow()
+                return existing
+        except RuntimeError:
+            # The underlying C++ object was already deleted (the window
+            # was closed with WA_DeleteOnClose somewhere) -- fall through
+            # and create a fresh one.
+            pass
+
+    window = SoundGeneratorWindow(parent, sounds_dir=sounds_dir)
+    if parent is not None:
+        parent._sound_generator = window
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    return window
+
+
+def install_sound_generator(
+    parent, sounds_dir: str | Path | None = None, toolbar=None
+) -> QAction:
+    """One-line integration for Video Grabber's main window.
+
+    Add this at the END of the main window's __init__ (after its menu
+    bar exists):
+
+        from sound_generator import install_sound_generator
+        install_sound_generator(self)
+
+    It finds the existing "Tools" menu by title -- no need to know the
+    variable name it was stored in -- creates one if there isn't one,
+    and adds a "Generate Sounds..." item to it. Optionally also pass a
+    QToolBar to get the same action as a toolbar button:
+
+        install_sound_generator(self, toolbar=self.toolbar)
+
+    Pass ``sounds_dir`` if sounds.py keeps its sounds anywhere other
+    than ./sounds/ next to this file.
+    """
+    action = QAction("Generate Sounds...", parent)
+    action.triggered.connect(
+        lambda _checked=False: open_sound_generator(parent, sounds_dir=sounds_dir)
+    )
+
+    tools_menu = None
+    menu_bar = parent.menuBar()
+    for menu_action in menu_bar.actions():
+        menu = menu_action.menu()
+        if menu and menu.title().replace("&", "").strip().lower() == "tools":
+            tools_menu = menu
+            break
+    if tools_menu is None:
+        tools_menu = menu_bar.addMenu("Tools")
+    tools_menu.addAction(action)
+
+    if toolbar is not None:
+        toolbar.addAction(action)
+
+    # Keep a reference, same reason as in open_sound_generator().
+    parent._sound_generator_action = action
+    return action
+
+
+# ---------------------------------------------------------------------------
+# Entry point (standalone use only -- not used when embedded)
 # ---------------------------------------------------------------------------
 
 def main() -> None:
