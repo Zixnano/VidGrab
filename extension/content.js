@@ -68,6 +68,7 @@
         }
         if (!cfg.microPill) hideMicro();
         if (cfg.pillCorner !== prev.pillCorner) syncAllPills();
+        if (cfg.microPillPos !== prev.microPillPos && microTarget) placeMicro();
       }
       if (changes.pillPrefs) {
         pillPrefs = changes.pillPrefs.newValue || {};
@@ -1821,8 +1822,10 @@
     return p;
   }
 
-  // Top-right corner of the part of the element that is on screen, in page
-  // coordinates (the pill is position:absolute on the root element).
+  // The configured corner (Batch 3: cfg.microPillPos; top-right by
+  // default, as it always was) of the part of the element that is on
+  // screen, in page coordinates (the pill is position:absolute on the
+  // root element).
   function placeMicro() {
     microPlaceQueued = false;
     const el = microTarget;
@@ -1835,10 +1838,20 @@
       return;
     }
     const vw = document.documentElement.clientWidth || innerWidth;
+    const vh = document.documentElement.clientHeight || innerHeight;
     const right = Math.min(r.right, vw);
+    const left = Math.max(r.left, 0);
     const top = Math.max(r.top, 0);
-    microPill.style.left = (right + scrollX - MICRO_W - 6) + "px";
-    microPill.style.top = (top + scrollY + 6) + "px";
+    const bottom = Math.min(r.bottom, vh);
+    const pos = cfg.microPillPos || "tr";
+    const px = (pos === "tl" || pos === "bl")
+      ? left + scrollX + 6
+      : right + scrollX - MICRO_W - 6;
+    const py = (pos === "br" || pos === "bl")
+      ? bottom + scrollY - MICRO_SIZE - 6
+      : top + scrollY + 6;
+    microPill.style.left = px + "px";
+    microPill.style.top = py + "px";
     microPill.style.display = "flex";
   }
 
@@ -1916,9 +1929,16 @@
     return Promise.resolve(fallback());
   }
 
+  function microFormatBytes(n) {
+    if (!Number.isFinite(n) || n < 0) return "";
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1).replace(/\.0$/, "") + " KB";
+    return (n / (1024 * 1024)).toFixed(2).replace(/\.?0+$/, "") + " MB";
+  }
+
   function openMicroMenu(x, y, el) {
     if (!el) return;
-    openPillCtx(x, y, [
+    const rows = [
       { label: "Download Image", onClick: () => sendMicro(el) },
       { label: "Download ALL Images", onClick: () => downloadAllPageImages() },
       { sep: true },
@@ -1928,7 +1948,28 @@
           copyToClipboard(url).then((ok) =>
             microToastShow(ok ? "Image URL copied" : "Couldn't copy the URL", !ok));
         } },
-    ]);
+    ];
+    // Batch 3: optional file-size header (microPillSize). The size needs a
+    // HEAD request, which many hosts refuse or do not expose to content
+    // scripts; when it cannot be read, the menu just opens without the
+    // line. The wait is capped so the menu never feels stuck.
+    if (cfg.microPillSize) {
+      const url = microUrlFor(el);
+      if (url) {
+        new Promise((resolve) => {
+          const to = setTimeout(() => resolve(0), 600);
+          fetch(url, { method: "HEAD" }).then((r) => {
+            clearTimeout(to);
+            resolve(parseInt(r.headers.get("content-length") || "0", 10) || 0);
+          }).catch(() => { clearTimeout(to); resolve(0); });
+        }).then((n) => {
+          const label = microFormatBytes(n);
+          openPillCtx(x, y, label ? [{ header: "File size: " + label }, ...rows] : rows);
+        });
+        return;
+      }
+    }
+    openPillCtx(x, y, rows);
   }
 
   // "Download ALL Images": every <img> on the page that is a real picture
@@ -2153,7 +2194,9 @@
       chrome.storage.onChanged.addListener((c, area) => {
         if (area !== "local") return;
         if (c.blobHookEnabled) hookEnabled = c.blobHookEnabled.newValue !== false;
-        if (c.blobHookEnabled || c.interceptDownloads || c.apiToken) syncArmed(true);
+        // Batch 3: the intercept switch lives in vgSettings now, so a flip
+        // there (not the old standalone key) is what re-arms the hook.
+        if (c.blobHookEnabled || c[VG_SETTINGS_KEY] || c.apiToken) syncArmed(true);
       });
       chrome.storage.local.get("blobHookEnabled").then((st) => {
         hookEnabled = st.blobHookEnabled !== false;

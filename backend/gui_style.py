@@ -64,10 +64,25 @@ def build_qss(settings_state=None):
     _wt = str(p.get("font_weight") or "normal").strip().lower()
     _weight = "" if _wt in ("", "normal", "400") else f"\n    font-weight: {_wt};"
     # Preset border thickness (Classic LCD and High Contrast are thick).
+    # Batch 3: the floor is 0, not 1 — Glass sets border_w=0 and means it
+    # (the old `or 1` also turned an explicit 0 back into 1).
     try:
-        _bw = f"{max(1, min(6, int(round(float(p.get('border_w', 1) or 1)))))}px"
+        _bwv = p.get("border_w", 1)
+        _bwn = max(0, min(6, int(round(float(1 if _bwv is None else _bwv)))))
     except (TypeError, ValueError):
-        _bw = "1px"
+        _bwn = 1
+    _bw = f"{_bwn}px"
+    # Batch 3: a preset may carry border_soft (Glass: rgba(255,255,255,0.1))
+    # — a faint 1px line used INSTEAD of the _bw border on the panel
+    # surfaces and the download table, so a borderless preset's lighter
+    # panels still read as separate sheets. Qt's QSS parser takes the CSS
+    # rgba() form as-is. Empty for every other preset, where _panel_border
+    # and _hdr_border expand to exactly what those rules said before.
+    _soft = str(p.get("border_soft") or "").strip()
+    _panel_border = f"1px solid {_soft}" if _soft else f"{_bw} solid {p['border']}"
+    _hdr_border = f"1px solid {_soft}" if _soft else f"1px solid {p['border']}"
+    # A borderless preset still needs a visible keyboard focus ring.
+    _bw_focus = _bw if _bwn else "1px"
     _ind = _z(16)       # checkbox / radio indicator size
     _sb = _z(10)        # scrollbar thickness
 
@@ -129,7 +144,7 @@ QToolButton[nav="true"][active="true"] {{ background: {p['bg_sel']}; color: {p['
 QTableView {{
     background: {p['bg_panel']};
     alternate-background-color: {p['bg_base']};
-    border: {_bw} solid {p['border']};
+    border: {_panel_border};
     border-radius: {_rad};
     gridline-color: {p['border']};
     selection-background-color: {p['bg_sel']};
@@ -141,7 +156,7 @@ QTableView::item:hover {{ background: {p['bg_hover']}; }}
 QTableView::item:selected {{ background: {p['bg_sel']}; }}
 QHeaderView::section {{
     background: {p['bg_elevated']}; color: {p['text_muted']}; border: 0;
-    border-bottom: 1px solid {p['border']}; padding: {pad(11, 10)};
+    border-bottom: {_hdr_border}; padding: {pad(11, 10)};
     font-size: {fs(11)}px; font-weight: 600;
 }}
 QHeaderView::section:hover {{ color: {p['text']}; }}
@@ -188,7 +203,7 @@ QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit {{
     selection-background-color: {p['accent_dim']};
 }}
 QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: {p['border_hi']}; }}
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus, QPlainTextEdit:focus {{ border-color: {p['accent']}; }}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus, QPlainTextEdit:focus {{ border: {_bw_focus} solid {p['accent']}; }}
 QComboBox QAbstractItemView {{
     background: {p['bg_elevated']}; border: {_bw} solid {p['border']};
     selection-background-color: {p['bg_sel']};
@@ -211,7 +226,7 @@ QProgressBar {{
 QProgressBar::chunk {{ background: {p['accent']}; border-radius: {p['radius_pill']}; }}
 
 /* ---- tabs and lists ---- */
-QTabWidget::pane {{ border: {_bw} solid {p['border']}; border-radius: {_rad}; top: -1px; }}
+QTabWidget::pane {{ border: {_panel_border}; border-radius: {_rad}; top: -1px; }}
 QTabBar::tab {{
     background: {p['bg_panel']}; border: {_bw} solid {p['border']}; border-bottom: none;
     border-top-left-radius: {_rad}; border-top-right-radius: {_rad};
@@ -219,7 +234,7 @@ QTabBar::tab {{
 }}
 QTabBar::tab:selected {{ background: {p['bg_elevated']}; color: {p['text']}; border-bottom: 2px solid {p['accent']}; }}
 QTabBar::tab:hover:!selected {{ background: {p['bg_elevated']}; }}
-QListWidget {{ background: {p['bg_panel']}; border: {_bw} solid {p['border']}; border-radius: {_rad}; outline: 0; }}
+QListWidget {{ background: {p['bg_panel']}; border: {_panel_border}; border-radius: {_rad}; outline: 0; }}
 QListWidget::item {{ padding: {pad(8, 12)}; border-radius: {_rs}; }}
 QListWidget::item:hover {{ background: {p['bg_hover']}; }}
 QListWidget::item:selected {{ background: {p['bg_sel']}; color: {p['text']}; }}
@@ -228,15 +243,15 @@ QListWidget#SettingsNav::item {{ padding: {pad(9, 12)}; color: {p['text_soft']};
 QListWidget#SettingsNav::item:selected {{ background: {p['bg_sel']}; color: {p['text']}; }}
 
 /* ---- focus, hover and disabled (v5.5) ---- */
-QPushButton:focus {{ border: {_bw} solid {p['accent']}; border-bottom: 2px solid {p['accent']}; }}
+QPushButton:focus {{ border: {_bw_focus} solid {p['accent']}; border-bottom: 2px solid {p['accent']}; }}
 QPushButton#primary:focus {{ border: 2px solid {p['text']}; }}
 QPushButton#primary:disabled {{ background: {p['bg_elevated']}; color: {_dis}; border: {_bw} solid {p['border']}; }}
-QToolButton:focus, #ToolbarButton:focus, #SidebarTool:focus {{ border: {_bw} solid {p['accent']}; }}
-QToolButton[nav="true"]:focus {{ border: {_bw} solid {p['accent']}; }}
+QToolButton:focus, #ToolbarButton:focus, #SidebarTool:focus {{ border: {_bw_focus} solid {p['accent']}; }}
+QToolButton[nav="true"]:focus {{ border: {_bw_focus} solid {p['accent']}; }}
 QCheckBox:focus, QRadioButton:focus {{ color: {p['text']}; }}
 QCheckBox::indicator:focus, QRadioButton::indicator:focus {{ border: 2px solid {p['accent']}; }}
 QTabBar::tab:focus {{ border-color: {p['accent']}; }}
-QListWidget:focus, QTableView:focus {{ border: {_bw} solid {p['accent']}; }}
+QListWidget:focus, QTableView:focus {{ border: {_bw_focus} solid {p['accent']}; }}
 QToolButton:disabled, #ToolbarButton:disabled, #SidebarTool:disabled {{ color: {_dis}; background: transparent; border-color: transparent; }}
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QTextEdit:disabled, QPlainTextEdit:disabled {{
     color: {_dis}; background: {p['bg_base']}; border-color: {p['border']}; }}
@@ -259,7 +274,7 @@ QScrollBar::handle:horizontal:hover {{ background: {p['border_hi']}; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 
 /* ---- theme page cards ---- */
-#Card {{ background: {p['bg_panel']}; border: {_bw} solid {p['border']}; border-radius: {_rad}; }}
+#Card {{ background: {p['bg_panel']}; border: {_panel_border}; border-radius: {_rad}; }}
 #CardTitle {{ font-size: {fs(13)}px; font-weight: 700; }}
 #CardHint {{ color: {p['text_muted']}; font-size: {fs(11)}px; }}
 #PageTitle {{ font-size: {fs(18)}px; font-weight: 700; }}
@@ -275,7 +290,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 #SidebarTool:hover {{ background: {p['bg_hover']}; color: {p['text']}; }}
 
 /* ---- download detail pane ---- */
-#DetailPane {{ background: {p['bg_panel']}; border: {_bw} solid {p['border']}; border-radius: {_rad}; }}
+#DetailPane {{ background: {p['bg_panel']}; border: {_panel_border}; border-radius: {_rad}; }}
 #DetailTitle {{ font-size: {fs(14)}px; font-weight: 700; }}
 #DetailSub, #StatCaption, #DetailKey {{ color: {p['text_muted']}; font-size: {fs(11)}px; }}
 #StatValue {{ font-size: {fs(13)}px; font-weight: 600; }}

@@ -21,6 +21,10 @@ def build_palette():
         # Borders
         "border":      "#242430",
         "border_hi":   "#33333f",   # hover/focus borders
+        "border_soft": "",          # Batch 3: optional faint border, a CSS
+                                    # rgba() string a preset can set for its
+                                    # panels / table rows when border_w is 0
+                                    # (Glass). Empty = unused.
 
         # Text
         "text":        "#e6e6eb",
@@ -73,7 +77,7 @@ _PRESET_DIFFS = {
                           border="#cccccc", border_hi="#ffffff", text="#ffffff",
                           text_muted="#cccccc", text_dim="#999999", accent="#00e5ff",
                           radius="0px", radius_sm="0px", radius_chip="0px",
-                          pad_scale=1.05, border_w=2, font_weight="bold"),
+                          pad_scale=1.05, border_w=3, font_weight="bold"),
     # Dark LCD screen, muted green, monospace type (the handheld screen).
     # Selecting it also turns the handheld shell on (see gui_theme_page).
     "handheld": dict(bg_base="#101412", bg_panel="#171c19", bg_elevated="#222925",
@@ -90,19 +94,23 @@ _PRESET_DIFFS = {
                         error="#7a1f12", info="#306230", radius="0px", font=_MONO,
                         radius_sm="0px", radius_chip="0px", pad_scale=0.9, border_w=3),
     # Lighter, frosted-looking blue-grey panels and big soft corners.
-    "glass": dict(bg_base="#1b2230", bg_panel="#273247", bg_elevated="#34425b",
-                  border="#4b5a77", border_hi="#6f82a6", text="#f2f6ff",
-                  text_muted="#b6c2da", text_dim="#8696b3", accent="#7fd4ff",
+    # Batch 3: lighter still, radius up to 24px and border_w=0 — panels and
+    # table rows keep their definition from border_soft, a faint 1px
+    # semi-transparent white line, instead of a drawn border.
+    "glass": dict(bg_base="#232e42", bg_panel="#303d59", bg_elevated="#3e4e6e",
+                  border="#5a6d92", border_hi="#7e93ba", text="#f2f6ff",
+                  text_muted="#c3cfe4", text_dim="#97a7c4", accent="#7fd4ff",
                   accent_dim="#4a9fc8", success="#6fe0a8", warning="#ffd479",
-                  error="#ff8a8a", info="#8fb4ff", radius="16px", font=_SEGOE,
-                  radius_sm="10px", radius_chip="16px", pad_scale=1.1),
+                  error="#ff8a8a", info="#8fb4ff", radius="24px", font=_SEGOE,
+                  radius_sm="14px", radius_chip="24px", pad_scale=1.1,
+                  border_w=0, border_soft="rgba(255,255,255,0.1)"),
     # Very dense: small type, tight corners, thin borders.
     "compact": dict(bg_base="#111113", bg_panel="#18181b", bg_elevated="#222226",
                     border="#2c2c31", border_hi="#3d3d44", text="#e4e4e8",
                     text_muted="#9a9aa4", text_dim="#6a6a74", accent="#4fc3f7",
                     accent_dim="#2f87b0", radius="2px", font=_SEGOE,
-                    radius_sm="1px", radius_chip="2px", pad_scale=0.75,
-                    border_w=1, font_scale=0.88),
+                    radius_sm="1px", radius_chip="2px", pad_scale=0.7,
+                    border_w=1, font_scale=0.8),
 }
 
 PRESET_NAMES = {
@@ -121,7 +129,7 @@ PALETTE = THEME_PRESETS["amoled_black"]
 # The layout layer (shape and spacing). A color-only preset or theme file
 # simply inherits the defaults above, so older themes keep working.
 LAYOUT_KEYS = ("radius", "radius_sm", "radius_chip", "radius_pill", "pad_scale",
-               "border_w", "font_scale", "font_weight")
+               "border_w", "font_scale", "font_weight", "border_soft")
 
 # Computed from the base tokens; the user can still override them.
 DERIVED = ("bg_side", "bg_input", "bg_hover", "bg_sel", "text_soft", "text_on_accent")

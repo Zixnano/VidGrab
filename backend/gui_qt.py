@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QColorDialog, QTableWidget, QTableWidgetItem,
     QStatusBar, QSizePolicy, QAbstractItemView, QStyledItemDelegate,
     QInputDialog, QFileDialog, QCheckBox, QSystemTrayIcon, QStyle,
-    QSpinBox, QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
+    QSpinBox, QSlider, QListWidget, QListWidgetItem, QTabWidget, QProgressBar,
     QStackedWidget, QScrollArea, QGroupBox, QBoxLayout, QGridLayout, QSplitter,
     QRubberBand,
 )
@@ -47,6 +47,10 @@ CONFIG_PATH = HOME / "settings.json"
 from palette import resolve_palette
 from settings import CATEGORIES, DISPLAY_VERSION, detect_type  # single source of truth: settings.py
 from gui_detail import IMAGE_EXT, VIDEO_EXT, DetailPane, ThumbLoader
+# Batch 3: Tools > "Generate Sounds..." — the procedural completion-sound
+# maker (sound_generator.py, same folder). install_sound_generator(self) is
+# called in MainWindow.__init__ below.
+from sound_generator import install_sound_generator
 
 try:    # Batch 5: FontAwesome icons for the toolbar and the collapsed sidebar.
     import qtawesome as _qta       # optional: without it the old glyphs are used
@@ -2131,16 +2135,33 @@ class SettingsDialog(QDialog):
         self.inline_play_muted.setChecked(bool(s.get("inline_play_muted", False)))
         gl.addRow(self.inline_play_muted)
         # v5.5: global text size (scales the font sizes in the stylesheet)
-        self.text_scale = QComboBox()
-        for _pct in (85, 100, 115, 130, 150):
-            self.text_scale.addItem(f"{_pct}%" + (" (default)" if _pct == 100 else ""), userData=_pct)
+        # Batch 3: a slider (100-150%) instead of the old preset combo, with
+        # a live % readout beside it. A saved value outside the range (the
+        # old combo offered 85%) is clamped into it.
         try:
             _cur = int(s.get("text_scale", 100) or 100)
         except (TypeError, ValueError):
             _cur = 100
-        _i = self.text_scale.findData(_cur)
-        self.text_scale.setCurrentIndex(_i if _i >= 0 else 1)
-        gl.addRow("Text size", self.text_scale)
+        _cur = max(100, min(150, _cur))
+        self.text_scale = QSlider(Qt.Horizontal)
+        self.text_scale.setRange(100, 150)
+        self.text_scale.setSingleStep(1)
+        self.text_scale.setPageStep(5)
+        self.text_scale.setTickPosition(QSlider.TicksBelow)
+        self.text_scale.setTickInterval(10)
+        self.text_scale.setValue(_cur)
+        self.text_scale.setToolTip("Above 115% the main window compacts itself: "
+                                   "toolbar labels, the Activity Log and the "
+                                   "Source / ETA columns hide so nothing overflows.")
+        self.text_scale_label = QLabel(f"{_cur}%")
+        self.text_scale.valueChanged.connect(
+            lambda v: self.text_scale_label.setText(f"{int(v)}%"))
+        _ts_row = QWidget()
+        _ts_lay = QHBoxLayout(_ts_row)
+        _ts_lay.setContentsMargins(0, 0, 0, 0)
+        _ts_lay.addWidget(self.text_scale, 1)
+        _ts_lay.addWidget(self.text_scale_label)
+        gl.addRow("Text size", _ts_row)
         # Batch 2: App Font. Every installed family; "Theme default" keeps the
         # preset's own font. Saved as settings "app_font".
         self.app_font = QComboBox()
@@ -2160,6 +2181,12 @@ class SettingsDialog(QDialog):
         self.app_font.setMaxVisibleItems(20)
         self.app_font.setToolTip("Overrides the theme's font everywhere in the app.")
         gl.addRow("App Font", self.app_font)
+        # Batch 3: live font preview. The dropdown re-skins the running app
+        # the moment it changes; nothing is written to settings until Save,
+        # and Cancel puts the saved font back (see done() below).
+        self._saved_app_font = _saved_font
+        self._font_preview_on = False
+        self.app_font.currentIndexChanged.connect(self._preview_app_font)
         tabs.addTab(g, "General")
 
         # ---- Theme tab (gui_theme_page.py) ----
@@ -2743,6 +2770,37 @@ class SettingsDialog(QDialog):
         if not self.rules_table.rowCount():
             self._add_rule_example()
 
+    def _preview_app_font(self, *_):
+        """Batch 3: apply the App Font dropdown's family to the running app
+        without saving it, so the user sees the real result before deciding.
+        Mirrors reapply_theme() but with the dropdown's value in place of
+        the saved one."""
+        try:
+            fam = self.app_font.currentData() or ""
+            st = dict(load_settings())
+            st["app_font"] = fam
+            from gui_style import build_qss
+            app = QApplication.instance()
+            if app is not None:
+                app.setStyleSheet(build_qss(st))
+            self._font_preview_on = (fam != self._saved_app_font)
+        except Exception:
+            pass
+
+    def done(self, r):
+        # Batch 3: closing this dialog without saving (Cancel, Esc, the
+        # window X — all of them end here as Rejected) after a font preview
+        # puts the saved font back. Saving ends as Accepted, and _save_inner
+        # has already re-applied the theme with the new font, so only a
+        # rejection reverts.
+        if r == QDialog.Rejected and getattr(self, "_font_preview_on", False):
+            self._font_preview_on = False
+            try:
+                reapply_theme()
+            except Exception:
+                pass
+        super().done(r)
+
     def _save(self):
         try:
             self._save_inner()
@@ -2805,7 +2863,7 @@ class SettingsDialog(QDialog):
             self.api.save_setting("blanc_mode", self.blanc_mode.isChecked())
             self.api.save_setting("inline_play_muted", self.inline_play_muted.isChecked())
             self.api.save_setting("thumb_click_mode", self.thumb_click_mode.currentData() or "inline")
-            self.api.save_setting("text_scale", int(self.text_scale.currentData() or 100))
+            self.api.save_setting("text_scale", int(self.text_scale.value() or 100))
             self.api.save_setting("app_font", self.app_font.currentData() or "")
             # --- v4 (Session 6) ---
             tv = self.theme_page.values()
@@ -3608,6 +3666,8 @@ class MainWindow(QMainWindow):
         self._trim_timer = QTimer(self)
         self._trim_timer.timeout.connect(lambda: self.trim_ui_memory(silent=True))
         self._trim_timer.start(10 * 60 * 1000)
+        # Batch 3: Tools > "Generate Sounds..." (see the import at the top).
+        install_sound_generator(self)
         self.select_category("All")
         self.refresh()
         self.refresh_diskspace()
@@ -4201,13 +4261,42 @@ class MainWindow(QMainWindow):
         so this can't fight sidebar collapse or the Queue view."""
         on = bool(load_settings().get("blanc_mode", False))
         self._blanc = on
-        for w in (self._log_label, self.log, self.hold_label, self.version_label):
+        for w in (self.hold_label, self.version_label):
             w.setVisible(not on)
+        # The Activity Log's visibility is decided together with the text
+        # scale (Batch 3): either Blanc or a scale above 115% hides it.
+        self._apply_text_scale_layout()
+
+    def _apply_text_scale_layout(self):
+        """Batch 3: smart responsive scaling. While Text size is above 115%
+        the main window hands the space back so the layout still fits at
+        150% without a horizontal scrollbar: the toolbar goes icons-only,
+        the Activity Log hides, and the two least important table columns
+        (ETA, logical 7; Source, logical 8) hide. At or below 115% all of
+        it is restored. Blanc mode composes on top of this (it is checked
+        again here), never against it. Called from _apply_blanc(), which
+        runs at startup and on every theme/settings re-apply."""
+        try:
+            scale = int(load_settings().get("text_scale", 100) or 100)
+        except (TypeError, ValueError):
+            scale = 100
+        big = scale > 115
+        self._scale_compact = big
+        log_on = not big and not getattr(self, "_blanc", False)
+        for w in (getattr(self, "_log_label", None), getattr(self, "log", None)):
+            if w is not None:
+                w.setVisible(log_on)
+        table = getattr(self, "table", None)
+        if table is not None:
+            table.setColumnHidden(7, big)   # ETA
+            table.setColumnHidden(8, big)   # Source
         self._apply_toolbar_text()
 
     def _apply_toolbar_text(self):
         extra = 262 if getattr(self, "shell", None) else 0   # the shell eats width
-        compact = getattr(self, "_blanc", False) or (self.width() - extra) < 1240
+        compact = (getattr(self, "_blanc", False)
+                   or getattr(self, "_scale_compact", False)
+                   or (self.width() - extra) < 1240)
         col = _toolbar_icon_color()
         for btn, icon, label in getattr(self, "_tb", []):
             ic = _qicon(_TB_ICONS.get(label), col)

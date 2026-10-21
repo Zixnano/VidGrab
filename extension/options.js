@@ -6,10 +6,34 @@
   if (apiToken) tokenInput.value = apiToken;
 
   const interceptCheckbox = document.getElementById("interceptDownloads");
-  const { interceptDownloads } = await chrome.storage.local.get("interceptDownloads");
-  interceptCheckbox.checked = !!interceptDownloads;
+  // Batch 3: the switch lives in vgSettings (vgsettings.js) — the same value
+  // the popup's Downloads toggle edits, and the one background.js reads.
+  // The old standalone "interceptDownloads" key is only a migration
+  // fallback: if vgSettings has never carried the switch, adopt the legacy
+  // value once (mirrors the migration in background.js).
+  {
+    const stored = await chrome.storage.local.get([VG_SETTINGS_KEY, "interceptDownloads"]);
+    const rawVg = stored[VG_SETTINGS_KEY];
+    if (!(rawVg && typeof rawVg.interceptDownloads === "boolean")
+        && typeof stored.interceptDownloads === "boolean") {
+      const adopted = vgNormalize({ ...(rawVg || {}), interceptDownloads: stored.interceptDownloads });
+      try { await chrome.storage.local.set({ [VG_SETTINGS_KEY]: adopted }); } catch (e) {}
+      interceptCheckbox.checked = adopted.interceptDownloads;
+    } else {
+      interceptCheckbox.checked = !!vgNormalize(rawVg).interceptDownloads;
+    }
+  }
   interceptCheckbox.addEventListener("change", async () => {
-    await chrome.storage.local.set({ interceptDownloads: interceptCheckbox.checked });
+    const cur = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    await chrome.storage.local.set({
+      [VG_SETTINGS_KEY]: { ...cur, interceptDownloads: interceptCheckbox.checked },
+    });
+  });
+  // Keep this page honest if the popup toggle flips the switch meanwhile.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes[VG_SETTINGS_KEY]) {
+      interceptCheckbox.checked = !!vgNormalize(changes[VG_SETTINGS_KEY].newValue).interceptDownloads;
+    }
   });
 
   const blobHookCheckbox = document.getElementById("blobHookEnabled");

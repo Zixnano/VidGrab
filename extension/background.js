@@ -651,18 +651,38 @@ async function sendToBackend({ url, pageUrl, filename, format_id, target_format 
   }
 }
 
-// Mirror of the interceptDownloads option so the downloads listener never has
-// to await storage before it can cancel. Loaded once per service-worker start
+// Mirror of the intercept setting so the downloads listener never has to
+// await storage before it can cancel. Loaded once per service-worker start
 // and kept current by storage.onChanged.
+//
+// Batch 3: the setting itself now lives in vgSettings (vgsettings.js) — the
+// single source of truth that the popup's Downloads toggle and the options
+// page toggle both edit. The old standalone "interceptDownloads" storage
+// key is read ONCE here as a migration fallback: when vgSettings has never
+// carried the switch, a legacy value is adopted and written into vgSettings
+// so both toggles show the truth; from then on the legacy key is ignored.
 let interceptDownloads = false;
 let interceptLoaded = false;
-const interceptReady = chrome.storage.local.get("interceptDownloads").then(
-  (v) => { interceptDownloads = !!v.interceptDownloads; interceptLoaded = true; },
-  () => { interceptLoaded = true; }
-);
+const interceptReady = (async () => {
+  try {
+    const st = await chrome.storage.local.get([VG_SETTINGS_KEY, "interceptDownloads"]);
+    const raw = st[VG_SETTINGS_KEY];
+    if (raw && typeof raw === "object" && typeof raw.interceptDownloads === "boolean") {
+      interceptDownloads = raw.interceptDownloads;
+    } else if (typeof st.interceptDownloads === "boolean") {
+      interceptDownloads = st.interceptDownloads;
+      try {
+        await chrome.storage.local.set({
+          [VG_SETTINGS_KEY]: vgNormalize({ ...(raw || {}), interceptDownloads }),
+        });
+      } catch (e) { /* the mirror above already holds the value */ }
+    }
+  } catch (e) { /* defaults: interception stays off */ }
+  interceptLoaded = true;
+})();
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.interceptDownloads) {
-    interceptDownloads = !!changes.interceptDownloads.newValue;
+  if (area === "local" && changes[VG_SETTINGS_KEY]) {
+    interceptDownloads = !!vgNormalize(changes[VG_SETTINGS_KEY].newValue).interceptDownloads;
     interceptLoaded = true;
   }
 });

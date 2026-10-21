@@ -1095,11 +1095,38 @@ def changelog_route():
         if cached:  # stale notes beat none when GitHub is unreachable
             return jsonify(cached)
         return jsonify({"ok": False, "error": str(e)}), 502
+    # Batch 3: clean the notes for the app. The release plumbing is noise
+    # in the Activity Log, so drop the "Automatic build from commit ..."
+    # line and any asset lines that point at the .zip download. An asset
+    # line is a line whose ONLY content is a .zip filename, a URL ending
+    # in .zip, or a markdown link to one — prose that merely mentions a
+    # zip (even with a URL in it) is a real changelog note and is kept.
+    _ZIP_ASSET_RE = re.compile(
+        r"^[\s\-\*\+]*"                       # optional list marker / whitespace
+        r"(?:"
+            r"[\w.\-]+\.zip\b"                # bare "name.zip"
+            r"|https?://\S+\.zip\b"           # bare URL ending in .zip
+            r"|\[[^\]]*\]\(\s*https?://\S+\.zip\s*\)"   # [label](url.zip)
+        r")\s*$",                             # nothing else on the line
+        re.IGNORECASE,
+    )
+
+    def _clean_changelog(body):
+        kept = []
+        for ln in str(body or "").splitlines():
+            low = ln.strip().lower()
+            if low.startswith("automatic build from commit"):
+                continue
+            if _ZIP_ASSET_RE.match(ln):
+                continue
+            kept.append(ln)
+        return "\n".join(kept).strip()
+
     data = {
         "ok": True,
         "tag": rel.get("tag_name") or "",
         "name": rel.get("name") or "",
-        "body": rel.get("body") or "",
+        "body": _clean_changelog(rel.get("body") or ""),
         "url": rel.get("html_url") or "",
         "published_at": rel.get("published_at") or "",
     }

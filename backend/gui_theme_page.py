@@ -3,6 +3,7 @@ optional fine-tune section. Pure UI. SettingsDialog creates one ThemePage
 and reads ThemePage.values() on Save. Nothing here touches the network or
 saves settings by itself."""
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -63,6 +64,24 @@ def _num(v, d=1.0):
         return float(v)
     except (TypeError, ValueError):
         return d
+
+
+def _soft_color(v):
+    """'rgba(255,255,255,0.1)' -> a QColor with alpha, or None. Palette
+    tokens are hex, but a preset may carry a CSS rgba() string for a faint
+    border (Batch 3: Glass's border_soft); QColor does not parse that form,
+    so the preview converts it by hand. The alpha may be 0..1 or 0..255."""
+    try:
+        m = re.match(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*"
+                     r"(?:,\s*([0-9.]+)\s*)?\)", str(v or "").strip())
+        if not m:
+            return None
+        a = float(m.group(4)) if m.group(4) is not None else 1.0
+        alpha = int(round(a * 255)) if a <= 1 else int(a)
+        return QColor(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                      max(0, min(255, alpha)))
+    except Exception:
+        return None
 
 
 def _pick_color(initial, parent, title):
@@ -175,7 +194,12 @@ class MiniPreview(QWidget):
         fmul = _num(t.get("font_scale"), 1.0)
         bold_all = str(t.get("font_weight") or "normal").lower() in ("bold", "600", "700")
         pf = 0.6 + 0.4 * ps                       # row pitch follows the density
-        bpen = max(1.0, bw * max(1.0, s * 0.7))   # border thickness
+        # Batch 3: border_w is drawn as-is — 0 really means no border (the
+        # old max(1.0, ...) floor hid the Glass preset's shape). A preset
+        # with border_soft (Glass) instead gets a faint 1px line on its
+        # panel / table / input boxes, drawn by box(..., soft_border=True).
+        bpen = bw * max(1.0, s * 0.7)             # border thickness
+        soft = _soft_color(t.get("border_soft"))
 
         def font(px, bold=False, mono=False):
             f = QFont(_family(t["font_mono"]) if mono else fam)
@@ -188,9 +212,14 @@ class MiniPreview(QWidget):
             p.setPen(QColor(color))
             p.drawText(QRectF(x * s, y * s, wd * s, ht * s), int(flags), s_)
 
-        def box(x, y, wd, ht, fill, border=None, r=6):
+        def box(x, y, wd, ht, fill, border=None, r=6, soft_border=False):
             r = max(0.0, min(r, wd / 2.0, ht / 2.0))
-            p.setPen(QPen(QColor(border), bpen) if border else Qt.NoPen)
+            if soft_border and soft is not None:
+                p.setPen(QPen(soft, max(1.0, s)))   # the faint 1px line
+            elif border and bpen > 0:
+                p.setPen(QPen(QColor(border), bpen))
+            else:
+                p.setPen(Qt.NoPen)
             p.setBrush(QColor(fill) if fill else Qt.NoBrush)
             p.drawRoundedRect(QRectF(x * s, y * s, wd * s, ht * s), r * s, r * s)
 
@@ -209,11 +238,11 @@ class MiniPreview(QWidget):
         text(132, 8, 70, 22, "+ Add URL", t["text_on_accent"], font(9, True), Qt.AlignCenter)
         for i, name in enumerate(["Start", "Pause", "Stop"]):
             text(212 + i * 48, 8, 46, 22, name, t["text_soft"], font(9), Qt.AlignCenter)
-        box(440, 8, 108, 22, t["bg_input"], t["border"], rad)
+        box(440, 8, 108, 22, t["bg_input"], t["border"], rad, soft_border=True)
         text(448, 8, 90, 22, "Search\u2026", t["text_dim"], font(8))
         # table
         top = 46
-        box(130, top, 420, 150, t["bg_panel"], t["border"], rad)
+        box(130, top, 420, 150, t["bg_panel"], t["border"], rad, soft_border=True)
         box(131, top + 1, 418, 22, t["bg_elevated"], None, rad_sm)
         for x, label in ((140, "Name"), (300, "Size"), (350, "Progress"), (480, "Status")):
             text(x, top + 1, 70, 22, label, t["text_muted"], font(8, True))
@@ -233,7 +262,7 @@ class MiniPreview(QWidget):
             text(440, y, 36, 24, "%d%%" % pct, t["text_soft"], font(8))
             text(480, y, 60, 24, st, col, font(9, True))
         # log
-        box(130, 204, 420, 22, t["bg_input"], t["border"], rad)
+        box(130, 204, 420, 22, t["bg_input"], t["border"], rad, soft_border=True)
         text(138, 204, 400, 22, "18:35:10  Job 564 started: Studio session part 4.mp4",
              t["text_muted"], font(8, mono=True))
         p.end()
@@ -275,7 +304,7 @@ class PresetTile(QAbstractButton):
         p.setPen(QPen(QColor(self.ring if self.isChecked() else t["border_hi"]),
                       2.5 if self.isChecked() else 1))
         p.setBrush(QColor(t["bg_base"]))
-        _rr = max(0.0, min(10.0, _px(t.get("radius"), 10) * 0.7))
+        _rr = max(0.0, _px(t.get("radius"), 10) * 0.7)
         p.drawRoundedRect(r, _rr, _rr)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(t["bg_panel"]))
@@ -296,7 +325,7 @@ class PresetTile(QAbstractButton):
         p.end()
 
 
-_NUM_TOKENS = {"pad_scale": (0.6, 1.5), "border_w": (1, 6), "font_scale": (0.7, 1.3)}
+_NUM_TOKENS = {"pad_scale": (0.6, 1.5), "border_w": (0, 6), "font_scale": (0.7, 1.3)}
 
 
 def _theme_from_dict(d):
@@ -309,7 +338,8 @@ def _theme_from_dict(d):
         return None
     base = THEME_PRESETS["amoled_black"]
     allowed = set(base) | set(DERIVED)
-    non_color = {"radius", "radius_pill", "font", "font_mono", "radius_sm", "radius_chip"}
+    non_color = {"radius", "radius_pill", "font", "font_mono", "radius_sm", "radius_chip",
+                 "border_soft"}
 
     def clean(toks):
         out = {}

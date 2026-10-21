@@ -18,6 +18,10 @@
   .hdr b { display: block; font-size: 15px; }
   .hdr small { color: var(--mu); letter-spacing: .06em; font-size: 11px; }
   .hdr .cog { margin-left: auto; width: 32px; height: 32px; padding: 0; font-size: 17px; line-height: 1; }
+  /* Batch 3: the header button is a sliders icon (inline SVG), distinct from
+     the app's cog; its strokes and knobs use currentColor, so it follows the
+     theme text color like the glyph did. */
+  .hdr .cog svg { display: block; margin: auto; }
 
   /* v4.3: settings panel (cog). Sections: Pill / Sniffer / Notifications. */
   #settingsView { display: none; padding-bottom: 8px; }
@@ -28,6 +32,13 @@
             padding: 8px 12px 10px; margin-bottom: 10px; }
   .setsec h2 { font-size: 11px; font-weight: 600; color: var(--ac); letter-spacing: .08em;
                text-transform: uppercase; margin: 2px 0 8px; }
+  /* Batch 3: the IMAGE MICRO-PILL section is a collapsible <details>. */
+  details.setsec summary { cursor: pointer; list-style: none; }
+  details.setsec summary::-webkit-details-marker { display: none; }
+  details.setsec summary h2 { display: inline-block; }
+  details.setsec summary::after { content: "\25b8"; float: right; color: var(--mu); font-size: 11px; }
+  details.setsec[open] summary::after { content: "\25be"; }
+  details.setsec:not([open]) { padding-bottom: 2px; }
   .setrow { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 8px; }
   .setrow > label { flex: 1; }
   .setrow.chk { justify-content: flex-start; }
@@ -160,7 +171,7 @@
 </style>
 </head>
 <body>
-  <div class="hdr"><img src="icons/icon48.png" alt=""><div><b>Video Grabber</b><small>BROWSER EXTENSION</small></div><button id="btnCog" class="cog" title="Settings" aria-label="Settings">&#9881;</button></div>
+  <div class="hdr"><img src="icons/icon48.png" alt=""><div><b>Video Grabber</b><small>BROWSER EXTENSION</small></div><button id="btnCog" class="cog" title="Settings" aria-label="Settings"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><circle cx="9" cy="7" r="2.2" fill="currentColor" stroke="none"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="15" cy="12" r="2.2" fill="currentColor" stroke="none"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="7" cy="17" r="2.2" fill="currentColor" stroke="none"/></svg></button></div>
   <div id="mainView">
   <div id="status">Checking desktop app…</div>
   <div id="recent" style="display:none;"><h2>Recent downloads</h2><div id="recentList"></div></div>
@@ -227,7 +238,6 @@
     <div class="setsec">
       <h2>Pill</h2>
       <div class="setrow chk"><input type="checkbox" id="setPillVisible"><label for="setPillVisible">Show the pill on videos</label></div>
-      <div class="setrow chk"><input type="checkbox" id="setMicroPill"><label for="setMicroPill">Show the image micro-pill on hover</label></div>
       <div class="setrow"><label for="setCorner">Default corner</label>
         <select id="setCorner">
           <option value="">Free (top-left offset)</option>
@@ -260,6 +270,20 @@
       <button id="setResetPos" class="setbtn">Reset pill positions on all sites</button>
     </div>
 
+    <details class="setsec" id="microPillSec">
+      <summary><h2>Image Micro-Pill</h2></summary>
+      <div class="setrow chk"><input type="checkbox" id="setMicroPill"><label for="setMicroPill">Show the image micro-pill on hover</label></div>
+      <div class="setrow"><label for="setMicroPos">Micro-pill default position</label>
+        <select id="setMicroPos">
+          <option value="tr">Top-Right</option>
+          <option value="tl">Top-Left</option>
+          <option value="br">Bottom-Right</option>
+          <option value="bl">Bottom-Left</option>
+        </select></div>
+      <div class="setrow chk"><input type="checkbox" id="setMicroSize"><label for="setMicroSize">Show file size in micro-pill menu</label></div>
+      <div class="sethint">The file size is fetched when the menu opens, so it only appears when the site lets the extension read it.</div>
+    </details>
+
     <div class="setsec">
       <h2>Sniffer</h2>
       <div class="setrow"><label for="setSniffer">Detect media in</label>
@@ -268,6 +292,12 @@
           <option value="active">Active tab only</option>
         </select></div>
       <div class="sethint">Active tab only skips background tabs, so media that loads while a tab is in the background isn't listed.</div>
+    </div>
+
+    <div class="setsec">
+      <h2>Downloads</h2>
+      <div class="setrow chk"><input type="checkbox" id="setIntercept"><label for="setIntercept">Intercept all browser downloads</label></div>
+      <div class="sethint">Cancels the browser's own download and hands the file to Video Grabber instead. The same switch lives under Pairing and advanced options — it is one setting, not two.</div>
     </div>
 
     <div class="setsec">

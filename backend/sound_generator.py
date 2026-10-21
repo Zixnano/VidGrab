@@ -461,7 +461,7 @@ class SoundGeneratorWindow(QMainWindow):
         # fire two generations / two async plays at the same instant --
         # winsound handles that badly (often playing neither sound).
         self.generate_button.setEnabled(False)
-        QTimer.singleShot(500, lambda: self.generate_button.setEnabled(True))
+        QTimer.singleShot(500, self._re_enable_generate)
 
         # Stop the previous preview before overwriting the temp file it
         # may still be playing from (a playing file can be locked).
@@ -478,6 +478,12 @@ class SoundGeneratorWindow(QMainWindow):
         self.style_label.setText(f"Style: {style}  --  press Save to keep it")
         self.save_button.setEnabled(True)
         play_wav_async(self.temp_path, self._fallback_player)
+
+    def _re_enable_generate(self) -> None:
+        try:
+            self.generate_button.setEnabled(True)
+        except RuntimeError:
+            pass  # window closed before the debounce fired
 
     # -- Saving -------------------------------------------------------------
 

@@ -802,9 +802,10 @@ function setupOverflowMenu() {
 }
 
 // ---------------- v4.3: settings panel (cog) ----------------
-// Sections: Pill / Sniffer / Notifications. Every control saves straight to
-// chrome.storage.local (key vgSettings, see vgsettings.js); content.js and
-// background.js pick the change up through storage.onChanged.
+// Sections: Pill / Image Micro-Pill / Sniffer / Downloads / Notifications.
+// Every control saves straight to chrome.storage.local (key vgSettings,
+// see vgsettings.js); content.js and background.js pick the change up
+// through storage.onChanged.
 async function setupSettings() {
   const $ = (id) => document.getElementById(id);
   const mainView = $("mainView");
@@ -822,6 +823,9 @@ async function setupSettings() {
   const controls = [
     ["setPillVisible", "pillVisible", "bool"],
     ["setMicroPill", "microPill", "bool"],
+    ["setMicroPos", "microPillPos", "str"],
+    ["setMicroSize", "microPillSize", "bool"],
+    ["setIntercept", "interceptDownloads", "bool"],
     ["setCorner", "pillCorner", "str"],
     ["setQuality", "defaultQuality", "num"],
     ["setMenuH", "maxMenuHeight", "num"],
