@@ -53,8 +53,10 @@ from gui_detail import IMAGE_EXT, VIDEO_EXT, DetailPane, ThumbLoader
 from sound_generator import install_sound_generator
 
 try:    # Batch 5: FontAwesome icons for the toolbar and the collapsed sidebar.
-    import qtawesome as _qta       # optional: without it the old glyphs are used
-except Exception:
+    import qtawesome as _qta
+    print("DEBUG: qtawesome loaded successfully!")
+except Exception as e:
+    print(f"DEBUG: qtawesome failed to load! Error: {e}")
     _qta = None
 
 _PAL = resolve_palette()
@@ -3128,6 +3130,7 @@ class Sidebar(QFrame):
         label = f"{name}  ({n})" if n else name
         ic = _qicon(_SB_ICONS.get(name), SOFT) if self._collapsed else None
         if self._collapsed:
+            # If icon is missing, use first letter as fallback
             text = "" if ic is not None else name[:1]
             tip = label
             css = "QToolButton { text-align: center; padding: 0; }"
@@ -3921,6 +3924,7 @@ class MainWindow(QMainWindow):
             b.setObjectName("ToolbarButton")
             b.setToolTip(label)
             b.clicked.connect(action)
+            b.setText(label)  # guaranteed fallback if the icon never loads
             ic = _qicon(_TB_ICONS.get(label), _toolbar_icon_color())
             if ic is not None:
                 b.setIcon(ic)
@@ -4323,7 +4327,11 @@ class MainWindow(QMainWindow):
                 entry[1] = ic
                 btn.setIcon(ic)
                 btn.setIconSize(QSize(16, 16))
-            btn.setText("" if compact else label)
+                btn.setText("" if compact else label)
+            else:
+                # qtawesome is missing: force text so the button doesn't vanish
+                btn.setIcon(QIcon())
+                btn.setText(label)
             btn.setToolTip(label)
 
     def resizeEvent(self, event):
