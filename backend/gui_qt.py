@@ -2235,6 +2235,13 @@ class SettingsDialog(QDialog):
         self.theme_page.applied.connect(self._save)
         tabs.addTab(self.theme_page, "Theme")
 
+        # ---- Theme Engine button (gui_theme_engine.py) ----
+        self.theme_engine_btn = QPushButton("Open Theme Engine\u2026")
+        self.theme_engine_btn.setToolTip("Build a theme from an image or by picking colors. "
+                                         "Changes preview live; saving writes a theme file.")
+        self.theme_engine_btn.clicked.connect(self._open_theme_engine)
+        self.theme_page.controls.layout().addWidget(self.theme_engine_btn)
+
         # ---- Downloads ----
         d = QWidget()
         dl = QFormLayout(d)
@@ -2844,6 +2851,24 @@ class SettingsDialog(QDialog):
             except Exception:
                 pass
         super().done(r)
+
+    def _open_theme_engine(self):
+        from gui_theme_engine import ThemeEngineDialog
+        dlg = ThemeEngineDialog(load_settings(), self)
+        dlg.themeChanged.connect(self._theme_engine_live)
+        try:
+            dlg.exec()
+        finally:
+            reapply_theme()                    # back to the saved theme, however the engine closed
+            self.theme_page._scan_themes()     # so a new custom.json shows in the Theme tab
+
+    def _theme_engine_live(self, state):
+        from gui_style import build_qss
+        app = QApplication.instance()
+        if app is None:
+            return
+        _sync_palette(state)                   # gui_qt's painted colors follow the live theme
+        app.setStyleSheet(build_qss(state))
 
     def _save(self):
         try:
