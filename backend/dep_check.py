@@ -10,8 +10,12 @@ What it does, each launch (a few milliseconds when nothing is missing):
   2. checks each one against what THIS interpreter has installed;
   3. installs whatever is missing with `sys.executable -m pip`, quietly.
 
+Works in both source and frozen (PyInstaller) builds. In a frozen build, it
+installs missing packages into %LOCALAPPDATA%\VideoGrabber\site-packages
+so the app can heal itself without needing admin rights.
+
 It never raises and never blocks startup for long: no network, no pip, or a
-frozen (PyInstaller) build just means it logs and carries on. A failed attempt
+failed install just means it logs and carries on. A failed attempt
 is not retried for an hour, so being offline doesn't slow every launch.
 Dev-only packages (pyinstaller, pytest) are skipped. yt-dlp is only installed
 when absent; its own updater manages its version.
@@ -19,7 +23,9 @@ when absent; its own updater manages its version.
 import importlib
 import importlib.metadata as md
 import json
+import os
 import re
+import site
 import subprocess
 import sys
 import tempfile
@@ -41,10 +47,17 @@ RETRY_AFTER_S = 3600
 STAMP = Path(tempfile.gettempdir()) / "vg_dep_check.json"
 _LINE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*(\[[^\]]*\])?\s*([<>=!~][^;#]*)?")
 
+def _get_target_dir():
+    """Where to install packages if running as a frozen EXE."""
+    if getattr(sys, "frozen", False):
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        target = base / "VideoGrabber" / "site-packages"
+        target.mkdir(parents=True, exist_ok=True)
+        return str(target)
+    return None
 
 def _norm(name):
     return re.sub(r"[-_.]+", "-", name).lower()
-
 
 def _parse(lines):
     """{normalized name: pip spec} from requirements-style lines."""
@@ -60,7 +73,6 @@ def _parse(lines):
         out[name] = line.split(";", 1)[0].strip()
     return out
 
-
 def _wanted(req_file=None):
     specs = _parse(BUILTIN)
     here = Path(__file__).resolve().parent
@@ -72,7 +84,6 @@ def _wanted(req_file=None):
         except OSError:
             pass
     return {n: s for n, s in specs.items() if n not in DEV_ONLY}
-
 
 def _satisfied(name, spec):
     try:
@@ -88,11 +99,9 @@ def _satisfied(name, spec):
     except Exception:
         return True
 
-
 def missing(req_file=None):
     """pip specs that this interpreter still needs."""
     return [spec for name, spec in sorted(_wanted(req_file).items()) if not _satisfied(name, spec)]
-
 
 def _recently_failed(key):
     try:
@@ -101,32 +110,35 @@ def _recently_failed(key):
     except Exception:
         return False
 
-
 def _stamp(key):
     try:
         STAMP.write_text(json.dumps({"key": key, "ts": time.time()}), encoding="utf-8")
     except OSError:
         pass
 
-
 def _pip(args, timeout):
     return subprocess.run([sys.executable, "-m", "pip", *args], capture_output=True, text=True,
                           timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
-
 def _install(specs):
+    target = _get_target_dir()
     base = ["install", "--disable-pip-version-check", "--timeout", "15", "--retries", "1"]
+    if target:
+        base += ["--target", target]
+    
     r = _pip(base + list(specs), 900)
     if r.returncode != 0 and "externally-managed-environment" in (r.stdout + r.stderr):
         # A distro-managed Python (PEP 668) refuses plain installs; the app owns this one.
         r = _pip(base + ["--break-system-packages"] + list(specs), 900)
     return r
 
-
 def ensure_requirements(req_file=None, force=False):
     """Install anything missing. Returns the list of specs that were installed."""
-    if getattr(sys, "frozen", False):
-        return []                        # a packaged build can't pip install into itself
+    target = _get_target_dir()
+    if target and target not in sys.path:
+        sys.path.append(target)
+        site.addsitedir(target)
+
     try:
         need = missing(req_file)
         if not need:
@@ -146,11 +158,19 @@ def ensure_requirements(req_file=None, force=False):
                                timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             except Exception as e:
                 log(f"dep_check: ensurepip failed: {e}")
+        
         r = _install(need)
         if r.returncode != 0 and len(need) > 1:      # one bad package must not block the rest
             for spec in need:
                 r = _install([spec])
+                
         importlib.invalidate_caches()
+        
+        # If we installed to a target dir, we need to load it into the current process
+        if target:
+            site.addsitedir(target)
+            importlib.invalidate_caches()
+            
         left = missing(req_file)
         done = [s for s in need if s not in left]
         if r.returncode != 0 or left:
@@ -163,7 +183,6 @@ def ensure_requirements(req_file=None, force=False):
     except Exception as e:               # never take the app down over this
         log(f"dep_check: skipped ({type(e).__name__}: {e})")
         return []
-
 
 if __name__ == "__main__":
     print("missing:", missing())
