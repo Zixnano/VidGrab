@@ -1,590 +1,99 @@
-# launcher.py — thin entry point for VideoGrabber.exe
+# VideoGrabber.spec — thin launcher build (Session 9 restructure).
 #
-# Locates runtime/ and app/, exports VG_RUNTIME so engines.py can find
-# ffmpeg/deno inside runtime\, sets up the DLL search path so PySide6
-# can load Qt, then hands off to app/server.py.
-#
-# Also starts the bgutil PO-token provider (a small local Deno server on
-# 127.0.0.1:4416) that yt-dlp's bgutil plugin asks for YouTube proof-of-origin
-# tokens, and stops it when the app exits. See _start_pot_provider().
-#
-# Works both frozen and from source (python launcher.py).
-import atexit
-import os
-import shutil
-import subprocess
+# Deliberately bundles NONE of the heavy deps: no PySide6, yt-dlp,
+# streamlink, watchdog, ffmpeg, Deno, and no app code. Those ship in
+# runtime\ beside the exe; app code lives in app\ so it can be hot-updated
+# with the thin zip. Build: pyinstaller VideoGrabber.spec
 import sys
-import threading
-import time
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules, collect_all
 
+# python3.dll: PySide6's extension modules link the stable-ABI DLL. The
+# launcher's own interpreter doesn't need it, but PySide6 loaded from
+# runtime\ does — bundle it when the build python ships one (harmless
+# when absent, e.g. inside a venv without it).
+_py3_dll = Path(sys.base_prefix) / "python3.dll"
+_binaries = [(str(_py3_dll), ".")] if _py3_dll.is_file() else []
 
-def _root() -> Path:
-    """Where VideoGrabber.exe (or launcher.py from source) lives."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def _log_error(msg: str) -> None:
-    """Report a launcher error. Frozen --noconsole builds have
-    sys.stderr=None, so a plain sys.stderr.write would raise and the
-    user would see nothing — always persist to a log beside the exe,
-    and mirror to stderr only when a console actually exists."""
+# Bundle the entire stdlib via collect_submodules. sys.stdlib_module_names
+# only lists top-level names ("http") and misses submodules
+# ("http.cookies"); collect_submodules walks each package and returns the
+# full dotted paths, which is what PyInstaller needs to actually include
+# them. This is the "bundle it all once, never chase a missing module
+# again" approach — costs ~15 MB on the exe, saves a lot of future pain.
+_SKIP_STDLIB = {
+    'antigravity', 'this', '__main__', '__hello__', '__phello__',
+    'idlelib', 'turtledemo', 'turtle', 'tkinter', '_tkinter',
+    'test', 'pydoc_data', 'ensurepip', 'venv', 'site', 'sitecustomize',
+    'usercustomize', 'distutils', 'lib2to3',
+}
+_hidden_stdlib = []
+for _name in sorted(sys.stdlib_module_names):
+    if _name in _SKIP_STDLIB or _name.startswith(('_test', 'xx', '_xx')):
+        continue
+    _hidden_stdlib.append(_name)
     try:
-        log_path = _root() / "launcher-error.log"
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(msg.rstrip() + "\n")
-    except OSError:
-        pass
-    if sys.stderr is not None:
-        try:
-            sys.stderr.write(msg + "\n")
-        except (OSError, ValueError):
-            pass
-
-
-def _setup_dll_search(runtime: Path) -> None:
-    """Python 3.8+ requires explicit DLL directories for anything
-    outside the default search path. PySide6 ships its Qt DLLs in a
-    subfolder that isn't on PATH, so we add it."""
-    if sys.platform != "win32":
-        return
-    candidates = [
-        # pip --target layout: PySide6 stays inside site-packages
-        runtime / "site-packages" / "PySide6",
-        runtime / "site-packages" / "PySide6" / "Qt" / "bin",
-        # moved layout, if someone insists on hoisting it to runtime\
-        runtime / "PySide6",
-        runtime / "PySide6" / "Qt" / "bin",
-        runtime,
-    ]
-    for d in candidates:
-        if d.is_dir():
-            try:
-                os.add_dll_directory(str(d))
-            except OSError:
-                pass
-
-
-# ---------------------------------------------------------------------------
-# bgutil PO-token provider
-#
-# yt-dlp's bgutil plugin (runtime\site-packages\yt_dlp_plugins) asks
-# http://127.0.0.1:4416 for YouTube PO tokens. This starts the provider
-# server (runtime\bgutil-pot-server, run by the runtime's own Deno) and stops
-# it on exit. It is a mitigation, not a guarantee: the provider's own README
-# says a token "does not guarantee bypassing 403 errors or bot checks".
-#
-# Everything here is best-effort: a missing, crashing or slow provider must
-# never stop the app from starting. No cookie files are involved.
-# ---------------------------------------------------------------------------
-_POT_PORT = 4416   # the plugin's default base_url; another port needs a yt-dlp extractor arg too
-_POT_LOG_CAP = 1_000_000
-_POT = {"proc": None, "job": None}
-
-
-def _pot_ping(timeout: float = 1.5) -> bool:
-    """True when a POT provider answers GET /ping on the port (checks the
-    reply shape so some unrelated service on 4416 doesn't count)."""
-    try:
-        import json
-        from urllib.request import urlopen
-        with urlopen(f"http://127.0.0.1:{_POT_PORT}/ping", timeout=timeout) as r:
-            return r.status == 200 and "server_uptime" in json.loads(r.read().decode("utf-8", "replace"))
+        _hidden_stdlib += collect_submodules(_name)
     except Exception:
-        return False
-
-
-def _find_deno(runtime: Path):
-    for name in ("deno.exe", "deno"):
-        p = runtime / name
-        if p.is_file():
-            return str(p)
-    return shutil.which("deno")
-
-
-def _pot_log_writer(root: Path):
-    """Return write(line): appends to pot-provider.log beside the exe
-    (truncated each start, capped at ~1 MB). Never raises."""
-    lock = threading.Lock()
-    state = {"f": None, "n": 0}
-    try:
-        state["f"] = open(root / "pot-provider.log", "w", encoding="utf-8", errors="replace")
-    except OSError:
+        # Some stdlib entries aren't real importable packages on every
+        # build platform; skip silently rather than failing the build.
         pass
 
-    def write(line: str) -> None:
-        with lock:
-            f = state["f"]
-            if f is None or state["n"] > _POT_LOG_CAP:
-                return
-            try:
-                stamp = time.strftime("%H:%M:%S")
-                text = f"{stamp} {line.rstrip()}\n"
-                f.write(text)
-                f.flush()
-                state["n"] += len(text)
-            except (OSError, ValueError):
-                state["f"] = None
-    return write
+_hidden_stdlib += [
+    'requests', 'urllib3', 'idna', 'certifi', 'charset_normalizer',
+]
 
+# --- Numpy and Pillow support ---
+# PyInstaller's frozen interpreter needs to know about these C-extensions
+# at build time, even though we load them from runtime\site-packages.
+numpy_datas, numpy_binaries, numpy_hidden = collect_all('numpy')
+pil_datas, pil_binaries, pil_hidden = collect_all('PIL')
 
-def _bind_to_kill_on_close_job(proc) -> bool:
-    """Windows: put the child in a Job Object that kills it when this
-    process dies for ANY reason (task kill, crash, power button on the
-    window). atexit alone is skipped by a hard kill, which would leave
-    deno.exe running and holding files open. Returns False when it
-    couldn't (the atexit/finally path still stops it on a normal exit)."""
-    if sys.platform != "win32":
-        return False
-    try:
-        import ctypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        u32, u64, c_void_p = ctypes.c_uint32, ctypes.c_uint64, ctypes.c_void_p
+_hidden_stdlib += numpy_hidden + pil_hidden
 
-        class IO_COUNTERS(ctypes.Structure):
-            _fields_ = [(n, u64) for n in (
-                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
-                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+a = Analysis(
+    ['launcher.py'],
+    pathex=[],
+    binaries=_binaries + numpy_binaries + pil_binaries,
+    datas=numpy_datas + pil_datas,
+    hiddenimports=_hidden_stdlib,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        'PySide6', 'shiboken6', 'PySide2', 'PyQt6', 'PyQt5',
+        'yt_dlp', 'streamlink', 'watchdog', 'flask',
+    ],
+    noarchive=False,
+)
+pyz = PYZ(a.pure)
 
-        class BASIC(ctypes.Structure):
-            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
-                        ("PerJobUserTimeLimit", ctypes.c_int64),
-                        ("LimitFlags", u32),
-                        ("MinimumWorkingSetSize", ctypes.c_size_t),
-                        ("MaximumWorkingSetSize", ctypes.c_size_t),
-                        ("ActiveProcessLimit", u32),
-                        ("Affinity", ctypes.c_size_t),
-                        ("PriorityClass", u32),
-                        ("SchedulingClass", u32)]
-
-        class EXTENDED(ctypes.Structure):
-            _fields_ = [("BasicLimitInformation", BASIC),
-                        ("IoInfo", IO_COUNTERS),
-                        ("ProcessMemoryLimit", ctypes.c_size_t),
-                        ("JobMemoryLimit", ctypes.c_size_t),
-                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
-
-        k32.CreateJobObjectW.restype = c_void_p
-        k32.CreateJobObjectW.argtypes = [c_void_p, c_void_p]
-        k32.SetInformationJobObject.argtypes = [c_void_p, ctypes.c_int, c_void_p, u32]
-        k32.OpenProcess.restype = c_void_p
-        k32.OpenProcess.argtypes = [u32, ctypes.c_int, u32]
-        k32.AssignProcessToJobObject.argtypes = [c_void_p, c_void_p]
-        k32.CloseHandle.argtypes = [c_void_p]
-
-        job = k32.CreateJobObjectW(None, None)
-        if not job:
-            return False
-        info = EXTENDED()
-        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
-            return False
-        # PROCESS_SET_QUOTA | PROCESS_TERMINATE
-        h = k32.OpenProcess(0x0100 | 0x0001, 0, proc.pid)
-        if not h:
-            return False
-        try:
-            ok = bool(k32.AssignProcessToJobObject(job, h))
-        finally:
-            k32.CloseHandle(h)
-        if ok:
-            _POT["job"] = job  # keep the handle open for the life of the process
-        return ok
-    except Exception:
-        return False
-
-
-def _stop_pot_provider() -> None:
-    """Stop the provider we started (never one we merely found running)."""
-    proc = _POT.get("proc")
-    _POT["proc"] = None
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        proc.terminate()
-        proc.wait(timeout=5)
-    except Exception:
-        try:
-            proc.kill()
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-
-
-def _start_pot_provider(root: Path, runtime: Path) -> None:
-    """Start runtime\\bgutil-pot-server on 127.0.0.1:4416 unless one is
-    already answering. Never raises, never blocks startup. Set
-    VG_NO_POT_PROVIDER=1 to skip it."""
-    try:
-        if os.environ.get("VG_NO_POT_PROVIDER", "").strip().lower() in ("1", "true", "yes", "on"):
-            return
-        server_dir = runtime / "bgutil-pot-server"
-        main_ts = server_dir / "src" / "main.ts"
-        modules = server_dir / "node_modules"
-        if not (main_ts.is_file() and modules.is_dir()):
-            return  # not bundled (source run or an older install): nothing to do
-        write = _pot_log_writer(root)
-        if _pot_ping():
-            write(f"launcher: a provider already answers on port {_POT_PORT}; reusing it "
-                  "(it is not ours, so it won't be stopped on exit)")
-            return
-        deno = _find_deno(runtime)
-        if not deno:
-            write("launcher: deno not found; provider not started")
-            _log_error("pot provider: deno not found next to the runtime or on PATH; "
-                       "YouTube proof-of-origin tokens are unavailable")
-            return
-        # Same command the provider documents for Deno. It runs from
-        # node_modules so --allow-ffi/--allow-read=. cover the native canvas
-        # module and nothing else. --no-prompt: a missing permission fails
-        # instead of waiting for a keypress nobody can give.
-        cmd = [deno, "run", "--no-prompt", "--allow-env", "--allow-net",
-               "--allow-ffi=.", "--allow-read=.", "../src/main.ts",
-               "--port", str(_POT_PORT)]
-        env = dict(os.environ, DENO_NO_UPDATE_CHECK="1")
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        proc = subprocess.Popen(
-            cmd, cwd=str(modules), env=env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=flags)
-        _POT["proc"] = proc
-        atexit.register(_stop_pot_provider)
-        bound = _bind_to_kill_on_close_job(proc)
-        write(f"launcher: started provider pid {proc.pid} on port {_POT_PORT} "
-              f"(kill-on-exit job: {'yes' if bound else 'no, atexit only'})")
-
-        def _pump() -> None:
-            try:
-                for raw in proc.stdout:
-                    write(raw.decode("utf-8", "replace"))
-            except Exception:
-                pass
-
-        def _watch() -> None:
-            deadline = time.time() + 45
-            while time.time() < deadline:
-                if proc.poll() is not None:
-                    write(f"launcher: provider exited early with code {proc.returncode}")
-                    _log_error(f"pot provider exited early (code {proc.returncode}); "
-                               "see pot-provider.log")
-                    return
-                if _pot_ping():
-                    write(f"launcher: provider ready on port {_POT_PORT}")
-                    return
-                time.sleep(0.5)
-            write("launcher: provider has not answered after 45 s (still running)")
-
-        threading.Thread(target=_pump, daemon=True).start()
-        threading.Thread(target=_watch, daemon=True).start()
-    except Exception as e:
-        _log_error(f"pot provider: could not start: {e}")
-
-
-def _apply_pending_components(runtime: Path) -> None:
-    """Swap in ffmpeg/deno staged by the Settings > Updates page
-    (component_updater.py). Runs before anything starts, so nothing holds
-    the files open. Same rename-then-replace pattern as updater.bat:
-    live -> .old, .new -> live, and put .old back if the second step fails.
-    The .old leftovers are deleted by _cleanup_update_leftovers."""
-    import json
-    marker = runtime / "components-pending.json"
-    if not marker.is_file():
-        return
-    try:
-        pend = json.loads(marker.read_text(encoding="utf-8"))
-    except Exception as e:
-        _log_error(f"launcher: unreadable {marker.name}: {e}")
-        return
-    left = {}
-    for comp, info in pend.items():
-        failed = False
-        for fname in (info or {}).get("files", []):
-            live, new, old = runtime / fname, runtime / (fname + ".new"), runtime / (fname + ".old")
-            if not new.is_file():
-                continue
-            try:
-                if old.exists():
-                    old.unlink()
-                if live.exists():
-                    live.rename(old)
-                try:
-                    new.rename(live)
-                except OSError:
-                    if old.exists() and not live.exists():
-                        old.rename(live)       # restore the working binary
-                    raise
-            except OSError as e:
-                failed = True
-                _log_error(f"launcher: couldn't apply {fname} update ({e}); will retry next start")
-        if failed:
-            left[comp] = info
-        else:
-            _log_error(f"launcher: applied {comp} {info.get('version', '')} update")
-    try:
-        if left:
-            marker.write_text(json.dumps(left, indent=2), encoding="utf-8")
-        else:
-            marker.unlink()
-    except OSError:
-        pass
-
-
-def _cleanup_update_leftovers(root: Path) -> None:
-    """Delete the previous update's rollback leftovers (app.old\\, the
-    renamed-out launcher exe, the renamed-out internal folder). Never
-    during the swap — only after the new app has been up long enough to
-    prove it starts, otherwise restore.bat / the rename pattern have
-    nothing to fall back to."""
-    leftovers = [
-        root / "app.old",
-        root / "VideoGrabber.exe.old",
-        root / "VideoGrabber_internal.old",
-        # v5.5: ffmpeg/deno binaries replaced by _apply_pending_components.
-        root / "runtime" / "ffmpeg.exe.old",
-        root / "runtime" / "ffprobe.exe.old",
-        root / "runtime" / "deno.exe.old",
-    ]
-    leftovers = [p for p in leftovers if p.exists()]
-    if not leftovers:
-        return
-
-    def _later() -> None:
-        time.sleep(60)  # survived this long => new app started fine
-        for p in leftovers:
-            if p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-            else:
-                try:
-                    p.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
-    threading.Thread(target=_later, daemon=True).start()
-
-
-# ---------------------------------------------------------------------------
-# Self-healing: after a crash in server.py, offer to restore the app's .py
-# files from the source backend folder (the job restore.bat does by hand) and
-# relaunch once. Frozen (installed) builds only.
-# ---------------------------------------------------------------------------
-_RELAUNCH_ENV = "VG_RELAUNCHED"
-_EXE_NAME = "VideoGrabber.exe"
-_SOURCE_BACKEND_DIR = (r"C:\Users\Zix Nano\Downloads\Compressed"
-                       r"\Video grabber\Video grabber New\backend")
-_SOURCE_MARKER = "api.py"
-_MB_OK, _MB_YESNO, _MB_ICONERROR = 0x0, 0x4, 0x10
-_IDYES = 6
-_CREATE_NO_WINDOW = 0x08000000
-
-
-def _message_box(title: str, text: str, flags: int) -> int:
-    """Native Windows MessageBox. Returns the button id (IDYES = 6), or 0
-    when no box could be shown (not Windows, or ctypes failed)."""
-    if sys.platform != "win32":
-        return 0
-    try:
-        import ctypes
-        return int(ctypes.windll.user32.MessageBoxW(None, text, title, flags))
-    except Exception:
-        return 0
-
-
-def _is_source_folder(p: Path) -> bool:
-    try:
-        return p.is_dir() and (p / _SOURCE_MARKER).is_file()
-    except OSError:
-        return False
-
-
-def _source_dir(root: Path = None):
-    """The backend source folder, or None.
-    1. The hardcoded backend folder, if it exists and contains api.py.
-    2. The VG_SOURCE_DIR environment variable, with the same test.
-    Otherwise None. `root` is unused; it keeps the call site unchanged."""
-    hard = Path(_SOURCE_BACKEND_DIR)
-    if _is_source_folder(hard):
-        return hard
-    env = os.environ.get("VG_SOURCE_DIR", "").strip().strip('"')
-    if env and _is_source_folder(Path(env)):
-        return Path(env)
-    return None
-
-
-def _repair_app_files(src: Path, dst: Path) -> tuple:
-    """Copy every top-level *.py from src into dst, the same as
-    `xcopy /Y *.py`. Each file gets its own shutil.copy2, so one locked file
-    doesn't stop the rest. A PermissionError (or other OSError) is logged to
-    launcher-error.log with the file name. Returns (copied, failed) names."""
-    dst.mkdir(parents=True, exist_ok=True)
-    copied, failed = [], []
-    for f in sorted(src.glob("*.py")):
-        target = dst / f.name
-        try:
-            shutil.copy2(f, target)
-            copied.append(f.name)
-        except PermissionError as e:
-            failed.append(f.name)
-            _log_error(f"launcher: PermissionError copying {f} -> {target}: {e} "
-                       "(file locked or read-only; is VideoGrabber.exe still running?)")
-        except OSError as e:
-            failed.append(f.name)
-            _log_error(f"launcher: copy failed {f} -> {target}: {e}")
-    return copied, failed
-
-
-def _close_other_instances() -> None:
-    """taskkill /F /IM VideoGrabber.exe, skipping this process: this is the
-    crashing copy, and it exits right after the repair. Logs the result and
-    never raises."""
-    me = os.getpid()
-    try:
-        r = subprocess.run(
-            ["taskkill", "/F", "/IM", _EXE_NAME, "/FI", f"PID ne {me}"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=_CREATE_NO_WINDOW)
-        out = (r.stdout or r.stderr or "").strip()
-        _log_error(f"launcher: taskkill (other instances) exit {r.returncode}: {out}")
-    except (OSError, subprocess.SubprocessError) as e:
-        _log_error(f"launcher: taskkill failed: {e}")
-
-
-def _offer_repair_and_relaunch(root: Path, app_dir: Path, tb_text: str) -> None:
-    if sys.platform != "win32" or not getattr(sys, "frozen", False):
-        return  # source runs already print the traceback to the console
-    if os.environ.get(_RELAUNCH_ENV) == "1":
-        # Already relaunched once and it crashed again: stop here, don't loop.
-        _message_box(
-            "Video Grabber",
-            "Video Grabber still crashes after the repair.\n\n"
-            "See launcher-error.log beside the app for details.",
-            _MB_OK | _MB_ICONERROR)
-        return
-    lines = [ln.strip() for ln in tb_text.strip().splitlines() if ln.strip()]
-    last = lines[-1][:300] if lines else "unknown error"
-    answer = _message_box(
-        "Video Grabber crashed",
-        "Video Grabber hit an error while starting:\n\n"
-        f"{last}\n\n"
-        "Restore the app files from the source folder and restart now?\n"
-        "(Details are in launcher-error.log.)",
-        _MB_YESNO | _MB_ICONERROR)
-    if answer != _IDYES:
-        return
-
-    src = _source_dir(root)
-    if src is None:
-        _log_error(f"launcher: no source folder. Checked {_SOURCE_BACKEND_DIR} "
-                   f"and VG_SOURCE_DIR (must contain {_SOURCE_MARKER}).")
-        _message_box(
-            "Video Grabber",
-            "No source folder found. Expected this folder to exist:\n\n"
-            f"{_SOURCE_BACKEND_DIR}\n\n"
-            f"(it must contain {_SOURCE_MARKER}), or set VG_SOURCE_DIR to a "
-            "backend folder with that file.",
-            _MB_OK | _MB_ICONERROR)
-        return
-
-    _close_other_instances()
-    time.sleep(1)  # give the closed process a moment to release its files
-
-    try:
-        copied, failed = _repair_app_files(src, app_dir)
-    except OSError as e:
-        _log_error(f"launcher: repair failed copying {src} -> {app_dir}: {e}")
-        _message_box("Video Grabber",
-                     f"The repair failed:\n\n{e}\n\nSee launcher-error.log.",
-                     _MB_OK | _MB_ICONERROR)
-        return
-    _log_error(f"launcher: copied {len(copied)} file(s) from {src} into {app_dir}: "
-               f"{', '.join(copied) or '(none)'}; failed: {', '.join(failed) or '(none)'}")
-    if failed:
-        # Don't relaunch on a half-restored app.
-        _message_box(
-            "Video Grabber",
-            f"Couldn't copy {len(failed)} file(s):\n\n{', '.join(failed)}\n\n"
-            "Close any other Video Grabber windows, then try again. "
-            "Details are in launcher-error.log.",
-            _MB_OK | _MB_ICONERROR)
-        return
-
-    env = dict(os.environ)
-    env[_RELAUNCH_ENV] = "1"
-    try:
-        subprocess.Popen([sys.executable, *sys.argv[1:]],
-                         cwd=str(root), env=env, close_fds=True)
-    except OSError as e:
-        _log_error(f"launcher: relaunch failed: {e}")
-        _message_box("Video Grabber",
-                     f"Repaired, but the app could not restart:\n\n{e}",
-                     _MB_OK | _MB_ICONERROR)
-
-
-def main() -> int:
-    root = _root()
-    app_dir = root / "app"
-    runtime_dir = root / "runtime"
-    server_py = app_dir / "server.py"
-
-    if not server_py.is_file():
-        # Fall back to the flat layout (pre-restructure) so dev
-        # runs don't explode.
-        flat = root / "server.py"
-        if flat.is_file():
-            server_py = flat
-            app_dir = root
-        else:
-            _log_error(
-                "Video Grabber: can't find server.py.\n"
-                f"  Looked in: {server_py}\n"
-                f"  And:       {flat}\n"
-                "Reinstall or extract the update zip again."
-            )
-            return 1
-
-    if runtime_dir.is_dir():
-        # VG_RUNTIME: engines.py lives in app\ and can't derive the runtime\
-        # folder from __file__ — export it before any app code imports.
-        os.environ["VG_RUNTIME"] = str(runtime_dir)
-        _setup_dll_search(runtime_dir)
-        sys.path.insert(0, str(runtime_dir))
-        site = runtime_dir / "site-packages"
-        if site.is_dir():
-            sys.path.insert(0, str(site))
-
-    sys.path.insert(0, str(app_dir))
-
-    if runtime_dir.is_dir():
-        _apply_pending_components(runtime_dir)
-    _cleanup_update_leftovers(root)
-    if runtime_dir.is_dir():
-        _start_pot_provider(root, runtime_dir)
-
-    # No os.chdir: sys.path is what makes app/*.py importable. Mutating the
-    # process cwd would silently re-base every relative path in future code.
-    sys.argv[0] = str(server_py)
-    import runpy
-    try:
-        runpy.run_path(str(server_py), run_name="__main__")
-    except Exception:
-        import traceback
-        tb = traceback.format_exc()
-        _log_error(
-            "launcher: unhandled exception while running server.py:\n" + tb
-        )
-        # Stop the PO-token provider first, so a relaunched copy doesn't
-        # reuse a provider this process is about to kill on exit.
-        _stop_pot_provider()
-        _offer_repair_and_relaunch(root, app_dir, tb)
-        return 1
-    finally:
-        # Normal exit, error, or server.py's sys.exit(): stop the provider
-        # before the process ends so nothing keeps runtime\ files open
-        # while updater.bat swaps folders.
-        _stop_pot_provider()
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+# Onedir (exclude_binaries + COLLECT): instant start — no onefile
+# extraction to %TEMP% on every launch — and updatable, since a plain
+# folder can be swapped with the same rename pattern as app\. Output:
+# dist-launcher\VideoGrabber\VideoGrabber.exe + VideoGrabber_internal\
+# (contents_directory renames PyInstaller 6's default _internal).
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='VideoGrabber',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,          # --noconsole: no stray CMD window behind the app
+    icon='VideoGrabber.ico',
+    contents_directory='VideoGrabber_internal',
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='VideoGrabber',
+)
