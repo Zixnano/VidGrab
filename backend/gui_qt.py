@@ -22,7 +22,7 @@ from pathlib import Path
 import requests
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, Qt, QTimer, QThread, Signal, QMimeData, QUrl,
-    QItemSelectionModel, QPropertyAnimation, QEasingCurve, QAbstractAnimation,
+    QItemSelectionModel, QItemSelection, QPropertyAnimation, QEasingCurve, QAbstractAnimation,
     QElapsedTimer, QByteArray, QRect, QPoint, QSize,
 )
 from PySide6.QtGui import QAction, QColor, QDrag, QFont, QFontDatabase, QIcon, QPainter, QPixmap
@@ -47,10 +47,10 @@ CONFIG_PATH = HOME / "settings.json"
 from palette import resolve_palette
 from settings import CATEGORIES, DISPLAY_VERSION, detect_type  # single source of truth: settings.py
 from gui_detail import IMAGE_EXT, VIDEO_EXT, DetailPane, ThumbLoader
-# Batch 3: Tools > "Generate Sounds..." — the procedural completion-sound
-# maker (sound_generator.py, same folder). install_sound_generator(self) is
-# called in MainWindow.__init__ below.
-from sound_generator import install_sound_generator
+# Batch 3 (moved): the procedural completion-sound maker (sound_generator.py,
+# same folder) opens from Settings > Sounds through open_sound_options. It no
+# longer has a Tools menu entry.
+from sound_generator import open_sound_options
 
 from PySide6.QtSvg import QSvgRenderer  # pure-SVG icons, no icon-font dependency
 
@@ -869,6 +869,19 @@ class DownloadModel(QAbstractTableModel):
         return mime
 
 
+class _BottomPane(QWidget):
+    """Bottom half of the table / detail splitter. The detail pane inside it
+    (thumbnail, tabs, log) can ask for a lot of height. Reporting that as this
+    widget's minimum let it raise the whole window's minimum height every time
+    a row got selected, which squeezed the status bar out of view. The splitter
+    decides the real height (the divider is draggable and remembered), so the
+    minimum reported here stays small."""
+    MIN_H = 96
+
+    def minimumSizeHint(self):
+        return QSize(0, self.MIN_H)
+
+
 class DownloadTable(QTableView):
     """The downloads table, with Windows-Explorer style mouse behaviour:
       * Press + drag on an UNSELECTED row, or on empty space, never starts a
@@ -980,6 +993,31 @@ class DownloadTable(QTableView):
             e.accept()
             return
         super().mouseReleaseEvent(e)
+
+    def restore_selection(self, ids, current_id=None):
+        """Re-select rows by job id after the model was rebuilt, and put the
+        current row back. A model reset clears both. Without the current row
+        Qt has no Shift+Click anchor, so the next Shift+Click extended the
+        selection from the FIRST row instead of the row clicked last. Ctrl and
+        Shift clicks themselves already reach Qt's selection model untouched
+        (see mousePressEvent), and the drag-out of selected finished rows is
+        unchanged."""
+        sm, model = self.selectionModel(), self.model()
+        if sm is None or model is None:
+            return
+        ids = set(ids or ())
+        sel, cur = QItemSelection(), None
+        last = model.columnCount() - 1
+        for r, j in enumerate(getattr(model, "items", [])):
+            jid = j.get("id")
+            if jid in ids:
+                sel.select(model.index(r, 0), model.index(r, last))
+            if current_id is not None and jid == current_id:
+                cur = model.index(r, 0)
+        if not sel.isEmpty():
+            sm.select(sel, QItemSelectionModel.Select | QItemSelectionModel.Rows)   # one signal
+        if cur is not None:
+            sm.setCurrentIndex(cur, QItemSelectionModel.NoUpdate)
 
     def _start_file_drag(self, pressed_id):
         model = self.model()
@@ -2319,8 +2357,16 @@ class SettingsDialog(QDialog):
         self.play_sound_on_complete.setChecked(
             bool(s.get("play_sound_on_complete", False)))
         for w in (self.defender_scan, self.auto_shutdown, self.auto_extract,
-                  self.open_folder_on_complete, self.play_sound_on_complete):
+                  self.open_folder_on_complete):
             pl.addRow(w)
+        tabs.addTab(p, "Post-Download")
+
+        # ---- Sounds ---- (moved out of Post-Download: the "Play sound on
+        # completion" switch, the sound choice, the custom file and the
+        # procedural generator)
+        so = QWidget()
+        sl = QFormLayout(so)
+        sl.addRow(self.play_sound_on_complete)
         # v5.5: completion sound. Bundled presets or your own .wav/.mp3; the
         # Windows beep is only the fallback when the chosen file can't play.
         import sounds as _sounds
@@ -2330,7 +2376,7 @@ class SettingsDialog(QDialog):
         self.sound_preset.addItem("Custom file\u2026", userData=_sounds.CUSTOM)
         _i = self.sound_preset.findData(s.get("completion_sound", _sounds.DEFAULT_PRESET))
         self.sound_preset.setCurrentIndex(_i if _i >= 0 else 0)
-        pl.addRow("Completion sound", self.sound_preset)
+        sl.addRow("Completion sound", self.sound_preset)
         self.sound_path = QLineEdit(s.get("completion_sound_path", ""))
         self.sound_path.setReadOnly(True)
         self.sound_path.setPlaceholderText("(no custom file chosen: .wav or .mp3)")
@@ -2342,8 +2388,19 @@ class SettingsDialog(QDialog):
         _test = QPushButton("Test Sound")
         _test.clicked.connect(self._test_sound)
         _brow.addWidget(_test)
-        pl.addRow("Custom file", _brow)
-        tabs.addTab(p, "Post-Download")
+        sl.addRow("Custom file", _brow)
+        _gen = QPushButton("Generate Sounds\u2026")
+        _gen.setToolTip("Make three very different completion sounds from scratch and "
+                        "keep the one you like")
+        _gen.clicked.connect(self._open_sound_generator)
+        sl.addRow("Procedural sounds", _gen)
+        _gen_hint = QLabel("Builds three sounds from three different style families. "
+                           "Pick a length, press Play on each, and Save as Default on "
+                           "the one you want.")
+        _gen_hint.setObjectName("CardHint")
+        _gen_hint.setWordWrap(True)
+        sl.addRow(_gen_hint)
+        tabs.addTab(so, "Sounds")
 
         # ---- Connection ----
         c = QWidget()
@@ -2666,6 +2723,27 @@ class SettingsDialog(QDialog):
         if path:
             self.sound_path.setText(path)
             self.sound_preset.setCurrentIndex(self.sound_preset.findData("custom"))
+
+    def _open_sound_generator(self):
+        open_sound_options(self, on_saved=self._on_generated_sound)
+
+    def _on_generated_sound(self, path, name):
+        """Save as Default in the generator: point the completion sound at the
+        new file right away, so the choice holds even if Settings is closed
+        without pressing Save, and keep the widgets in step with it."""
+        self.sound_path.setText(path)
+        self.sound_preset.setCurrentIndex(self.sound_preset.findData("custom"))
+        turned_on = not self.play_sound_on_complete.isChecked()
+        if turned_on:
+            self.play_sound_on_complete.setChecked(True)   # a default you never hear is no default
+        if self.api is not None:
+            try:
+                self.api.save_setting("completion_sound", "custom")
+                self.api.save_setting("completion_sound_path", path)
+                if turned_on:
+                    self.api.save_setting("play_sound_on_complete", True)
+            except Exception:
+                pass    # Save in Settings writes the same values
 
     def _test_sound(self):
         import sounds as _sounds
@@ -3461,7 +3539,7 @@ running or waiting. Tools &gt; Downloads &gt; Bandwidth profiles manages bandwid
 Programs, Fonts and Other. Settings &gt; Downloads &gt; Destinations sets the folders.</li>
 <li><b>After a download.</b> Right-click a row to open it, move it to another category, convert
 it (mp4, mkv, mp3, wav, m4a, flac, opus), reorder it or delete it. Settings &gt; Post-Download
-covers the completion sound and what happens when a download finishes.</li>
+covers what happens when a download finishes; Settings &gt; Sounds covers the completion sound.</li>
 <li><b>Media Toolkit.</b> Compress, trim, or turn a clip into a GIF.</li>
 <li><b>Look and feel.</b> Themes, text size, Blanc minimal mode, a collapsible sidebar and an
 optional handheld shell.</li>
@@ -3490,7 +3568,7 @@ Tools &gt; Pairing &gt; Pair Extension and follow the steps.</p>
 plus an optional folder per category.</p>
 <p><b>Why did a file land in Other?</b><br>The category follows the file type. Add a rule in
 Settings &gt; Rules to send a site's downloads to a category.</p>
-<p><b>Why no sound when a download finishes?</b><br>In Settings &gt; Post-Download turn the
+<p><b>Why no sound when a download finishes?</b><br>In Settings &gt; Sounds turn the
 completion sound on, pick a sound and press Test Sound. If the test falls back to the Windows
 beep and you hear nothing, your Windows sound scheme may be set to No Sounds.</p>
 <p><b>I sent the same link twice.</b><br>A link that is already queued or downloading is not
@@ -3732,8 +3810,7 @@ class MainWindow(QMainWindow):
         self._trim_timer = QTimer(self)
         self._trim_timer.timeout.connect(lambda: self.trim_ui_memory(silent=True))
         self._trim_timer.start(10 * 60 * 1000)
-        # Batch 3: Tools > "Generate Sounds..." (see the import at the top).
-        install_sound_generator(self)
+        # Generate Sounds moved to Settings > Sounds (see the import at the top).
         self.select_category("All")
         self.refresh()
         self.refresh_diskspace()
@@ -3993,7 +4070,13 @@ class MainWindow(QMainWindow):
         self.search.setObjectName("Search")
         self.search.setPlaceholderText("Search…")
         self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self.apply_filter)
+        # One filter pass per pause in typing, not one per keystroke: each pass
+        # rebuilds the table and used to show/hide the detail pane in between.
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(120)
+        self._search_timer.timeout.connect(lambda: self.apply_filter(self.search.text()))
+        self.search.textChanged.connect(lambda _t: self._search_timer.start())
         tl.addWidget(self.search)
         root_layout.addWidget(toolbar)
         body = QWidget()
@@ -4086,7 +4169,7 @@ class MainWindow(QMainWindow):
         self._thumbs.ready.connect(self._on_thumb_ready, Qt.QueuedConnection)
         # The details label (several rows selected) and the detail pane share
         # the splitter's bottom half; it is hidden while neither is showing.
-        self._bottom = QWidget()
+        self._bottom = _BottomPane()
         self._bottom.setObjectName("Plain")
         _bl = QVBoxLayout(self._bottom)
         _bl.setContentsMargins(0, 0, 0, 0)
@@ -4123,6 +4206,9 @@ class MainWindow(QMainWindow):
         self.apply_shell()
         status = QStatusBar()
         status.setObjectName("BottomStatus")
+        # The bar keeps its own height; the central widget gives way, not the bar.
+        status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        status.setMinimumHeight(max(24, status.sizeHint().height()))
         self.status_label = QLabel("● Connecting…")
         self.status_label.setObjectName("StatusLabel")
         status.addWidget(self.status_label)
@@ -4463,6 +4549,21 @@ class MainWindow(QMainWindow):
     def _update_details(self):
         self._update_details_inner()
         self._sync_bottom()
+        sb = self.statusBar()          # safety net: the bottom bar is never left hidden
+        if sb is not None and self.isVisible() and not sb.isVisible():
+            sb.show()
+
+    def _selection_snapshot(self):
+        """(selected job ids, current job id) before a table rebuild."""
+        try:
+            ids = {j["id"] for j in self._selected_rows()}
+        except Exception:
+            ids = set()
+        ci = self.table.currentIndex()
+        cur = None
+        if ci.isValid() and ci.row() < len(self.model.items):
+            cur = self.model.items[ci.row()].get("id")
+        return ids, cur
 
     def _update_details_inner(self):
         """Panel under the table: the detail pane for one selected row, a
@@ -4822,15 +4923,9 @@ class MainWindow(QMainWindow):
             active = any(j.get("status") == "downloading" for j in self.all_items)
             self._tray.setIcon(_make_tray_icon(active))
         # Snapshot the selection before the model reset wipes it, then restore.
-        selected_ids = {j["id"] for j in self._selected_rows()}
+        selected_ids, current_id = self._selection_snapshot()
         self.apply_filter(self.search.text())
-        if selected_ids:
-            sm = self.table.selectionModel()
-            if sm is not None:
-                for r, j in enumerate(self.model.items):
-                    if j["id"] in selected_ids:
-                        sm.select(self.model.index(r, 0),
-                                  QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        self.table.restore_selection(selected_ids, current_id)
         # 12.1: rows inserted/removed -> fade the viewport in (150 ms).
         visible_ids = frozenset(j["id"] for j in self.model.items)
         if visible_ids != getattr(self, "_last_visible_ids", None):
@@ -5225,8 +5320,11 @@ class MainWindow(QMainWindow):
             # in playlist order (001 first) instead of arbitrary.
             src = sorted(src, key=lambda x: (-(x.get("created_ts") or 0),
                                              x.get("playlist_index") or 0))
+        _ids, _cur = self._selection_snapshot()
         self.model.update_items(src)
+        self.table.restore_selection(_ids, _cur)   # a rebuild clears the selection and the Shift anchor
         self._update_empty_state()
+        self._update_details()                     # detail pane matches what is still selected
 
     def select_category(self, name):
         self.current_filter = name
@@ -5360,6 +5458,11 @@ class MainWindow(QMainWindow):
         # picks a menu item, so handlers key off self._current_ctx instead.
         idx = self.table.indexAt(pos)
         if not idx.isValid() or idx.row() >= len(self.model.items):
+            if self.model.items:           # empty space: just offer Select all
+                em = QMenu(self)
+                if em.addAction("Select all   (Ctrl+A)") == em.exec(
+                        self.table.viewport().mapToGlobal(pos)):
+                    self.table.selectAll()
             return
         self._current_ctx = self.model.items[idx.row()]["id"]
         j = self.model.items[idx.row()]
@@ -5391,6 +5494,8 @@ class MainWindow(QMainWindow):
         a_copy_file = m.addAction("Copy file")
         a_copy_url = m.addAction("Copy URL")
         a_props = m.addAction("Properties")
+        m.addSeparator()
+        a_select_all = m.addAction("Select all   (Ctrl+A)")
         a_toolkit.setEnabled(j["status"] == "done")
         a_open.setEnabled(j["status"] == "done")
         a_open_folder.setEnabled(j["status"] == "done")
@@ -5407,7 +5512,9 @@ class MainWindow(QMainWindow):
         # menu was open, so every handler below reads the fresh dict.
         j = next((x for x in self.model.items
                   if x["id"] == self._current_ctx), j)
-        if chosen == a_open:
+        if chosen == a_select_all:
+            self.table.selectAll()
+        elif chosen == a_open:
             self._ctx_open()
         elif chosen == a_open_folder:
             self._ctx_open_folder()

@@ -8,13 +8,17 @@ HOME/themes/custom.json, in the Export format that
 gui_theme_page._theme_from_dict reads back, so the Theme tab shows it.
 
 Pillow is used only for the image step. Without it the dialog still opens
-and the Load image button says why it is off.
+and the drop zone says why it is off.
+
+The image step: drop an image on the zone at the top (or click it to browse).
+The dialog shows a thumbnail and the extracted swatches, and waits. The theme
+only changes when you press Fill chips.
 """
 import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QColorDialog, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget,
@@ -47,6 +51,8 @@ SAVE_NAME = "custom.json"
 MAX_THEME_BYTES = 256 * 1024           # the Theme tab skips bigger files
 EXTRACT_SIZE = (160, 160)              # thumbnail size; plenty for color stats
 EXTRACT_COLORS = 5
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+THUMB_MAX = 480                        # longest side the preview ever decodes
 
 
 def extract_colors(path, count=EXTRACT_COLORS):
@@ -90,6 +96,113 @@ def suggest_chips(colors):
         text = max(("#f2f2f2", "#111111"), key=lambda c: contrast(c, bg))
     out["text"] = text
     return out
+
+
+class ImageDropZone(QFrame):
+    """A bordered zone that takes a dropped image file or a click (browse).
+    After an image is set it shows a thumbnail, scaled to fit. It only reports
+    the choice (imageChosen / clicked); the dialog decides what to do with it."""
+    imageChosen = Signal(str)       # a valid image file was dropped
+    clicked = Signal()              # click or Enter/Space: ask for a file
+
+    PROMPT = "Drop an image here, or click to browse."
+    _QSS = ("QFrame#ImageDropZone { border: 2px dashed palette(mid); border-radius: 10px; }"
+            "QFrame#ImageDropZone:hover, QFrame#ImageDropZone[dragOver=\"true\"] "
+            "{ border: 2px dashed palette(highlight); }"
+            "QFrame#ImageDropZone:disabled { border: 2px dashed palette(midlight); }")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ImageDropZone")
+        self.setStyleSheet(self._QSS)
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(130)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAccessibleName("Image drop zone")
+        self._pix = None
+        lay = QVBoxLayout(self)
+        self.label = QLabel(self.PROMPT)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setWordWrap(True)
+        self.label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        lay.addWidget(self.label)
+
+    # ---- state ----
+    def disable_with(self, text, tip):
+        """Pillow is missing: the zone stays visible but inert, and says why."""
+        self.setEnabled(False)
+        self.setCursor(Qt.ArrowCursor)
+        self.label.setText(text)
+        self.setToolTip(tip)
+
+    def set_image(self, path):
+        """Show a thumbnail of `path`. Returns False when Qt cannot decode it."""
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if size.isValid() and max(size.width(), size.height()) > THUMB_MAX:
+            size.scale(THUMB_MAX, THUMB_MAX, Qt.KeepAspectRatio)
+            reader.setScaledSize(size)
+        img = reader.read()
+        if img.isNull():
+            return False
+        self._pix = QPixmap.fromImage(img)
+        self.label.setVisible(False)
+        self.setToolTip(f"{path}\nDrop another image to replace it.")
+        self.update()
+        return True
+
+    @staticmethod
+    def _dropped_image(md):
+        for u in md.urls():
+            if u.isLocalFile() and u.toLocalFile().lower().endswith(IMAGE_EXTS):
+                return u.toLocalFile()
+        return None
+
+    def _drag_over(self, on):
+        self.setProperty("dragOver", "true" if on else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    # ---- events ----
+    def dragEnterEvent(self, e):
+        if self._dropped_image(e.mimeData()):
+            e.acceptProposedAction()
+            self._drag_over(True)
+        else:
+            e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self._drag_over(False)
+
+    def dropEvent(self, e):
+        self._drag_over(False)
+        path = self._dropped_image(e.mimeData())
+        if path:
+            e.acceptProposedAction()
+            self.imageChosen.emit(path)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.clicked.emit()
+        else:
+            super().keyPressEvent(e)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)       # the dashed border
+        if self._pix is None:
+            return
+        box = self.rect().adjusted(10, 10, -10, -10)
+        pm = self._pix.scaled(box.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        p = QPainter(self)
+        p.drawPixmap(box.x() + (box.width() - pm.width()) // 2,
+                     box.y() + (box.height() - pm.height()) // 2, pm)
 
 
 class ColorChip(QWidget):
@@ -160,19 +273,22 @@ class ThemeEngineDialog(QDialog):
         hint.setWordWrap(True)
         root.addWidget(hint)
 
-        # Image step
+        # Image step: a drop zone, then Fill chips. Dropping only previews;
+        # the theme changes when Fill chips is pressed.
+        self.drop = ImageDropZone()
+        self.drop.imageChosen.connect(self._load_image_path)
+        self.drop.clicked.connect(self._load_image)
+        root.addWidget(self.drop)
         img_row = QHBoxLayout()
-        self.load_btn = QPushButton("Load image\u2026")
-        self.load_btn.clicked.connect(self._load_image)
-        self.fill_btn = QPushButton("Fill chips from image")
+        self.fill_btn = QPushButton("Fill chips")
         self.fill_btn.setEnabled(False)
         self.fill_btn.clicked.connect(self._fill_from_image)
         if Image is None:
-            self.load_btn.setEnabled(False)
             self.fill_btn.setEnabled(False)
-            self.load_btn.setToolTip("Pillow is not installed, so images cannot be read. "
-                                     "Install it with: pip install \"Pillow>=10\"")
-        img_row.addWidget(self.load_btn)
+            _why = ("Pillow is not installed, so images cannot be read. "
+                    "Install it with: pip install \"Pillow>=10\"")
+            self.drop.disable_with("Image colors are off: Pillow is not installed.", _why)
+            self.fill_btn.setToolTip(_why)
         img_row.addWidget(self.fill_btn)
         img_row.addStretch(1)
         root.addLayout(img_row)
@@ -274,9 +390,16 @@ class ThemeEngineDialog(QDialog):
     # ---- image ----
 
     def _load_image(self):
+        """Browse (the drop zone was clicked)."""
         path, _ = QFileDialog.getOpenFileName(self, "Pick an image", "",
-                                              "Images (*.png *.jpg *.jpeg)")
-        if not path:
+                                              "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        if path:
+            self._load_image_path(path)
+
+    def _load_image_path(self, path):
+        """A dropped or browsed image: show the thumbnail and the swatches,
+        then wait. Nothing about the theme changes until Fill chips."""
+        if Image is None:
             return
         try:
             colors = extract_colors(path)
@@ -287,9 +410,10 @@ class ThemeEngineDialog(QDialog):
             QMessageBox.warning(self, "Image failed", "That image has too few colors to use.")
             return
         self._extracted = colors
+        self.drop.set_image(path)
         self._show_swatches(colors)
         self.fill_btn.setEnabled(True)
-        self._fill_from_image()
+        self.status.setText(f"Loaded {Path(path).name}. Press Fill chips to use its colors.")
 
     def _fill_from_image(self):
         suggested = suggest_chips(self._extracted)
