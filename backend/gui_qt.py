@@ -19,6 +19,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# Self-heal: install any missing requirement into THIS Python before the
+# third-party imports below (see dep_check.py). Never raises.
+try:
+    import dep_check as _dep_check
+    _dep_check.ensure_requirements()
+except Exception:
+    pass
+
 import requests
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, Qt, QTimer, QThread, Signal, QMimeData, QUrl,

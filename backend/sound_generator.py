@@ -18,11 +18,14 @@ profiles, a length choice (1 / 3 / 5 / 10 s), Play, and Save as Default. That
 engine needs numpy; the older SoundGeneratorWindow below does not.
 """
 
+import importlib
 import math
 import os
 import random
 import re
 import struct
+import subprocess
+import sys
 import tempfile
 import wave
 from pathlib import Path
@@ -794,7 +797,21 @@ LEVEL_RMS = 0.12        # quiet styles (hiss, wind) are lifted toward this
 
 
 def numpy_ok() -> bool:
-    return np is not None
+    """True when numpy is importable. Re-checks, so an install made while the
+    app is running (the dialog's Install numpy button) takes effect at once."""
+    global np
+    if np is None:
+        try:
+            importlib.invalidate_caches()
+            np = importlib.import_module("numpy")
+        except Exception:
+            return False
+    return True
+
+
+def numpy_install_command() -> list:
+    """pip for the exact Python that is running this app."""
+    return [sys.executable, "-m", "pip", "install", "numpy>=1.26"]
 
 
 def _hz(midi: float) -> float:
@@ -1379,6 +1396,21 @@ class _MiniWave(QWidget):
             p.drawLine(x, int(mid - hi * half), x, int(max(mid - lo * half, mid - hi * half + 1)))
 
 
+class _InstallThread(QThread):
+    """Runs pip for numpy off the UI thread."""
+    finished_ok = Signal(bool, str)
+
+    def run(self) -> None:
+        try:
+            r = subprocess.run(numpy_install_command(), capture_output=True, text=True,
+                               timeout=600,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            tail = (r.stdout + r.stderr).strip().splitlines()[-1:] or [""]
+            self.finished_ok.emit(r.returncode == 0, tail[0])
+        except Exception as exc:
+            self.finished_ok.emit(False, f"{type(exc).__name__}: {exc}")
+
+
 class _RenderThread(QThread):
     """Renders the three options off the UI thread (a 10 s sound can take a second)."""
     done = Signal(list)       # [(style name, float32 array), ...]
@@ -1487,14 +1519,49 @@ class SoundOptionsDialog(QDialog):
         bottom.addWidget(close_btn)
         root.addLayout(bottom)
 
+        self.install_btn = QPushButton("Install numpy")
+        self.install_btn.clicked.connect(self._install_numpy)
+        self.install_btn.setVisible(False)
+        bottom.insertWidget(1, self.install_btn)
+        self._installer = None
         if not numpy_ok():
-            self.gen_btn.setEnabled(False)
-            self.length_combo.setEnabled(False)
-            self.status.setText("The sound engine needs numpy, which is not installed. "
-                                "Install it with: pip install numpy")
-            _vg_log("sound generator: numpy is missing, generation is disabled")
+            self._show_numpy_missing()
         else:
             QTimer.singleShot(0, self.generate)   # show 3 options straight away
+
+    def _show_numpy_missing(self) -> None:
+        self.gen_btn.setEnabled(False)
+        self.length_combo.setEnabled(False)
+        frozen = bool(getattr(sys, "frozen", False))
+        cmd = " ".join(f'"{c}"' if " " in c else c for c in numpy_install_command())
+        if frozen:
+            self.status.setText("The sound engine needs numpy, which is not bundled in this "
+                                "build. Rebuild with numpy installed (it is in requirements.txt).")
+        else:
+            self.install_btn.setVisible(True)
+            self.status.setText("The sound engine needs numpy, which this Python does not have "
+                                f"({sys.executable}). Press Install numpy, or run: {cmd}")
+        _vg_log(f"sound generator: numpy is missing for {sys.executable}; generation is disabled")
+
+    def _install_numpy(self) -> None:
+        self.install_btn.setEnabled(False)
+        self.status.setText("Installing numpy into this Python\u2026 this can take a minute.")
+        t = _InstallThread(self)
+        t.finished_ok.connect(self._on_numpy_installed)
+        self._installer = t
+        t.start()
+
+    def _on_numpy_installed(self, ok: bool, tail: str) -> None:
+        self._installer = None
+        _vg_log(f"sound generator: numpy install {'ok' if ok else 'failed'}: {tail}")
+        if ok and numpy_ok():
+            self.install_btn.setVisible(False)
+            self.length_combo.setEnabled(True)
+            self.generate()
+        else:
+            self.install_btn.setEnabled(True)
+            self.status.setText(f"Couldn't install numpy ({tail}). Run this in a terminal "
+                                f"instead: {' '.join(numpy_install_command())}")
 
     # ---- generating ----------------------------------------------------------
     def _length(self) -> int:
@@ -1624,6 +1691,8 @@ class SoundOptionsDialog(QDialog):
     # ---- lifecycle ------------------------------------------------------------------
     def done(self, r: int) -> None:
         stop_playback()
+        if self._installer is not None:
+            self._installer.wait(15000)
         if self._thread is not None:
             self._rerun = False
             self._thread.wait(15000)

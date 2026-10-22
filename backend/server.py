@@ -8,6 +8,15 @@ All logic lives in the sibling modules. This file's only job is to:
 5. Hand off to the Qt GUI
 """
 
+# Self-heal first: install any missing requirement into THIS Python before
+# anything below imports Flask, yt-dlp, PySide6 and the rest (see dep_check.py).
+# It never raises, and does nothing in a packaged build.
+try:
+    import dep_check
+    dep_check.ensure_requirements()
+except Exception:
+    pass
+
 from pathlib import Path
 import sys
 import threading
