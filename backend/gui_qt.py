@@ -25,7 +25,7 @@ from PySide6.QtCore import (
     QItemSelectionModel, QItemSelection, QPropertyAnimation, QEasingCurve, QAbstractAnimation,
     QElapsedTimer, QByteArray, QRect, QPoint, QSize,
 )
-from PySide6.QtGui import QAction, QColor, QDrag, QFont, QFontDatabase, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QColor, QDrag, QFont, QFontDatabase, QIcon, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QGraphicsDropShadowEffect, QTextEdit, QTextBrowser
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame,
@@ -883,35 +883,55 @@ class _BottomPane(QWidget):
 
 
 class DownloadTable(QTableView):
-    """The downloads table, with Windows-Explorer style mouse behaviour:
-      * Press + drag on an UNSELECTED row, or on empty space, never starts a
-        file drag. It selects (rows between press and cursor) and draws a
-        rubber-band box.
-      * A file drag starts only when the press lands on an ALREADY-SELECTED
-        finished row and the mouse then moves past a threshold.
-      * Pressing an already-selected row keeps the whole selection until the
-        button is released (so a multi-row selection can be dragged out);
-        a plain click without a drag then collapses it to that row.
+    """The downloads table, with Windows-Explorer style mouse behaviour.
+
+    A plain press never changes the selection on its own, so a box drag can
+    start on any row, even in a table that fills the whole viewport:
+      * Press + drag draws a rubber-band box. The existing selection stays
+        exactly as it was until the button is released; then the rows the box
+        touches become the selection. Ctrl/Shift + drag ADDS the box rows.
+      * A file drag (to Explorer / Discord) starts only from a press on an
+        ALREADY-SELECTED, finished row, and only when the press is on the
+        Name column, or Alt is held (Alt + drag works from any column).
+        It carries the whole selection.
+      * A plain click collapses the selection to the clicked row (or clears it
+        on empty space) on release. Ctrl+Click toggles and Shift+Click extends,
+        handled by Qt as before.
+    Qt's own drag is switched off (startDrag below does nothing): it started a
+    file drag on any finished row, which is what made the box unreachable.
     The dragged row is found by job id at press time, because the model
-    refreshes every second and rows can move before Qt would start a drag."""
+    refreshes every second and rows can move before the drag starts."""
     DRAG_THRESHOLD = 5   # pixels
+    EDGE_SCROLL_MS = 50  # box drag: auto-scroll tick while the cursor is outside the table
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._press_pos = None      # press position, only set when a drag may start
-        self._press_id = None       # job id under the press, only set when a drag may start
-        self._deferred_idx = None   # selected row pressed without modifiers; collapse on release
+        self._press_pos = None      # left-press position (viewport coords); None = no press tracked
+        self._press_kind = None     # "file" (may drag files out) or "band" (box select)
+        self._press_id = None       # job id under a "file" press
+        self._press_mods = Qt.NoModifier   # Ctrl/Shift held at the press
+        self._press_event = None    # copy of a plain press, replayed on release if it was a click
+        self._base_rows = set()     # rows selected when the press happened
         self._rb_origin = None      # rubber-band start, in content (scroll-independent) coords
         self._rb_last = None        # last mouse position in viewport coords
         self._rubber = None         # QRubberBand, created lazily
+        self._edge_timer = QTimer(self)
+        self._edge_timer.setInterval(self.EDGE_SCROLL_MS)
+        self._edge_timer.timeout.connect(self._edge_scroll)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setDragDropMode(QAbstractItemView.DragOnly)
         self.setDragEnabled(True)
 
+    def startDrag(self, supportedActions):
+        """Qt's built-in drag is disabled; _start_file_drag runs the file drag."""
+        return
+
     # ---- rubber band -------------------------------------------------
     def _scroll_offset(self):
-        return self.horizontalScrollBar().value(), self.verticalScrollBar().value()
+        # Pixel offsets of the content (the scroll bars count rows while the
+        # table scrolls per item, so they cannot be used here).
+        return self.horizontalHeader().offset(), self.verticalHeader().offset()
 
     def _band_begin(self, pos):
         ox, oy = self._scroll_offset()
@@ -932,21 +952,77 @@ class DownloadTable(QTableView):
         self._rubber.setGeometry(rect.intersected(self.viewport().rect()))
         self._rubber.show()
 
+    def _band_active(self):
+        return self._rubber is not None and self._rubber.isVisible()
+
     def _band_end(self):
         self._rb_origin = self._rb_last = None
         if self._rubber is not None:
             self._rubber.hide()
 
+    def _band_rows(self):
+        """Rows the box touches, from its content-space rectangle."""
+        if self._rb_origin is None or self._rb_last is None:
+            return set()
+        ox, oy = self._scroll_offset()
+        a = self._rb_origin
+        rect = QRect(QPoint(a[0], a[1]),
+                     QPoint(self._rb_last.x() + ox, self._rb_last.y() + oy)).normalized()
+        rows = set()
+        for r in range(self.model().rowCount()):
+            if self.isRowHidden(r):
+                continue
+            top = self.rowViewportPosition(r) + oy
+            if top <= rect.bottom() and top + self.rowHeight(r) > rect.top():
+                rows.add(r)
+        return rows
+
+    def _edge_scroll(self):
+        """While a box drag is held outside the table, keep scrolling toward it."""
+        if self._rb_last is None or self._press_kind != "band":
+            self._edge_timer.stop()
+            return
+        sb = self.verticalScrollBar()
+        y = self._rb_last.y()
+        if y < 0:
+            sb.setValue(sb.value() - 1)
+        elif y > self.viewport().height():
+            sb.setValue(sb.value() + 1)
+
     def scrollContentsBy(self, dx, dy):
         super().scrollContentsBy(dx, dy)
         self._band_update()   # keep the box anchored while autoscrolling
 
+    # ---- selection helpers -------------------------------------------
+    def _selected_row_set(self):
+        sm = self.selectionModel()
+        return {i.row() for i in sm.selectedIndexes()} if sm is not None else set()
+
+    def _apply_rows(self, rows):
+        """Make exactly `rows` the selection (empty clears it)."""
+        sm, model = self.selectionModel(), self.model()
+        if sm is None or model is None:
+            return
+        sel, last = QItemSelection(), model.columnCount() - 1
+        for r in sorted(rows):
+            sel.select(model.index(r, 0), model.index(r, last))
+        sm.select(sel, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+        if rows:   # the first row is the Shift+Click anchor afterwards
+            sm.setCurrentIndex(model.index(min(rows), 0), QItemSelectionModel.NoUpdate)
+
+    def _reset_press(self):
+        self._press_pos = None
+        self._press_kind = None
+        self._press_id = None
+        self._press_event = None
+        self._press_mods = Qt.NoModifier
+        self._base_rows = set()
+        self._edge_timer.stop()
+        self._band_end()
+
     # ---- mouse -------------------------------------------------------
     def mousePressEvent(self, e):
-        self._press_pos = None
-        self._press_id = None
-        self._deferred_idx = None
-        self._band_end()
+        self._reset_press()
         if e.button() != Qt.LeftButton:
             super().mousePressEvent(e)       # right-click etc.: standard handling (context menu)
             return
@@ -954,44 +1030,70 @@ class DownloadTable(QTableView):
         idx = self.indexAt(pos)
         mods = e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)
         items = getattr(self.model(), "items", [])
-        on_selected = (idx.isValid() and not mods
-                       and self.selectionModel().isRowSelected(idx.row(), idx.parent()))
-        if on_selected and idx.row() < len(items):
-            # Possible drag. Leave the selection alone for now so a multi-row
-            # selection survives until we know whether this is a drag or a click.
-            self._deferred_idx = idx
-            self.setFocus(Qt.MouseFocusReason)
-            self.selectionModel().setCurrentIndex(idx, QItemSelectionModel.NoUpdate)
-            j = items[idx.row()]
-            if j.get("status") == "done":    # only finished files can be dragged out
-                self._press_pos = pos
-                self._press_id = j.get("id")
-            e.accept()
-            return
-        # Unselected row, empty space, or Ctrl/Shift: standard selection and
-        # rubber band. No drag intent.
+        self._press_pos = pos
+        self._press_mods = mods
+        self._press_kind = "band"
+        self._base_rows = self._selected_row_set()
         self._band_begin(pos)
-        super().mousePressEvent(e)
+        self._edge_timer.start()
+        if mods:
+            # Ctrl/Shift+Click: Qt's own toggle / range selection, unchanged.
+            # If this turns into a drag, the box rows are added on release.
+            super().mousePressEvent(e)
+            return
+        # Plain press: leave the selection alone (a multi-row selection must
+        # survive until we know if this is a file drag, a box or a click).
+        self.setFocus(Qt.MouseFocusReason)
+        if idx.isValid():
+            self.selectionModel().setCurrentIndex(idx, QItemSelectionModel.NoUpdate)
+        if idx.isValid() and idx.row() < len(items):
+            j = items[idx.row()]
+            if (j.get("status") == "done"        # only finished files can be dragged out
+                    and self.selectionModel().isRowSelected(idx.row(), idx.parent())
+                    and (idx.column() == 0 or (e.modifiers() & Qt.AltModifier))):
+                self._press_kind = "file"
+                self._press_id = j.get("id")
+        self._press_event = QMouseEvent(e)   # replayed on release if this was only a click
+        e.accept()
 
     def mouseMoveEvent(self, e):
-        super().mouseMoveEvent(e)
-        if self._rb_origin is not None and (e.buttons() & Qt.LeftButton):
-            self._rb_last = e.position().toPoint()
-            self._band_update()
+        if self._press_pos is None or not (e.buttons() & Qt.LeftButton):
+            super().mouseMoveEvent(e)        # hover etc.
+            return
+        pos = e.position().toPoint()
+        if self._press_kind == "file":
+            if (pos - self._press_pos).manhattanLength() >= self.DRAG_THRESHOLD:
+                pid = self._press_id
+                self._reset_press()
+                self._start_file_drag(pid)
+            return
+        # Box select: draw only. The selection is untouched until release.
+        self._rb_last = pos
+        self._band_update()
+        e.accept()
 
     def mouseReleaseEvent(self, e):
-        deferred = self._deferred_idx
-        self._press_id = self._press_pos = None
-        self._deferred_idx = None
-        self._band_end()
-        if deferred is not None and e.button() == Qt.LeftButton:
-            # Plain click on an already-selected row: collapse to just that row.
-            if deferred.isValid():
-                self.selectionModel().select(
-                    deferred,
-                    QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+        kind, mods, base = self._press_kind, self._press_mods, set(self._base_rows)
+        press_event = self._press_event
+        boxed = self._band_active()
+        rows = self._band_rows() if boxed else None
+        self._reset_press()
+        if e.button() != Qt.LeftButton or kind is None:
+            super().mouseReleaseEvent(e)
+            return
+        if mods:
+            super().mouseReleaseEvent(e)     # Ctrl/Shift+Click result stands
+            if rows is not None:
+                self._apply_rows(base | rows)
+            return
+        if rows is not None:                 # box finished: it becomes the selection
+            self._apply_rows(rows)
+            super().mouseReleaseEvent(e)
             e.accept()
             return
+        # A plain click: let Qt select (row, anchor and current row included).
+        if press_event is not None:
+            super().mousePressEvent(press_event)
         super().mouseReleaseEvent(e)
 
     def restore_selection(self, ids, current_id=None):
