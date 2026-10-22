@@ -7,8 +7,9 @@ the host applies it with gui_style.build_qss. The only file it writes is
 HOME/themes/custom.json, in the Export format that
 gui_theme_page._theme_from_dict reads back, so the Theme tab shows it.
 
-Pillow is used only for the image step. Without it the dialog still opens
-and the drop zone says why it is off.
+Pillow is optional. With it, colors come from Pillow's quantizer; without it
+the same step runs on Qt's own image reader and a built-in median cut, so the
+drop zone always works.
 
 The image step: drop an image on the zone at the top (or click it to browse).
 The dialog shows a thumbnail and the extracted swatches, and waits. The theme
@@ -18,7 +19,7 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QImageReader, QPainter, QPixmap
+from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QColorDialog, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget,
@@ -51,13 +52,71 @@ SAVE_NAME = "custom.json"
 MAX_THEME_BYTES = 256 * 1024           # the Theme tab skips bigger files
 EXTRACT_SIZE = (160, 160)              # thumbnail size; plenty for color stats
 EXTRACT_COLORS = 5
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def _image_exts():
+    """Every picture extension we can read: Qt's image plugins, Pillow's
+    registered formats when Pillow is there, and the common ones."""
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico"}
+    exts |= {"." + bytes(f).decode("ascii", "ignore").lower()
+             for f in QImageReader.supportedImageFormats()}
+    if Image is not None:
+        try:
+            exts |= {e.lower() for e in Image.registered_extensions()}
+        except Exception:
+            pass
+    return tuple(sorted(exts))
+
+
+IMAGE_EXTS = _image_exts()
 THUMB_MAX = 480                        # longest side the preview ever decodes
+
+
+def _extract_colors_qt(path, count):
+    """Pillow-free extraction: Qt reads and shrinks the image, then a median cut."""
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid():
+        size.scale(*EXTRACT_SIZE, Qt.KeepAspectRatio)
+        reader.setScaledSize(size)
+    img = reader.read()
+    if img.isNull():
+        raise OSError(reader.errorString() or "unreadable image")
+    img = img.convertToFormat(QImage.Format_RGB32)
+    px = [(c.red(), c.green(), c.blue())
+          for c in (QColor(img.pixel(x, y)) for y in range(img.height())
+                    for x in range(img.width()))]
+    def spread(box):
+        return [max(p[i] for p in box) - min(p[i] for p in box) for i in range(3)]
+
+    boxes = [px]
+    while len(boxes) < count:
+        # split the box with the widest color range (a flat box cannot be split)
+        cand = [b for b in boxes if len(b) > 1 and max(spread(b)) > 0]
+        if not cand:
+            break
+        box = max(cand, key=lambda b: max(spread(b)) * len(b) ** 0.5)
+        rng = spread(box)
+        ch = rng.index(max(rng))
+        box.sort(key=lambda p: p[ch])
+        mid = len(box) // 2
+        i = next(k for k, b in enumerate(boxes) if b is box)
+        boxes[i:i + 1] = [box[:mid], box[mid:]]
+    out = []
+    for box in sorted(boxes, key=len, reverse=True):
+        n = len(box)
+        hx = "#%02x%02x%02x" % tuple(sum(p[i] for p in box) // n for i in range(3))
+        if hx not in out:
+            out.append(hx)
+    return out[:count]
 
 
 def extract_colors(path, count=EXTRACT_COLORS):
     """Up to `count` dominant colors of an image as #rrggbb, most frequent
     first. Raises OSError or ValueError when the file is not a readable image."""
+    if Image is None:
+        return _extract_colors_qt(path, count)
     with Image.open(path) as im:
         im = im.convert("RGB")
         im.thumbnail(EXTRACT_SIZE)
@@ -156,8 +215,11 @@ class ImageDropZone(QFrame):
     @staticmethod
     def _dropped_image(md):
         for u in md.urls():
-            if u.isLocalFile() and u.toLocalFile().lower().endswith(IMAGE_EXTS):
-                return u.toLocalFile()
+            if not u.isLocalFile():
+                continue
+            f = u.toLocalFile()
+            if f.lower().endswith(IMAGE_EXTS) or QImageReader(f).canRead():
+                return f
         return None
 
     def _drag_over(self, on):
@@ -283,12 +345,6 @@ class ThemeEngineDialog(QDialog):
         self.fill_btn = QPushButton("Fill chips")
         self.fill_btn.setEnabled(False)
         self.fill_btn.clicked.connect(self._fill_from_image)
-        if Image is None:
-            self.fill_btn.setEnabled(False)
-            _why = ("Pillow is not installed, so images cannot be read. "
-                    "Install it with: pip install \"Pillow>=10\"")
-            self.drop.disable_with("Image colors are off: Pillow is not installed.", _why)
-            self.fill_btn.setToolTip(_why)
         img_row.addWidget(self.fill_btn)
         img_row.addStretch(1)
         root.addLayout(img_row)
@@ -392,15 +448,14 @@ class ThemeEngineDialog(QDialog):
     def _load_image(self):
         """Browse (the drop zone was clicked)."""
         path, _ = QFileDialog.getOpenFileName(self, "Pick an image", "",
-                                              "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+                                              "Images (" + " ".join("*" + e for e in IMAGE_EXTS)
+                                              + ");;All files (*)")
         if path:
             self._load_image_path(path)
 
     def _load_image_path(self, path):
         """A dropped or browsed image: show the thumbnail and the swatches,
         then wait. Nothing about the theme changes until Fill chips."""
-        if Image is None:
-            return
         try:
             colors = extract_colors(path)
         except (OSError, ValueError) as e:

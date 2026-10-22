@@ -886,14 +886,15 @@ class DownloadTable(QTableView):
     """The downloads table, with Windows-Explorer style mouse behaviour.
 
     A plain press never changes the selection on its own, so a box drag can
-    start on any row, even in a table that fills the whole viewport:
-      * Press + drag draws a rubber-band box. The existing selection stays
-        exactly as it was until the button is released; then the rows the box
-        touches become the selection. Ctrl/Shift + drag ADDS the box rows.
-      * A file drag (to Explorer / Discord) starts only from a press on an
-        ALREADY-SELECTED, finished row, and only when the press is on the
-        Name column, or Alt is held (Alt + drag works from any column).
-        It carries the whole selection.
+    start on any unselected row or empty space, even in a table that fills
+    the whole viewport:
+      * Press + drag draws a rubber-band box and highlights the rows it
+        touches as you go. A plain click that never becomes a drag leaves the
+        old selection alone until release. Ctrl/Shift + drag ADDS the box rows.
+      * A file drag (to Explorer / Discord) starts from a press on an
+        ALREADY-SELECTED, finished row (any column) and carries the whole
+        selection, so you can box-select and then pick the rows up. Hold Alt
+        on a selected row to draw a box from it instead.
       * A plain click collapses the selection to the clicked row (or clears it
         on empty space) on release. Ctrl+Click toggles and Shift+Click extends,
         handled by Qt as before.
@@ -903,6 +904,7 @@ class DownloadTable(QTableView):
     refreshes every second and rows can move before the drag starts."""
     DRAG_THRESHOLD = 5   # pixels
     EDGE_SCROLL_MS = 50  # box drag: auto-scroll tick while the cursor is outside the table
+    boxFinished = Signal()   # a box drag ended; the host refreshes the details panel
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -912,6 +914,8 @@ class DownloadTable(QTableView):
         self._press_mods = Qt.NoModifier   # Ctrl/Shift held at the press
         self._press_event = None    # copy of a plain press, replayed on release if it was a click
         self._base_rows = set()     # rows selected when the press happened
+        self.live_selecting = False # True while a box drag is changing the selection
+        self._live_rows = None      # rows last applied by the box
         self._rb_origin = None      # rubber-band start, in content (scroll-independent) coords
         self._rb_last = None        # last mouse position in viewport coords
         self._rubber = None         # QRubberBand, created lazily
@@ -1017,8 +1021,18 @@ class DownloadTable(QTableView):
         self._press_event = None
         self._press_mods = Qt.NoModifier
         self._base_rows = set()
+        self._live_rows = None
+        self.live_selecting = False
         self._edge_timer.stop()
         self._band_end()
+
+    def _live_box_select(self):
+        """Highlight the rows under the box while it is dragged."""
+        rows = self._band_rows()
+        target = (self._base_rows | rows) if self._press_mods else rows
+        if target != self._live_rows:
+            self._live_rows = target
+            self._apply_rows(target)
 
     # ---- mouse -------------------------------------------------------
     def mousePressEvent(self, e):
@@ -1050,7 +1064,7 @@ class DownloadTable(QTableView):
             j = items[idx.row()]
             if (j.get("status") == "done"        # only finished files can be dragged out
                     and self.selectionModel().isRowSelected(idx.row(), idx.parent())
-                    and (idx.column() == 0 or (e.modifiers() & Qt.AltModifier))):
+                    and not (e.modifiers() & Qt.AltModifier)):   # Alt: box from a selected row
                 self._press_kind = "file"
                 self._press_id = j.get("id")
         self._press_event = QMouseEvent(e)   # replayed on release if this was only a click
@@ -1067,9 +1081,12 @@ class DownloadTable(QTableView):
                 self._reset_press()
                 self._start_file_drag(pid)
             return
-        # Box select: draw only. The selection is untouched until release.
+        # Box select: draw the box and highlight the rows it touches.
         self._rb_last = pos
         self._band_update()
+        if self._band_active():
+            self.live_selecting = True
+            self._live_box_select()
         e.accept()
 
     def mouseReleaseEvent(self, e):
@@ -1085,10 +1102,12 @@ class DownloadTable(QTableView):
             super().mouseReleaseEvent(e)     # Ctrl/Shift+Click result stands
             if rows is not None:
                 self._apply_rows(base | rows)
+                self.boxFinished.emit()
             return
-        if rows is not None:                 # box finished: it becomes the selection
+        if rows is not None:                 # box finished: it is the selection
             self._apply_rows(rows)
             super().mouseReleaseEvent(e)
+            self.boxFinished.emit()
             e.accept()
             return
         # A plain click: let Qt select (row, anchor and current row included).
@@ -4287,7 +4306,11 @@ class MainWindow(QMainWindow):
         self._split_timer.setSingleShot(True)
         self._split_timer.timeout.connect(self._save_split)
         self.split.splitterMoved.connect(lambda *_: self._split_timer.start(600))
-        self.table.selectionModel().selectionChanged.connect(lambda *_: self._update_details())
+        # While a box drag is live the selection changes on every mouse move;
+        # the details panel waits for boxFinished instead of flickering.
+        self.table.selectionModel().selectionChanged.connect(
+            lambda *_: None if self.table.live_selecting else self._update_details())
+        self.table.boxFinished.connect(self._update_details)
         from PySide6.QtGui import QShortcut, QKeySequence
         for seq, act in (("Alt+Up", "up"), ("Alt+Down", "down")):
             sc = QShortcut(QKeySequence(seq), self.table)
