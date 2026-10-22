@@ -52,12 +52,58 @@ from gui_detail import IMAGE_EXT, VIDEO_EXT, DetailPane, ThumbLoader
 # called in MainWindow.__init__ below.
 from sound_generator import install_sound_generator
 
-try:    # Batch 5: FontAwesome icons for the toolbar and the collapsed sidebar.
-    import qtawesome as _qta
-    print("DEBUG: qtawesome loaded successfully!")
-except Exception as e:
-    print(f"DEBUG: qtawesome failed to load! Error: {e}")
-    _qta = None
+from PySide6.QtSvg import QSvgRenderer  # pure-SVG icons, no icon-font dependency
+
+# --- Pure SVG icon engine: Material-style paths, rendered by QSvgRenderer ---
+_SVG_PATHS = {
+    "add": '<path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>',
+    "batch": '<path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z"/>',
+    "playlist": '<path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/>',
+    "play": '<path d="M8 5v14l11-7z"/>',
+    "pause": '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>',
+    "stop": '<path d="M6 6h12v12H6z"/>',
+    "delete": '<path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>',
+    "stream": '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>',
+    "queue_play": '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7zm10 7l4-4-4-4v8z"/>',
+    "queue_pause": '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7zm10 5v4l-4-2 4-2z"/>',
+    "settings": '<path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>',
+    "all": '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>',
+    "active": '<path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>',
+    "finished": '<path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>',
+    "unfinished": '<path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/>',
+    "failed": '<path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/>',
+    "video": '<path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/>',
+    "music": '<path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>',
+    "images": '<path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/>',
+    "compressed": '<path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-6 10h-2v-2h2v2zm0-4h-2v-2h2v2zm0-4h-2V6h2v2z"/>',
+    "documents": '<path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/>',
+    "programs": '<path d="M20 18c1.1 0 1.99-.9 1.99-2L22 6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z"/>',
+    "fonts": '<path d="M9 4v3h5v12h3V7h5V4H9zm-6 8h3v7h3v-7h3V9H3v3z"/>',
+    "other": '<path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/>',
+}
+
+_ICON_PX = 64  # rendered large, then scaled down by Qt: stays sharp on HiDPI
+
+
+def _qicon(name, color):
+    """Pure-SVG icon for `name` tinted `color` (hex string), or None when the
+    name is unknown. Callers show the plain label (or its first letter)."""
+    if not name or name not in _SVG_PATHS:
+        return None
+    key = (name, color)
+    if key in _SVG_ICON_CACHE:
+        return _SVG_ICON_CACHE[key]
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+           f'fill="{color}">{_SVG_PATHS[name]}</svg>')
+    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+    pm = QPixmap(_ICON_PX, _ICON_PX)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    renderer.render(p)
+    p.end()
+    ic = QIcon(pm)
+    _SVG_ICON_CACHE[key] = ic
+    return ic
 
 _PAL = resolve_palette()
 ACCENT = _PAL["accent"]
@@ -72,7 +118,7 @@ SUCCESS = _PAL["success"]
 TRACK = _PAL["bg_elevated"]   # progress-bar track
 
 _ICON_CACHE = {}
-_QTA_CACHE = {}
+_SVG_ICON_CACHE = {}
 
 
 _TRAY_ICONS = {}
@@ -92,7 +138,7 @@ def _sync_palette(settings=None):
     DANGER, WARN, SUCCESS = _PAL["error"], _PAL["warning"], _PAL["success"]
     TRACK, SEL, SOFT = _PAL["bg_elevated"], _PAL["bg_sel"], _PAL["text_soft"]
     _ICON_CACHE.clear()
-    _QTA_CACHE.clear()
+    _SVG_ICON_CACHE.clear()
     _TRAY_ICONS.clear()
     _STATUS_COLORS.update({"downloading": SUCCESS, "done": SUCCESS, "paused": WARN,
                            "stopped": DANGER, "error": DANGER, "queued": MUTED,
@@ -108,38 +154,21 @@ def _title_bar_dark():
         return True
 
 
-# Batch 5: FontAwesome (qtawesome fa5s) icon names. Toolbar keys are the
-# toolbar labels (see MainWindow._build_ui); sidebar keys are nav names.
+# Toolbar keys are the toolbar labels (see MainWindow._build_ui); sidebar keys
+# are nav names. Values are keys of _SVG_PATHS.
 _TB_ICONS = {
-    "Add URL": "fa5s.plus", "Batch": "fa5s.layer-group", "Playlist": "fa5s.list-ul",
-    "Resume": "fa5s.play", "Pause": "fa5s.pause", "Stop": "fa5s.stop",
-    "Delete": "fa5s.trash-alt", "Queue": "fa5s.stream",
-    "Pause Queue": "fa5s.pause-circle", "Start Queue": "fa5s.play-circle",
-    "Settings": "fa5s.cog",
+    "Add URL": "add", "Batch": "batch", "Playlist": "playlist",
+    "Resume": "play", "Pause": "pause", "Stop": "stop",
+    "Delete": "delete", "Queue": "stream",
+    "Pause Queue": "queue_pause", "Start Queue": "queue_play",
+    "Settings": "settings",
 }
 _SB_ICONS = {
-    "All": "fa5s.th-list", "Active": "fa5s.download", "Queue": "fa5s.stream",
-    "Finished": "fa5s.check", "Unfinished": "fa5s.hourglass-half",
-    "Failed": "fa5s.exclamation-triangle", "Video": "fa5s.film", "Music": "fa5s.music",
-    "Images": "fa5s.image", "Compressed": "fa5s.file-archive", "Documents": "fa5s.file-alt",
-    "Programs": "fa5s.microchip", "Fonts": "fa5s.font", "Other": "fa5s.ellipsis-h",
+    "All": "all", "Active": "active", "Queue": "stream",
+    "Finished": "finished", "Unfinished": "unfinished", "Failed": "failed",
+    "Video": "video", "Music": "music", "Images": "images", "Compressed": "compressed",
+    "Documents": "documents", "Programs": "programs", "Fonts": "fonts", "Other": "other",
 }
-
-
-def _qicon(name, color):
-    """qtawesome icon in `color`, or None when qtawesome (or the name) is
-    unavailable. Callers show the plain label (or its first letter)."""
-    if _qta is None or not name:
-        return None
-    key = (name, color)
-    if key in _QTA_CACHE:
-        return _QTA_CACHE[key]
-    try:
-        ic = _qta.icon(name, color=color)
-    except Exception:
-        ic = None
-    _QTA_CACHE[key] = ic
-    return ic
 
 
 def _toolbar_icon_color():
@@ -4329,7 +4358,7 @@ class MainWindow(QMainWindow):
                 btn.setIconSize(QSize(16, 16))
                 btn.setText("" if compact else label)
             else:
-                # qtawesome is missing: force text so the button doesn't vanish
+                # no icon for this label: show text so the button doesn't vanish
                 btn.setIcon(QIcon())
                 btn.setText(label)
             btn.setToolTip(label)
