@@ -3,63 +3,67 @@
 # numpy / PIL / yt-dlp are loaded at runtime from
 # runtime\site-packages, never bundled here.
 #
-# Why hiddenimports is long: the heavy packages (yt_dlp, requests,
-# flask) are EXCLUDED from the analysis and imported at runtime from
-# runtime\site-packages, so PyInstaller never sees their import
-# graphs. Every standard library module they touch dynamically must
-# be named here, or the frozen host dies with ModuleNotFoundError
-# the first time a runtime package reaches for it (http.cookies,
-# logging.handlers, optparse and xml.etree all failed this way).
+# hiddenimports is GENERATED, not curated. History: yt_dlp, requests
+# and flask are excluded from the analysis and loaded at runtime, so
+# PyInstaller never sees their import graphs, and the frozen host
+# died one module at a time (http.cookies, logging.handlers,
+# optparse, xml.etree, fileinput, ...) as each was hand-added to a
+# list. A curated list can only ever contain the modules that have
+# already crashed. So the spec now enumerates the ENTIRE standard
+# library of the build Python from disk: every module that exists
+# is named, and the whack-a-mole class of bug is gone by
+# construction. Test suites and the Tk GUI toolkit are skipped (the
+# app never uses them and they bloat or destabilise the build).
+# Unresolvable names are warnings to PyInstaller, never errors, so
+# an over-inclusive list is safe.
+import os
+import sys
+import sysconfig
+
+
+def _all_stdlib_hiddenimports():
+    skip_dirs = {"__pycache__", "test", "tests", "idlelib",
+                 "turtledemo", "tkinter", "turtle"}
+    roots = set()
+    for key in ("stdlib", "platstdlib"):
+        try:
+            p = sysconfig.get_path(key)
+            if p:
+                roots.add(p)
+        except Exception:
+            pass
+    # Windows builds keep the C accelerator modules in DLLs\
+    roots.add(os.path.join(sys.base_prefix, "DLLs"))
+    names = set()
+    for base in roots:
+        if not base or not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            rel = os.path.relpath(root, base)
+            pkg = "" if rel == "." else rel.replace(os.sep, ".")
+            if pkg.split(".")[0] in skip_dirs:
+                continue
+            for f in files:
+                if not f.endswith((".py", ".pyd", ".so")):
+                    continue
+                stem = f.split(".")[0]
+                if not stem.isidentifier():
+                    continue
+                if stem == "__init__":
+                    if pkg:
+                        names.add(pkg)
+                else:
+                    names.add(pkg + "." + stem if pkg else stem)
+    return sorted(names)
+
+
 a = Analysis(
     ['app_host.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[
-        # --- XML (the current crash: yt_dlp.compat imports
-        # xml.etree.ElementTree; the whole package chain plus the
-        # C accelerators must come along) ---
-        'xml', 'xml.etree', 'xml.etree.ElementTree',
-        'xml.dom', 'xml.dom.minidom', 'xml.sax', 'xml.sax.handler',
-        'xml.parsers.expat', 'pyexpat', '_elementtree',
-        'xml.sax.saxutils', 'xml.sax.xmlreader',
-        # --- HTTP, URLs, cookies, mail-shaped plumbing ---
-        'http', 'http.client', 'http.cookies', 'http.cookiejar',
-        'urllib', 'urllib.parse', 'urllib.request', 'urllib.error',
-        'urllib.response', 'urllib.robotparser',
-        'email', 'email.parser', 'email.feedparser', 'email.header',
-        'email.utils', 'email.encoders', 'email.policy',
-        'email.message', 'email.mime', 'email.mime.base',
-        'email.mime.text', 'email.mime.multipart',
-        'email.mime.message', 'email.mime.nonmultipart',
-        'html', 'html.parser', 'html.entities',
-        'ftplib', 'netrc', 'mimetypes', 'ipaddress',
-        'socket', 'ssl', 'selectors',
-        # --- Data formats, compression, hashing ---
-        'json', 'json.decoder', 'json.encoder',
-        'gzip', 'zlib', 'bz2', 'lzma', 'zipfile', 'tarfile',
-        'hashlib', 'hmac', 'base64', 'binascii', 'secrets', 'uuid',
-        'csv', 'configparser', 'plistlib', 'struct',
-        # --- Logging and CLI plumbing ---
-        'logging', 'logging.handlers', 'logging.config',
-        'optparse', 'argparse', 'getopt', 'shlex',
-        # --- System glue yt_dlp and requests reach for ---
-        'getpass', 'platform', 'webbrowser',
-        'ctypes', 'ctypes.util',
-        'locale', 'codecs', 'encodings', 'unicodedata',
-        'importlib.metadata', 'pkgutil', 'zipimport', 'runpy',
-        'site', 'sysconfig', 'inspect',
-        # --- Core runtime (cheap insurance; several are dynamic
-        # somewhere in the three packages' long tail) ---
-        'os', 'sys', 're', 'io', 'time', 'datetime', 'calendar',
-        'threading', 'queue', 'contextlib', 'warnings',
-        'string', 'textwrap', 'copy', 'pprint', 'difflib',
-        'glob', 'fnmatch', 'tempfile', 'pathlib', 'shutil', 'stat',
-        'subprocess', 'signal', 'traceback', 'random', 'math',
-        'collections', 'collections.abc', 'functools', 'itertools',
-        'operator', 'typing', 'enum', 'dataclasses', 'weakref',
-        'types', 'heapq', 'bisect',
-        'concurrent', 'concurrent.futures',
+    hiddenimports=_all_stdlib_hiddenimports() + [
         # Third-party modules we are now bundling
         'requests', 'flask',
     ],
