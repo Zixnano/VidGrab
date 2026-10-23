@@ -60,6 +60,16 @@ jobs:
       - name: Build thin launcher exe
         run: pyinstaller VideoGrabber.spec --noconfirm --distpath dist-launcher --workpath build-launcher
 
+      # Launcher must stay thin: numpy/PIL/PySide6 live ONLY in runtime\site-packages.
+      - name: Verify launcher is thin
+        shell: pwsh
+        run: |
+          $int = 'dist-launcher/VideoGrabber/VideoGrabber_internal'
+          foreach ($n in 'numpy','numpy.libs','PIL','pillow.libs','PySide6','yt_dlp') {
+            if (Test-Path "$int/$n") { throw "Launcher bundles $n; it must only live in runtime\site-packages" }
+          }
+          Write-Host "Launcher is thin: OK"
+
       # runtime\site-packages: the full dependency set as importable source.
       # --upgrade because a plain --target skips requirements already
       # satisfied in the CI python's own site-packages. PySide6 STAYS in
@@ -67,6 +77,33 @@ jobs:
       # add_dll_directory points at runtime\site-packages\PySide6.
       - name: Install runtime dependencies
         run: pip install --upgrade -r requirements.txt --target "staging\video 3 grabber\runtime\site-packages"
+
+      # Fail the build if numpy / Pillow (and numpy's DLL folder) did not land
+      # in runtime\site-packages, then import them from THERE only
+      # (-I -S ignores the CI python's own site-packages).
+      - name: Verify numpy and Pillow in runtime
+        shell: pwsh
+        run: |
+          $sp = (Resolve-Path 'staging/video 3 grabber/runtime/site-packages').Path
+          foreach ($n in 'numpy','PIL') {
+            if (-not (Test-Path "$sp/$n")) { throw "$n missing from runtime\site-packages" }
+          }
+          if (-not (Test-Path "$sp/numpy.libs")) { Write-Warning "numpy.libs not present (ok only if this numpy build has no vendored DLLs)" }
+          @'
+          import sys, os
+          sp = sys.argv[1]
+          sys.path.insert(0, sp)
+          for d in (sp, os.path.join(sp, "numpy.libs"), os.path.join(sp, "pillow.libs")):
+              if os.path.isdir(d):
+                  os.add_dll_directory(d)
+          import numpy, PIL
+          from PIL import Image
+          assert os.path.normcase(numpy.__file__).startswith(os.path.normcase(sp)), numpy.__file__
+          assert os.path.normcase(PIL.__file__).startswith(os.path.normcase(sp)), PIL.__file__
+          print("numpy", numpy.__version__, "| PIL", PIL.__version__, "| arr sum", int(numpy.arange(10).sum()))
+          '@ | Set-Content -Path smoke_runtime.py -Encoding utf8
+          python -I -S smoke_runtime.py "$sp"
+          if ($LASTEXITCODE -ne 0) { throw "numpy/PIL import from runtime\site-packages failed" }
 
       - name: Assemble split layout (launcher + app + runtime)
         shell: pwsh

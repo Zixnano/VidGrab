@@ -1,5 +1,20 @@
 const BACKEND_BASE = "http://127.0.0.1:5757";
 
+// --- CIRCUIT BREAKER: Prevent popup lockups if the app is dead ---
+const originalFetch = window.fetch;
+window.fetch = function(...args) {
+    if (args[0] && typeof args[0] === 'string' && !args[0].includes('127.0.0.1') && !args[0].includes('localhost')) {
+        return originalFetch.apply(this, args);
+    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000); 
+    const options = args[1] || {};
+    options.signal = controller.signal;
+    args[1] = options;
+    return originalFetch.apply(this, args).finally(() => clearTimeout(timeoutId));
+};
+// -----------------------------------------------------------------
+
 // ---------------- helpers ----------------
 
 function fmtBytes(n) {

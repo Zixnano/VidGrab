@@ -16,6 +16,9 @@ rem launcher removes them on its next successful startup.
 set "ROOT=%~1"
 set "PKG=%~2"
 set "NEWTAG=%~3"
+rem AUTO_LAUNCH=0: never start the app from here (loop safety). Set to 1 to restore
+rem relaunch-after-update once the single-instance mutex build is confirmed stable.
+set "AUTO_LAUNCH=0"
 set "DID_APP="
 set "DID_EXE="
 set "DID_INT="
@@ -35,7 +38,7 @@ rem the current install look like real app folders. Otherwise a bogus
 rem pkg would get the good app\ renamed away with nothing to restore.
 if not exist "%PKG%\app\server.py" (
     echo updater.bat: staged pkg has no app\server.py — aborting untouched.
-    start "" "%ROOT%\VideoGrabber.exe"
+    if "%AUTO_LAUNCH%"=="1" start "" "%ROOT%\VideoGrabber.exe"
     endlocal
     exit /b 1
 )
@@ -61,7 +64,7 @@ goto :swap
 
 :blocked
 echo updater.bat: previous update leftovers are locked — aborting untouched.
-start "" "%ROOT%\VideoGrabber.exe"
+if "%AUTO_LAUNCH%"=="1" start "" "%ROOT%\VideoGrabber.exe"
 endlocal
 exit /b 1
 
@@ -105,7 +108,7 @@ rem actually on disk — not the APP_VERSION baked into the old source.
 if defined NEWTAG (echo %NEWTAG%)> "%ROOT%\install-version.txt"
 
 rmdir /s /q "%PKG%" 2>NUL
-start "" "%ROOT%\VideoGrabber.exe"
+if "%AUTO_LAUNCH%"=="1" start "" "%ROOT%\VideoGrabber.exe"
 endlocal
 exit /b 0
 
@@ -131,6 +134,6 @@ if "%DID_APP%"=="1" (
     )
 )
 echo updater.bat: swap failed — rolled back to the previous version. Staged files left in "%PKG%".
-start "" "%ROOT%\VideoGrabber.exe"
+if "%AUTO_LAUNCH%"=="1" start "" "%ROOT%\VideoGrabber.exe"
 endlocal
 exit /b 1

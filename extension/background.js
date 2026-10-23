@@ -8,6 +8,25 @@
 
 const BACKEND_BASE = "http://127.0.0.1:5757";
 
+// --- CIRCUIT BREAKER: Prevent browser lockups if the desktop app is dead ---
+const originalFetch = self.fetch;
+self.fetch = function(...args) {
+    // If it's not a request to the local app, let it pass through normally.
+    if (args[0] && typeof args[0] === 'string' && !args[0].includes('127.0.0.1') && !args[0].includes('localhost')) {
+        return originalFetch.apply(this, args);
+    }
+    // If it IS a request to the app, add a strict timeout.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2-second max wait
+    
+    const options = args[1] || {};
+    options.signal = controller.signal;
+    args[1] = options;
+    
+    return originalFetch.apply(this, args).finally(() => clearTimeout(timeoutId));
+};
+// ---------------------------------------------------------------------------
+
 // v4.3: extension settings (popup cog). vgsettings.js holds the defaults and
 // vgNormalize(). VGCFG is kept current by storage.onChanged; until the first
 // read lands it holds the defaults, so nothing is dropped on a cold wake.
