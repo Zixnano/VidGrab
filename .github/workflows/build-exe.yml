@@ -53,22 +53,44 @@ jobs:
           Expand-Archive "deno.zip" -DestinationPath "_deno" -Force
           Copy-Item "_deno\deno.exe" "deno.exe"
 
-      # Thin launcher: built from VideoGrabber.spec (onedir, console=False,
-      # no PySide6 / yt-dlp / streamlink / watchdog / ffmpeg / Deno / app
-      # code — those all live in runtime\). Output: dist-launcher\
-      # VideoGrabber\ containing VideoGrabber.exe + VideoGrabber_internal\.
-      - name: Build thin launcher exe
-        run: pyinstaller VideoGrabber.spec --noconfirm --distpath dist-launcher --workpath build-launcher
+      # Supervisor Architecture: THREE PyInstaller builds.
+      #  - VideoGrabber.exe    = the supervisor (VideoGrabber.spec /
+      #    launcher.py): resident process manager, stdlib only.
+      #  - VideoGrabberApp.exe = the app host (AppHost.spec / app_host.py,
+      #    the former launcher): runs app\server.py in-process.
+      #  - recovery\recovery.exe = the lifeline (Recovery.spec /
+      #    recovery_ui.py): onedir, BUNDLES PySide6 so it can open with
+      #    the app runtime completely dead.
+      # Supervisor and host must stay thin — numpy/PIL/PySide6/yt-dlp
+      # live ONLY in runtime\site-packages.
+      - name: Build supervisor exe
+        run: pyinstaller VideoGrabber.spec --noconfirm --distpath dist-supervisor --workpath build-supervisor
+      - name: Build app host exe
+        run: pyinstaller AppHost.spec --noconfirm --distpath dist-host --workpath build-host
+      - name: Build recovery exe (onedir, bundles PySide6)
+        run: pyinstaller Recovery.spec --noconfirm --distpath dist-recovery --workpath build-recovery
 
-      # Launcher must stay thin: numpy/PIL/PySide6 live ONLY in runtime\site-packages.
-      - name: Verify launcher is thin
+      # The specs set contents_directory explicitly; without those
+      # exact folders every Copy-Item below fails or, worse, a
+      # Test-Path further down passes vacuously. Fail HERE, loudly.
+      - name: Assert PyInstaller internal folders exist
         shell: pwsh
         run: |
-          $int = 'dist-launcher/VideoGrabber/VideoGrabber_internal'
-          foreach ($n in 'numpy','numpy.libs','PIL','pillow.libs','PySide6','yt_dlp') {
-            if (Test-Path "$int/$n") { throw "Launcher bundles $n; it must only live in runtime\site-packages" }
+          foreach ($d in 'dist-supervisor/VideoGrabber/VideoGrabber_internal','dist-host/VideoGrabberApp/VideoGrabberApp_internal','dist-recovery/recovery/VideoGrabberRecovery_internal') {
+            if (-not (Test-Path $d -PathType Container)) { throw "missing internal folder: $d (check contents_directory in the .spec files)" }
           }
-          Write-Host "Launcher is thin: OK"
+          Write-Host "Internal folders present: OK"
+
+      - name: Verify supervisor and host are thin
+        shell: pwsh
+        run: |
+          foreach ($int in 'dist-supervisor/VideoGrabber/VideoGrabber_internal','dist-host/VideoGrabberApp/VideoGrabberApp_internal') {
+            if (-not (Test-Path $int -PathType Container)) { throw "internal folder missing: $int" }
+            foreach ($n in 'numpy','numpy.libs','PIL','pillow.libs','PySide6','yt_dlp') {
+              if (Test-Path "$int/$n") { throw "$int bundles $n; it must only live in runtime\site-packages" }
+            }
+          }
+          Write-Host "Supervisor and host are thin: OK"
 
       # runtime\site-packages: the full dependency set as importable source.
       # --upgrade because a plain --target skips requirements already
@@ -109,18 +131,59 @@ jobs:
         shell: pwsh
         run: |
           $root = 'staging/video 3 grabber'
-          # app\ = my Python code only (every backend .py, launcher.py included)
+          # app\ = the app Python code. EXCLUDED: launcher.py (supervisor
+          # source), app_host.py (host source), recovery_ui.py (the
+          # lifeline is never part of app\ and thin updates never touch
+          # it). updater_ui.py IS included — the supervisor copies it
+          # from app\ to its staging folder when an update runs.
           New-Item -ItemType Directory -Force "$root/app" | Out-Null
-          Copy-Item -Path *.py -Destination "$root/app/"
+          Get-ChildItem -Filter *.py | Where-Object {
+            $_.Name -notin 'launcher.py','app_host.py','recovery_ui.py'
+          } | Copy-Item -Destination "$root/app/"
+          # vg_state.py is the shared state module: updater_ui.py and
+          # gui_qt.py import it from app\. Fail loudly if it is not
+          # there (it means backend\ was not copied into the repo).
+          if (-not (Test-Path "$root/app/vg_state.py")) { throw "app/vg_state.py missing: the shared state module must ship in app\" }
           Copy-Item -Path updater.bat, restore.bat -Destination "$root/"
           # Stamp the setup with its own build tag so a fresh install
           # compares updates against THIS build, not APP_VERSION.
           Set-Content "$root/install-version.txt" "v${env:GITHUB_RUN_NUMBER}" -NoNewline
-          # launcher = exe + its internal folder, both at the install root
-          Copy-Item -Path 'dist-launcher/VideoGrabber/VideoGrabber.exe' -Destination "$root/VideoGrabber.exe"
-          Copy-Item -Path 'dist-launcher/VideoGrabber/VideoGrabber_internal' -Destination "$root/" -Recurse
+          # supervisor + host exes with their internal folders, at root
+          Copy-Item -Path 'dist-supervisor/VideoGrabber/VideoGrabber.exe' -Destination "$root/VideoGrabber.exe"
+          Copy-Item -Path 'dist-supervisor/VideoGrabber/VideoGrabber_internal' -Destination "$root/" -Recurse
+          Copy-Item -Path 'dist-host/VideoGrabberApp/VideoGrabberApp.exe' -Destination "$root/VideoGrabberApp.exe"
+          Copy-Item -Path 'dist-host/VideoGrabberApp/VideoGrabberApp_internal' -Destination "$root/" -Recurse
+          # the lifeline: its own folder at the install root, outside app\
+          Copy-Item -Path 'dist-recovery/recovery' -Destination "$root/recovery" -Recurse
           # PySide6 is NOT hoisted — it remains runtime\site-packages\PySide6
           Copy-Item -Path ffmpeg.exe, ffprobe.exe, deno.exe -Destination "$root/runtime/"
+
+      # Recovery's integrity check needs a build-generated manifest of
+      # app\ (hand-maintained manifests drift). SHA-256 + size per file,
+      # excluding __pycache__ / *.pyc / the manifest itself.
+      - name: Generate app manifest.json
+        shell: pwsh
+        run: |
+          @'
+          import hashlib, json, pathlib
+          app = pathlib.Path('staging/video 3 grabber/app')
+          files = {}
+          for p in sorted(app.rglob('*')):
+              if not p.is_file():
+                  continue
+              rel = p.relative_to(app)
+              if '__pycache__' in rel.parts or p.suffix == '.pyc' or p.name == 'manifest.json':
+                  continue
+              h = hashlib.sha256()
+              with open(p, 'rb') as f:
+                  for chunk in iter(lambda: f.read(65536), b''):
+                      h.update(chunk)
+              files[rel.as_posix()] = {'sha256': h.hexdigest(), 'size': p.stat().st_size}
+          out = {'schema_version': 1, 'files': files}
+          (app / 'manifest.json').write_text(json.dumps(out, indent=1), encoding='utf-8')
+          print('manifest:', len(files), 'files')
+          '@ | Set-Content -Path gen_manifest.py -Encoding utf8
+          python gen_manifest.py
 
       - name: "Package setup zip (full install: launcher + app + runtime)"
         shell: pwsh
@@ -128,19 +191,44 @@ jobs:
           Compress-Archive -Path 'staging/video 3 grabber' `
             -DestinationPath "VideoGrabber-setup-v${env:GITHUB_RUN_NUMBER}.zip" -Force
 
-      # Thin update zip: launcher (exe + internal) + app ONLY. Must NOT
-      # contain runtime\ — if it does, the split is pointless and updates
-      # stay ~148 MB.
+      # Runtime-only zip: Recovery's "Re-download Runtime" repair
+      # path downloads this asset by its predictable name.
+      - name: Package runtime-only zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'staging/video 3 grabber/runtime' `
+            -DestinationPath "VideoGrabber-runtime-v${env:GITHUB_RUN_NUMBER}.zip" -Force
+
+      # Thin update zip: host + app ONLY. Must NOT contain runtime\
+      # (the split is pointless otherwise), recovery\ (thin updates
+      # never touch the lifeline), or the supervisor (contract: it
+      # ships with the full setup only, exactly like Recovery).
       - name: Package app-only update zip
         shell: pwsh
         run: |
           $appRoot = 'staging-app/video 3 grabber'
           New-Item -ItemType Directory -Force "$appRoot/app" | Out-Null
-          Copy-Item -Path *.py -Destination "$appRoot/app/"
-          Copy-Item -Path 'dist-launcher/VideoGrabber/VideoGrabber.exe' -Destination "$appRoot/VideoGrabber.exe"
-          Copy-Item -Path 'dist-launcher/VideoGrabber/VideoGrabber_internal' -Destination "$appRoot/" -Recurse
+          Copy-Item -Path 'staging/video 3 grabber/app/*' -Destination "$appRoot/app/" -Recurse
+          Copy-Item -Path 'dist-host/VideoGrabberApp/VideoGrabberApp.exe' -Destination "$appRoot/VideoGrabberApp.exe"
+          Copy-Item -Path 'dist-host/VideoGrabberApp/VideoGrabberApp_internal' -Destination "$appRoot/" -Recurse
+          # The bats ride in the thin zip too (post-audit fix 5): the
+          # updater copies them to the install root during the swap,
+          # so bat fixes no longer wait for a full reinstall.
+          Copy-Item -Path 'staging/video 3 grabber/updater.bat','staging/video 3 grabber/restore.bat' -Destination "$appRoot/"
           Compress-Archive -Path "$appRoot" `
             -DestinationPath "VideoGrabber-app-v${env:GITHUB_RUN_NUMBER}.zip" -Force
+
+      # Every release carries a SHA256SUMS asset: the updater and
+      # Recovery verify downloaded zips against it (fix 11).
+      - name: Generate SHA256SUMS for the release assets
+        shell: pwsh
+        run: |
+          $lines = foreach ($z in "VideoGrabber-setup-v${env:GITHUB_RUN_NUMBER}.zip","VideoGrabber-app-v${env:GITHUB_RUN_NUMBER}.zip","VideoGrabber-runtime-v${env:GITHUB_RUN_NUMBER}.zip") {
+            $h = (Get-FileHash $z -Algorithm SHA256).Hash.ToLower()
+            "$h  $z"
+          }
+          $lines | Set-Content -Path "SHA256SUMS-v${env:GITHUB_RUN_NUMBER}.txt" -Encoding ascii
+          Get-Content "SHA256SUMS-v${env:GITHUB_RUN_NUMBER}.txt"
 
       # softprops/action-gh-release: files: paths are relative to the
       # WORKSPACE ROOT, not the backend working-directory — hence the
@@ -157,12 +245,179 @@ jobs:
 
             ${{ github.event.head_commit.message }}
 
-            - `VideoGrabber-setup-v${{ github.run_number }}.zip` — full install (launcher + app + runtime)
-            - `VideoGrabber-app-v${{ github.run_number }}.zip` — thin update (launcher + app only, no runtime)
+            - `VideoGrabber-setup-v${{ github.run_number }}.zip` — full install (supervisor + host + recovery + app + runtime)
+            - `VideoGrabber-app-v${{ github.run_number }}.zip` — thin update (host + app only, no runtime, no recovery, no supervisor)
+            - `VideoGrabber-runtime-v${{ github.run_number }}.zip` — runtime only (Recovery repair downloads)
+            - `SHA256SUMS-v${{ github.run_number }}.txt` — SHA-256 of every zip above; the updater and Recovery verify downloads against it
           files: |
             backend/VideoGrabber-setup-v${{ github.run_number }}.zip
             backend/VideoGrabber-app-v${{ github.run_number }}.zip
+            backend/VideoGrabber-runtime-v${{ github.run_number }}.zip
+            backend/SHA256SUMS-v${{ github.run_number }}.txt
           draft: false
-          prerelease: false
+          # Published as a PRERELEASE on purpose. updater_ui.pick_candidate
+          # skips prereleases, so installed apps are NOT offered this build
+          # until the integration job below passes and the publish job
+          # promotes it. Recovery's rollback still reaches it by tag.
+          prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Fix 18: exercise the BUILT exes on a real Windows runner. The
+  # Linux harness can only test pure functions; everything about the
+  # supervisor contract that depends on processes, mutexes and the
+  # Job Object is proven here or nowhere. Any failing step fails the
+  # release (the build job has already published it; treat a red
+  # integration job as a do-not-ship signal and roll the release).
+  integration:
+    needs: build
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    steps:
+      - name: Fetch this run's setup zip and lay out a scratch install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release download "v${env:GITHUB_RUN_NUMBER}" --pattern "VideoGrabber-setup-*.zip" --dir dl
+          Expand-Archive -Path (Get-ChildItem dl/*.zip | Select-Object -First 1).FullName -DestinationPath install-test
+          $root = (Resolve-Path 'install-test/video 3 grabber').Path
+          "VG_ROOT=$root" | Out-File $env:GITHUB_ENV -Append
+          $scratch = Join-Path $env:RUNNER_TEMP 'vg-localappdata'
+          New-Item -ItemType Directory -Force $scratch | Out-Null
+          "LOCALAPPDATA=$scratch" | Out-File $env:GITHUB_ENV -Append
+          Write-Host "install root: $root"
+
+      - name: "(a) crash-before-sentinel x3 opens Recovery and auto-blacklists"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:VG_ROOT 'VideoGrabber.exe'
+          $tag = "v${env:GITHUB_RUN_NUMBER}"
+          foreach ($i in 1..3) {
+            # NOT Start-Process -Wait: it also waits for descendants,
+            # and the third run leaves Recovery open (CI would hang).
+            $p = Start-Process $exe -ArgumentList '--simulate=crash-before-sentinel' -PassThru
+            $null = $p.Handle
+            if (-not $p.WaitForExit(180000)) { Stop-Process -Id $p.Id -Force; throw "supervisor run $i did not exit within 3 minutes" }
+            Write-Host "supervisor run $i exit $($p.ExitCode)"
+          }
+          $statePath = Join-Path $env:LOCALAPPDATA 'VideoGrabber/recovery_state.json'
+          $state = Get-Content $statePath -Raw | ConvertFrom-Json
+          if ($state.crash_count -lt 3) { throw "crash_count is $($state.crash_count), expected >= 3" }
+          if ($state.blacklist -notcontains $tag) { throw "auto-blacklist missing $tag (blacklist: $($state.blacklist))" }
+          $rec = $null
+          foreach ($i in 1..30) {
+            $rec = Get-Process recovery -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($rec) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $rec) { throw "Recovery did not open after 3 simulated crashes" }
+          Write-Host "Recovery opened (pid $($rec.Id)); auto-blacklist OK"
+          Stop-Process -Id $rec.Id -Force
+          # keep later steps independent of this state
+          Remove-Item (Join-Path $env:LOCALAPPDATA 'VideoGrabber') -Recurse -Force
+
+      - name: "(b) bat swap (full + host mode) and restore.bat rollback"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # the scratch path deliberately contains a space: the real
+          # install folder is "video 3 grabber"
+          $scratch = Join-Path $env:RUNNER_TEMP 'vg swap test'
+          Copy-Item $env:VG_ROOT $scratch -Recurse
+          $pkg = Join-Path $env:RUNNER_TEMP 'vg pkg test'
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item (Join-Path $scratch 'app') $pkg -Recurse
+          Copy-Item (Join-Path $scratch 'VideoGrabberApp.exe') $pkg
+          Copy-Item (Join-Path $scratch 'VideoGrabberApp_internal') $pkg -Recurse
+          Add-Content (Join-Path $pkg 'app/server.py') "`n# swap-marker-b"
+          $bat = Join-Path $scratch 'updater.bat'
+          # invoke through a runner .cmd so the quoting is exactly
+          # what cmd itself parses (the production string form has
+          # its own unit test in test_harness.py)
+          $runner = Join-Path $env:RUNNER_TEMP 'run-updater.cmd'
+          Set-Content $runner ('call "{0}" "{1}" "{2}" "vTEST"' -f $bat, $scratch, $pkg)
+          & $runner
+          if ($LASTEXITCODE -ne 0) { throw "updater.bat full swap exited $LASTEXITCODE" }
+          if (-not (Select-String -Path (Join-Path $scratch 'app/server.py') -Pattern 'swap-marker-b' -Quiet)) { throw "bat swap did not land the pkg app" }
+          if (-not (Test-Path (Join-Path $pkg 'app/server.py'))) { throw "updater.bat deleted the staged pkg (it must only copy)" }
+          & (Join-Path $scratch 'restore.bat') $scratch
+          if (Select-String -Path (Join-Path $scratch 'app/server.py') -Pattern 'swap-marker-b' -Quiet) { throw "restore.bat did not roll the app back" }
+          # restore.bat ends by START-ing VideoGrabber.exe. Kill what it
+          # started (supervisor first; the Job Object takes the host), or
+          # it would hold the host mutex and break steps (b-host) and (c).
+          Start-Sleep -Seconds 3
+          Get-Process VideoGrabber, VideoGrabberApp -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 2
+          Remove-Item (Join-Path $env:LOCALAPPDATA 'VideoGrabber') -Recurse -Force -ErrorAction SilentlyContinue
+
+          # HOST mode (4th argument): only the host files move.
+          $hostPkg = Join-Path $env:RUNNER_TEMP 'vg host pkg'
+          New-Item -ItemType Directory -Force $hostPkg | Out-Null
+          Copy-Item (Join-Path $scratch 'VideoGrabberApp.exe') $hostPkg
+          Copy-Item (Join-Path $scratch 'VideoGrabberApp_internal') $hostPkg -Recurse
+          Set-Content (Join-Path $hostPkg 'VideoGrabberApp_internal/host-marker.txt') 'host-marker-b'
+          Set-Content $runner ('call "{0}" "{1}" "{2}" "vTESTHOST" "host"' -f $bat, $scratch, $hostPkg)
+          & $runner
+          if ($LASTEXITCODE -ne 0) { throw "updater.bat host mode exited $LASTEXITCODE" }
+          if (-not (Test-Path (Join-Path $scratch 'VideoGrabberApp_internal/host-marker.txt'))) { throw "host mode did not land the staged host files" }
+          if ((Get-Content (Join-Path $scratch 'install-version.txt') -Raw).Trim() -ne 'vTESTHOST') { throw "host mode did not stamp install-version.txt" }
+          if (-not (Test-Path (Join-Path $hostPkg 'VideoGrabberApp.exe'))) { throw "host mode deleted the staged pkg (it must only copy)" }
+          Write-Host "bat swap (full + host mode) + rollback OK"
+
+      - name: "(c) a second host launch is refused while the first runs"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # NOT $host: that is PowerShell's read-only automatic variable.
+          $hostExe = Join-Path $env:VG_ROOT 'VideoGrabberApp.exe'
+          $first = Start-Process $hostExe -PassThru
+          Start-Sleep -Seconds 8
+          if ($first.HasExited) { throw "first host exited during warmup (exit $($first.ExitCode)); cannot test refusal" }
+          $second = Start-Process $hostExe -PassThru
+          if (-not $second.WaitForExit(15000)) {
+            Stop-Process -Id $second.Id -Force
+            throw "second host did not exit: the host mutex is not refusing duplicates"
+          }
+          Write-Host "second host refused OK"
+          Stop-Process -Id $first.Id -Force -ErrorAction SilentlyContinue
+
+      - name: "(d) killing the supervisor kills the host (Job Object)"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:VG_ROOT 'VideoGrabber.exe'
+          $sup = Start-Process $exe -PassThru
+          $hostProc = $null
+          foreach ($i in 1..30) {
+            $hostProc = Get-Process VideoGrabberApp -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hostProc) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $hostProc) { throw "supervisor never spawned a host" }
+          Stop-Process -Id $sup.Id -Force
+          foreach ($i in 1..15) {
+            if (-not (Get-Process -Id $hostProc.Id -ErrorAction SilentlyContinue)) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (Get-Process -Id $hostProc.Id -ErrorAction SilentlyContinue) {
+            Stop-Process -Id $hostProc.Id -Force
+            throw "host survived the supervisor's death: Job Object kill-on-close is not in effect"
+          }
+          Write-Host "job object kill-on-close OK"
+
+  # Promote the prerelease to a normal release ONLY when every
+  # integration step above passed. Until then installed apps cannot
+  # be offered this build (updater_ui skips prereleases).
+  publish:
+    needs: [build, integration]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Promote the release
+        run: gh release edit "v${{ github.run_number }}" --repo "${{ github.repository }}" --prerelease=false

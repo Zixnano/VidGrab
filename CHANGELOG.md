@@ -1,165 +1,178 @@
-# Changelog
+# CHANGELOG: audit fix pass (v7, 2026-10-23)
 
-## v4.0.9 — the two "your call" items from BUGS.md, resolved
-- **Deno version pinned in CI** (`BUGS.md` #6 / `QUESTIONS.md` #3):
-  `.github/workflows/build-exe.yml` no longer downloads
-  `releases/latest` for Deno. A job-level `DENO_VERSION: "2.9.6"` env var
-  (current stable as of this pass) now drives the download URL — bump
-  that one value deliberately when you want a newer Deno instead of
-  silently getting whatever's newest on the next unrelated push.
-- **Empty-cookie warning for YouTube downloads** (`BUGS.md` #7):
-  `engines.py::YtDlpEngine.download()` now logs a clear warning when a
-  YouTube/youtu.be URL has no cookie string available from either
-  `opts["cookie"]` or the `Cookie` header — explains that public videos
-  are unaffected but age-restricted/private/member-only ones will fail,
-  and to check that the browser the extension runs in is logged into
-  YouTube. Non-blocking: the download still proceeds exactly as before,
-  it just no longer fails silently with an unexplained 403 later. 4 new
-  tests in `test_engines.py` cover: warns for youtube.com and youtu.be
-  with no cookie, doesn't warn when a cookie is present, doesn't warn for
-  non-YouTube URLs.
-- Full suite: 33 passed, 2 pre-existing skips, 0 failed.
+Every numbered fix from the audit, what changed, and how to test it on
+its own. Harness tests live in test_harness.py (run:
+`python test_harness.py`, needs PySide6 importable). Windows-only
+behaviour is covered by the CI integration job in
+pipeline/build-exe.yml and the first-run checklist in BUILD_NOTES.md.
 
-## v4.0.8 — version display, disk-space awareness, a friendlier Theme tab, push.bat
-- **`push.bat`** added at the repo root: automates `git add -A` → commit →
-  `pull --rebase` → `push` in one double-click, so pushing doesn't have to
-  be done step by step. Accepts an optional commit message as an argument,
-  otherwise prompts (blank is fine — auto-generates one), and surfaces
-  merge conflicts / missing-upstream errors plainly instead of failing
-  silently.
-- **Version is now easy to check.** `settings.APP_VERSION` is the single
-  source of truth (kept in sync with `extension/manifest.json` — a test
-  now guards against them drifting the way `CATEGORIES` once did). It
-  shows up in: the main window's title bar, a permanent status-bar label,
-  and a new Tools → "About Video Grabber…" dialog. A new `GET /version`
-  endpoint exposes it to anything else that wants it.
-- **Disk-space monitor.** A new `GET /diskspace` endpoint
-  (`settings.disk_usage_for()`) reports free/used/total bytes for the
-  downloads drive. The main window's status bar shows free space,
-  refreshed every 15s, turning red when free space drops under 2 GB or
-  the drive is over 95% full. The Add Download dialog now also shows free
-  space next to the probed file size and warns (orange near the limit,
-  red if the file won't fit) before you commit to a download that's
-  likely to fail partway through from running out of room.
-- **Theme tab redesigned to be approachable, not an engineer's token
-  table.** Preset and accent picker (previously split oddly across the
-  General tab and a separate raw table) now live together in the Theme
-  tab: preset as a named dropdown, accent as a row of one-click color
-  swatches plus a custom picker. A real live preview (a mock title,
-  buttons, and progress bar restyled on the fly) replaced the old
-  read-only QSS-code-dump preview. The 14-row raw hex-token table is
-  still there for anyone who wants it, just hidden by default behind a
-  "Show advanced color overrides" checkbox instead of being the first
-  thing anyone sees. Added a "Reset to defaults" button. `CATEGORIES`-style
-  de-duplication applied here too: `self.theme_preset`/`self.accent`/
-  `self._theme_tokens` are still the only state `_save_inner` reads, so
-  saving/loading/export/import all work exactly as before.
-- **Quality-of-life additions:** "Retry all failed" (Tools menu — retries
-  every job currently in an error state in one click) and "Copy URL"
-  (per-job right-click context menu).
-- Test suite: added coverage for `disk_usage_for()` and the
-  version/manifest consistency check. Full suite: 29 passed, 2 pre-existing
-  skips, 0 failed.
+## Phase 1: ship blockers
 
-## v4.0.7 — BUGS.md follow-through (backend only, no extension changes)
-Everything below was found and reported (not fixed) in the v4.0.6 pass's
-`BUGS.md`; this pass fixes 1–5 and closes them out. 6–7 are new ideas from
-this same pass, left open pending a product decision — see `BUGS.md`.
-- **Screen-recording auto-import now creates a real job.** Previously
-  `_RecordingHandler._import_after_delay` copied the finished recording to
-  disk and only fired the GUI's "new job" hook with a bare synthetic dict —
-  nothing was ever added to `JOBS`, so the recording never showed up in
-  `/jobs`, the GUI table, or `jobs.json`. Fixed to mirror the `/upload`
-  route: `new_job()` → `_repair_recording()` → `_probe_recording()` →
-  `transition(..., JobEvent.COMPLETE)` (or `FAIL` if corrupt) →
-  `maybe_convert_to_mp4()`.
-- **`JOBS` dict iteration made thread-safe** at every call site that wasn't
-  already doing it (`api.py` ×2, `downloader.py` ×2, `jobs.py` ×2,
-  `server.py` ×1) — all now copy via `list(...)` before iterating, matching
-  the one call site (`dispatcher_loop`) that already did. Prevents an
-  intermittent `RuntimeError: dictionary changed size during iteration`
-  under concurrent job creation (most reachable via `/jobs`, which the GUI
-  polls every second).
-- **LAN remote-key check is now constant-time** (`secrets.compare_digest`
-  instead of `==`), matching the API token check two lines below it.
-- **`job_id` added to the `opts` dict** passed to `engine.download()`, so
-  yt-dlp diagnostic/traceback/cookie-file log lines are keyed by job id
-  instead of falling back to the destination filename.
-- **Stale test/implementation drift resolved:** `test_settings.py` and
-  `test_jobs.py` now match actual behavior (`safe_filename` replaces
-  illegal characters with `_`; `category_for("song.mp3")` returns
-  `"Music"`, matching `CATEGORY_MAP` and the README everywhere). Also
-  de-duplicated `CATEGORIES` — it now lives once, as a tuple, in
-  `settings.py`; `gui_qt.py`'s two separate copies (a module-level list and
-  an unrelated class-level tuple) were removed in favor of importing it.
-- **Stale cookie-file sweep added at startup** (`server.py`): any
-  `vg_cookies_*.txt` left in the OS temp dir older than 6 hours gets
-  deleted. These are normally cleaned up in a `finally` block right after
-  each download, but a hard kill mid-download skips that — and each file
-  holds a user's session cookies in plaintext, so leaving them indefinitely
-  was worth closing even though it's minor.
-- **Test coverage added** for everything introduced in v4.0.6's Task 1/2:
-  cookie-file writing/cleanup/fallback-priority in `YtDlpEngine.download()`,
-  and format sorting/filtering in `YtDlpEngine.probe()` (audio-only kept,
-  storyboards dropped, mp4/h264 preferred at equal resolution). Full suite:
-  26 passed, 2 pre-existing skips, 0 failed (up from 3 failures at the end
-  of v4.0.6).
+1. **Specs set contents_directory** (VideoGrabber_internal,
+   VideoGrabberApp_internal, VideoGrabberRecovery_internal). CI now
+   asserts all three folders exist right after the builds and the
+   thin check throws if one is missing.
+   Test: CI "Assert PyInstaller internal folders exist" step; locally,
+   grep `contents_directory` in the three .spec files.
+2. **updater.bat quoting**: the supervisor builds one pre-quoted
+   string (`cmd /s /c ""bat" "root" "pkg" "tag""`) via
+   `updater_bat_cmdline()` instead of a subprocess list that cmd
+   mangled on paths with spaces.
+   Test: harness "bat cmdline wraps the whole command in one outer
+   quote pair" (exact string, path with spaces) and the host-mode
+   variant.
+3. **Updater swaps app only**: `swap_from_pkg` copies app\ out of the
+   pkg (pkg stays whole) and never touches the host exe or internal
+   folder it is running inside. Host files stay staged; the
+   supervisor runs updater.bat in "host" mode after the updater host
+   exits. The bat copies (never moves or deletes the pkg), so a
+   failed rollback cannot destroy the staged files. The version
+   stamp is deferred until the host swap lands.
+   Test: harness "swap_from_pkg swaps app only and reports host
+   pending", "leaves the running host untouched", "copies: the pkg
+   stays whole", "version stamp deferred"; CI step (b).
 
-## v4.0.6 — cookie handoff, full format list, dialog focus, intercept-all
-- **YouTube cookies (Task 1):** `cookiesfrombrowser` removed for good —
-  it cannot work on Chrome 127+ / Vivaldi 6.9+ (App-Bound Encryption,
-  yt-dlp/yt-dlp#10927). `YtDlpEngine.download()` now takes the
-  extension-supplied cookie string (already sent by `background.js`'s
-  `cookieHeaderFor()` and already threaded through `api.py` → `jobs.py` →
-  `downloader.py`), writes it to a Netscape-format cookie file per job in
-  the OS temp dir, and points yt-dlp at it via `cookiefile`, cleaning up
-  afterward. The rest of the pipeline needed no changes — the bug was
-  isolated to `engines.py`.
-- **Full quality list (Task 2):** `YtDlpEngine.probe()` was using a
-  narrow `player_client` list that only surfaced a handful of progressive
-  YouTube formats; broadened to match `download()`'s client list and
-  stopped discarding audio-only formats. Formats are now sorted
-  (resolution descending, muxed-before-video-only, mp4/h264 preferred).
-  `content.js` had two separate `formats.slice(0, 12)` truncations in the
-  pill's quality menu — both removed; the backend's own sanity cap moved
-  from 30 to 40.
-- **Add-dialog focus (Task 3):** `AddDownloadDialog` now sets
-  `WindowStaysOnTopHint` and raises/activates itself on every `showEvent`;
-  `_on_show_dialog` also raises and activates the main window first, so
-  the dialog can no longer open behind other windows.
-- **Intercept-all downloads (Task 4):** `background.js`'s
-  `chrome.downloads.onCreated` handler no longer gates on a known-extension
-  regex or a HEAD-probe fallback — every intercepted download (other than
-  the app's own localhost/IP traffic and the extension's own downloads)
-  now opens the Add Download dialog via `/show-add-dialog`. The
-  `skip_add_dialog` escape hatch remains server-side only, as before.
-- **`BUGS.md`** added: 5 findings from this pass's audit (screen-recording
-  auto-import never registers a real job; several unprotected `JOBS` dict
-  iterations across threads; a non-constant-time LAN remote-key
-  comparison; a missing `job_id` in yt-dlp diagnostics; 3 pre-existing
-  test/implementation mismatches in `backend/tests/test_settings.py` and
-  `test_jobs.py`). None of these were fixed — logged for review.
+## Phase 2: high
 
-## v4.0.0 — full application rewrite (Sessions 0–13)
-- Modular backend: server/api/jobs/downloader/engines split; jobs.json
-  snapshot + restore; status state machine; engine routing (yt-dlp,
-  streamlink) honoring per-site/preference/disabled settings.
-- Download quality: H.264/mp4-first format string, MKV container
-  preservation, mp3 `-q:a 0` / opus 192k / m4a 256k, `-crf 18 -preset
-  medium` fallback, validated subtitle languages.
-- Multi-quality checklist downloads with resolution-suffixed filenames;
-  on-disk collision disambiguation at download start.
-- Responsiveness: all per-tick HTTP and settings reads on worker threads;
-  closeEvent stops workers; animations run only while active.
-- Animations: row fades, 100 ms progress interpolation, dialog fades,
-  pill open/close opacity — all gated by `animations_enabled`.
-- Extension: pill recorder upgraded — 4 capture modes with tab fallback,
-  quality presets, floating indicator (timer/pause/resume), notifications,
-  timestamped naming.
-- Theming: three presets, accent picker, per-token overrides with live
-  preview, JSON export/import; startup honors saved theme.
-- Tests: `backend/tests/` (conftest + 6 files), `requirements.txt`.
-- Defect fixes found by gates/sweeps: jobs snapshot JOBS_PATH NameError,
-  JS-runtime cache init, watchdog fallback base, download-dest collisions.
+4. **Host mutex + Job Object**: the host always takes its own
+   Local\VideoGrabber_Host_v1 except in smoke and updater guest
+   modes (`host_lock_required`). The supervisor assigns the host
+   (and the updater host) to a Windows Job Object with
+   JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+   Test: harness host-lock matrix (4 checks); CI steps (c) and (d).
+5. **Backups and restore cover the host**: `make_backup`,
+   `snapshot_app`, and the new component-wise `swap_install` include
+   VideoGrabberApp.exe and VideoGrabberApp_internal; restore still
+   stamps install-version.txt.
+   Test: harness "backup includes the host exe and internal folder",
+   "restore brings back app AND host".
+6. **Auto-blacklist**: at crash_count >= 3 the supervisor blacklists
+   current_version (unless it is the last known good) before Recovery
+   opens; Recovery restore/rollback blacklist the version they
+   replaced. Manual buttons unchanged.
+   Test: harness `should_auto_blacklist` matrix (4 checks); CI step
+   (a) asserts the blacklist in state after 3 simulated crashes.
+7. **Judging window**: FIRST_CHECK_SECONDS is 130 (the GUI health
+   watch allows 120). A pure `judge_step` never latches
+   backend_failed while the child is alive before the 300 s hard cap;
+   a late startup_ok upgrades the run to ok.
+   Test: harness judge_step matrix (6 checks).
+8. **Relaunch cap resets**: main() zeroes the consecutive-relaunch
+   counter whenever the last run settled ok or legacy_ok, so a tray
+   session can take more than 3 updates in its lifetime.
+   Test: harness "main() allows more than 3 lifetime update
+   relaunches when runs settle ok" (scripted supervise, 5 calls).
+9. **updater.bat waitloop cap**: about 30 tries then exit /b 1, and
+   the wait matches the host by full image path under the install
+   root via PowerShell, with the name-only tasklist check as
+   fallback.
+   Test: read the :waitloop block; CI step (b) runs the bat end to
+   end on a path with spaces.
 
-## v3.3.x — see FIXES_NOTES.txt (61 items, all verified fixed herein).
+## Phase 3: hardening
+
+10. **vg_state.py**: state dir, StateLock, load/save/mutate,
+    pid_alive, recovery log and update-result helpers now exist in
+    exactly one stdlib-only module, imported by launcher.py,
+    updater_ui.py, recovery_ui.py and gui_qt.py. Stale-lock takeover
+    is by atomic rename with content re-verification, never by
+    unlinking the live path.
+    Test: harness module-identity check, stale-takeover check,
+    live-lock refusal, and 2 processes x 50 locked increments = 100.
+11. **Download integrity**: CI publishes SHA256SUMS-vN.txt for every
+    zip. The updater downloads to .part, renames on completion,
+    checks bytes received == asset size, verifies the zip against
+    SHA256SUMS, and verify_pkg now compares SHA-256 as well as size.
+    Recovery verifies its rollback and runtime downloads the same
+    way. Releases older than the sums asset fall back to size plus
+    manifest checks, logged.
+    Test: harness verify_download accept/reject-short/reject-hash and
+    verify_pkg same-size SHA mismatch (5 checks).
+12. **Blocking wait**: once a run settles ok or legacy_ok, supervise()
+    blocks on child.wait() instead of polling every 0.25 s.
+    Test: code path in supervise(); the supervisor smoke still judges
+    a dead child correctly.
+13. **Update result surfaced in-app**: the updater and supervisor
+    write state["last_update_result"]; the GUI pops it (read and
+    clear in one locked pass) about 1.5 s after first show and
+    displays it once.
+    Test: harness update-result round trip; the GUI smoke constructs
+    the window and confirms the hook exists.
+14. **Pruning and log rotation**: app_broken-*, runtime_broken-*,
+    host broken copies and app_snapshot-* are pruned to the newest 2;
+    recovery.log rotates at 512 KB with one .1 kept (the rotation
+    lives in vg_state.recovery_log, shared by both writers).
+    Test: harness pruning and rotation checks.
+15. **Recovery messages**: Relaunch checks the supervisor mutex and
+    explains instead of spawning a supervisor that exits silently;
+    Rollback with no last known good version explains why, and the
+    button stays enabled so the click can say so.
+    Test: code paths in recovery_ui (_supervisor_mutex_held,
+    _rollback); Windows-only mutex probe, covered by inspection and
+    the first-run checklist.
+16. **Cleanup**: restore.bat defaults ROOT to its own folder (%~dp0),
+    no hardcoded user path; the dead _on_update_result slot and its
+    signal are removed from gui_qt.py; AUTO_LAUNCH is gone from
+    updater.bat; the stale CI comment above the runtime zip is fixed;
+    the updater's disk-space check measures the state drive
+    (download, extraction, backup) and the install drive (swap)
+    separately.
+    Test: grep the delivered files; harness still green.
+
+## Phase 4: verification
+
+17. **Harness**: 32 existing assertions kept; 38 added across the
+    fixes above. Total 70/70.
+18. **Windows CI integration job**: runs the built exes on
+    windows-latest: (a) triple crash simulation opens Recovery and
+    auto-blacklists; (b) bat full swap and restore.bat rollback on a
+    path with spaces; (c) a second host launch is refused; (d)
+    killing the supervisor kills the host via the Job Object.
+
+## Residual risks (honest list)
+
+- The integration job is new and has never run; expect to tune it
+  once against its first real run (process timing on the runner is
+  the usual suspect). Treat a red job as do-not-ship until read.
+- Job Object assignment, both mutexes, the PowerShell path check in
+  the bat, and the PyInstaller builds themselves cannot be executed
+  from the Linux build VM; they are covered by the CI job and the
+  Windows checklist, not by local runs.
+- gui_qt.py still contains em dashes in its pre-existing UI strings
+  (the app's own text, not added by this pass); the files authored
+  for the Supervisor Architecture are em-dash free.
+- SHA256SUMS verification falls back to size plus manifest checks
+  for releases published before the sums asset existed; that is
+  deliberate (Recovery must still be able to fetch old releases).
+- The internal manifest generator still exists in two places (the
+  workflow step and recovery.build_manifest); they hash identical
+  inputs the same way, but a single shared script would be tidier.
+
+## Post-audit cleanup (v8, 2026-10-23)
+Built on the audit's 4 patched files (85/85 baseline). Six fixes:
+(1) duplicate host exits 42 and is judged "duplicate", never
+counted; (2) Job Object assignment failure terminates the child and
+exits the supervisor; (3) BUILD_NOTES gains a "Residual risks
+(accepted)" section stating SHA256SUMS is integrity, not
+authenticity, and signing is not implemented; (4) vg_state
+SCHEMA_VERSION = 1 with a refusal gate in the supervisor and the
+updater; (5) the bats ride in the thin zip and the updater installs
+them during the swap; (6) stale BUILD_NOTES counts and the stale
+launcher.py stamp comment corrected. Harness: 97/97 (12 new checks
+across fixes 1, 2, 4 and 5; fixes 3 and 6 are documentation and
+have no executable test). One-line tests: fix 1, run the harness
+and read the "duplicate" checks; fix 2, the SupervisorFatal checks;
+fix 4, the schema gate checks; fix 5, the "fresh bats" check.
+
+## Deep scan fixes (v9, 2026-10-23)
+Thirteen defects from a final full read of the v8 set: pid-0 state
+locks never went stale; mutate_state had no per-process thread
+serialisation; unjudged runs ignored recorded exit codes and the
+marker files; a schema-blocked updater still fell back to the bat;
+one updater failure path told the user nothing; the updater window
+could be closed mid-swap and report success; app_unknown backups
+were never pruned; Recovery had no schema gate; diagnosis mislabelled
+duplicate runs; restore could fail on a missing data home; rollback
+could pick a nested server.py; both bats had rollback holes (copied
+components left behind, unchecked renames before relaunch). Harness
+113/113. Full list in BUILD_NOTES, v9 section.

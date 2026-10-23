@@ -41,6 +41,59 @@ from PySide6.QtWidgets import (
 
 BACKEND_BASE = "http://127.0.0.1:5757"
 HOME = Path.home() / "Downloads" / "VideoGrabber"
+
+# --- Supervisor Architecture (contract v3): sentinel markers + state ----
+# The supervisor (launcher.py) spawns this app with VG_LAUNCH_ID set.
+# On first show we write app_alive.tmp; once our own /health answers
+# with the app identity we write startup_ok.tmp. Without VG_LAUNCH_ID
+# (dev runs, old launcher) all of this is a no-op.
+_VG_LAUNCH_ID = os.environ.get("VG_LAUNCH_ID", "")
+
+
+try:
+    import vg_state as _vg_state_mod
+except Exception:
+    # An install caught mid-transition (app\ swapped before
+    # vg_state.py landed): the hooks degrade to no-ops rather than
+    # taking the window down with an ImportError.
+    _vg_state_mod = None
+
+
+def _vg_state_dir():
+    if _vg_state_mod is not None:
+        return _vg_state_mod.state_dir()
+    base = os.environ.get("VG_STATE_DIR") or os.environ.get("LOCALAPPDATA")
+    if base and os.environ.get("VG_STATE_DIR"):
+        return Path(base)
+    if base:
+        return Path(base) / "VideoGrabber"
+    return Path.home() / "AppData" / "Local" / "VideoGrabber"
+
+
+def _vg_write_marker(name):
+    if not _VG_LAUNCH_ID:
+        return
+    try:
+        d = _vg_state_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text(json.dumps(
+            {"launch_id": _VG_LAUNCH_ID, "timestamp": int(time.time())}),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _vg_update_state(fn):
+    """Read-modify-write of recovery_state.json via the ONE shared
+    implementation (vg_state.py, fix 10)."""
+    if _vg_state_mod is None:
+        return
+    try:
+        _vg_state_mod.mutate_state(fn)
+    except Exception:
+        pass
+
+
 CONFIG_PATH = HOME / "settings.json"
 
 # Palette-derived (single source of truth: palette.py).
@@ -3901,7 +3954,6 @@ class MainWindow(QMainWindow):
     _new_job_signal = Signal(object)
     # Update-check result back from the worker thread (updater runs off
     # the UI thread so the app doesn't freeze while it hits GitHub).
-    _update_result_signal = Signal(object)
     # Background scheduler found a newer app release (tag string).
     _update_available_signal = Signal(str)
 
@@ -3959,7 +4011,6 @@ class MainWindow(QMainWindow):
         self._apply_styles()
         self._build_tray()
         self._new_job_signal.connect(self._on_new_job, Qt.QueuedConnection)
-        self._update_result_signal.connect(self._on_update_result, Qt.QueuedConnection)
         self._update_available_signal.connect(self._on_update_available, Qt.QueuedConnection)
         try:
             import updater
@@ -4166,6 +4217,95 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Resume all", str(e))
         self.refresh()
+
+    # --- Supervisor Architecture hooks --------------------------------
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_vg_started", False):
+            self._vg_started = True
+            _vg_write_marker("app_alive.tmp")          # window painted
+            _vg_update_state(lambda st: st.setdefault("last_paths", {}).update(
+                {"data_home": str(HOME)}))
+            threading.Thread(target=self._vg_health_watch, daemon=True).start()
+            QTimer.singleShot(1500, self._vg_show_update_result)
+
+    def _vg_show_update_result(self):
+        """Fix 13: an update that ran while the app was closed (or
+        failed inside the updater window nobody saw) is reported
+        here, exactly once: vg_state.pop_update_result clears it in
+        the same locked pass that reads it."""
+        if _vg_state_mod is None:
+            return
+        try:
+            result = _vg_state_mod.pop_update_result()
+        except Exception:
+            return
+        if not result:
+            return
+        tag = result.get("tag") or "the update"
+        if result.get("ok"):
+            QMessageBox.information(
+                self, "Update finished",
+                f"{result.get('message') or f'Updated to {tag}.'}")
+        else:
+            QMessageBox.warning(
+                self, "Update did not finish",
+                f"{result.get('message') or 'The update failed.'}\n\n"
+                "The previous version is still installed. You can try "
+                "again from Tools > Updates, or open Recovery "
+                "(Tools > App) if the app misbehaves.")
+
+    def _vg_health_watch(self):
+        """Write startup_ok.tmp once our own backend answers /health
+        with the Video Grabber identity (contract §3)."""
+        if not _VG_LAUNCH_ID:
+            return
+        try:
+            from settings import APP_PORT
+        except Exception:
+            APP_PORT = 5757
+        import urllib.request
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{APP_PORT}/health", timeout=2) as r:
+                    data = json.loads(r.read().decode("utf-8", "replace"))
+                if isinstance(data, dict) and data.get("app") == "videograbber":
+                    _vg_write_marker("startup_ok.tmp")
+                    return
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    def _restart_in_recovery(self):
+        """Tools > App: set the boot flag and quit; the supervisor sees
+        the flag when we exit and boots recovery.exe instead."""
+        if QMessageBox.question(
+                self, "Restart in Recovery Mode",
+                "Video Grabber will close and the Recovery tool will open. "
+                "Continue?") != QMessageBox.Yes:
+            return
+        try:
+            d = _vg_state_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "boot_recovery.flag").write_text("gui", encoding="utf-8")
+        except Exception:
+            pass
+        self._real_quit()
+
+    def _request_supervised_update(self):
+        """Tools > Updates: hand the install to the supervisor (§5).
+        We only set update_pending and exit; the supervisor runs the
+        animated updater, with updater.bat as its fallback."""
+        if QMessageBox.question(
+                self, "Install update (supervised)",
+                "Video Grabber will close. The supervisor will back up the "
+                "current version, download and install the newest allowed "
+                "release, and relaunch. Continue?") != QMessageBox.Yes:
+            return
+        _vg_update_state(lambda st: st.update({"update_pending": True}))
+        self._real_quit()
 
     def _real_quit(self):
         self._quitting = True
@@ -4429,6 +4569,7 @@ class MainWindow(QMainWindow):
         tm = t.addMenu("Updates")
         a = QAction("Check for updates…", self); a.triggered.connect(self.check_for_updates); tm.addAction(a)
         a = QAction("Roll back yt-dlp…", self); a.triggered.connect(self.rollback_ytdlp); tm.addAction(a)
+        a = QAction("Install update (supervised)…", self); a.triggered.connect(self._request_supervised_update); tm.addAction(a)
         tm = t.addMenu("Pairing")
         a = QAction("Pair Extension\u2026", self); a.triggered.connect(self.show_pair_dialog); tm.addAction(a)
         a = QAction("Copy pairing token", self); a.triggered.connect(self.copy_token); tm.addAction(a)
@@ -4445,6 +4586,7 @@ class MainWindow(QMainWindow):
         a = QAction("Toggle handheld shell", self); a.setShortcut("Ctrl+Shift+S"); a.triggered.connect(self.toggle_shell); tm.addAction(a)
         a = QAction("What's New\u2026", self); a.triggered.connect(self.show_whats_new); tm.addAction(a)
         a = QAction("About Video Grabber…", self); a.triggered.connect(self.show_about); tm.addAction(a)
+        a = QAction("Restart in Recovery Mode…", self); a.triggered.connect(self._restart_in_recovery); tm.addAction(a)
 
     def _apply_styles(self):
         # All styling now comes from gui_style.build_qss (app-wide), so the
@@ -5252,70 +5394,22 @@ class MainWindow(QMainWindow):
         self.log.setText(f"Retrying {len(failed)} failed download(s)…")
 
     def check_for_updates(self):
-        """Run the updater on a background thread. On success it stages the
-        new app zip and hands off to updater.bat, which finishes the swap
-        after this process exits. Only works in the frozen (installed)
-        build; the source run just tells the user to use git."""
+        """All update entry points (Tools menu, the startup prompt's
+        "now", the update badge's "Install now") land here — and all of
+        them go through the supervisor (§5). The old in-process
+        updater.apply_update path staged a swap with no blacklist
+        check, no backup and no manifest verify, so it is gone: the
+        supervised updater is blacklist-aware, backs up first and
+        verifies the package before swapping. Only works in the frozen
+        (installed) build; the source run just tells the user to use
+        git."""
         if not getattr(sys, "frozen", False):
             QMessageBox.information(
                 self, "Check for updates",
                 "Updates only apply to the installed (exe) build.\n"
                 "Source runs should pull from git instead.")
             return
-        try:
-            from updater import apply_update
-        except Exception as e:
-            QMessageBox.warning(self, "Check for updates",
-                                f"Updater module not available:\n{e}")
-            return
-
-        self.status_label.setText("● Checking for updates…")
-        self.status_label.setStyleSheet(f"color: {MUTED}; padding-left: 10px;")
-
-        def _do():
-            try:
-                staged = apply_update()
-                self._update_result_signal.emit({"ok": True, "staged": bool(staged)})
-            except Exception as e:
-                self._update_result_signal.emit({"ok": False, "error": str(e)})
-
-        threading.Thread(target=_do, daemon=True).start()
-
-    def _on_update_result(self, payload):
-        """GUI-thread slot for the update check result."""
-        # Restore the status label to whatever refresh() would have set.
-        try:
-            self.refresh()
-        except Exception:
-            pass
-        if not payload.get("ok"):
-            QMessageBox.warning(self, "Update check failed",
-                                payload.get("error") or "Unknown error")
-            return
-        if not payload.get("staged"):
-            QMessageBox.information(
-                self, "Check for updates",
-                f"You're already on the latest version.\n\nCurrent: v{DISPLAY_VERSION}")
-            return
-        # Update staged — the bat is already waiting for us to exit.
-        answer = QMessageBox.question(
-            self, "Update ready",
-            "An update has been downloaded and is ready to install.\n\n"
-            "The app needs to close briefly while the files are swapped, "
-            "then it will reopen automatically.\n\n"
-            "Restart now?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if answer == QMessageBox.Yes:
-            # Bypass closeEvent's tray-intercept so the process actually
-            # exits — updater.bat is polling for exactly that.
-            self._quitting = True
-            if self._tray:
-                self._tray.hide()
-            QApplication.instance().quit()
-        else:
-            QMessageBox.information(
-                self, "Update ready",
-                "The update will apply the next time you close the app.")
+        self._request_supervised_update()
 
     def open_settings(self):
         try:

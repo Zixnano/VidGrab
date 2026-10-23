@@ -125,7 +125,11 @@ def cleanup_partial_files(job):
 # --------------------------------------------------------------- API ------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True})
+    # Supervisor Architecture (contract §3): the identity payload lets
+    # the launcher's sentinel check and Recovery's ghost check tell OUR
+    # backend apart from any other service on this port. Unauthenticated
+    # by design (it reveals nothing but name + version).
+    return jsonify({"ok": True, "app": "videograbber", "version": APP_VERSION})
 
 @app.route("/pair", methods=["POST"])
 def pair():

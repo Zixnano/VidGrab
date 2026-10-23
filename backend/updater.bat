@@ -1,130 +1,166 @@
 @echo off
 setlocal enableextensions
-rem updater.bat — post-exit swap, spawned by updater.py with:
-rem   %1 = install root  (VideoGrabber.exe, VideoGrabber_internal\, app\, runtime\)
-rem   %2 = staged pkg    (extracted thin zip: VideoGrabber.exe +
-rem                       VideoGrabber_internal\ + app\)
-rem   %3 = release tag   (e.g. v43) — stamped into install-version.txt
-rem Windows won't touch a running .exe or a loaded DLL, so poll until the
-rem process is gone, THEN rename/move. Renames always work where deletes
-rem fail. Every rename/move is error-checked; on failure we roll back
-rem only what THIS run changed (DID_* flags, reverse order), so a stale
-rem leftover from an older aborted cycle can never be swapped in as if
-rem it were this run's backup. Never deletes *.old mid-swap — the
-rem launcher removes them on its next successful startup.
+rem updater.bat: the post-exit swapper. Called by the supervisor in
+rem two situations:
+rem   (a) FALLBACK: updater_ui.py exited non-zero. The bat performs
+rem       the whole swap from the pkg the updater staged.
+rem   (b) HOST mode (%4 = "host"): updater_ui succeeded but staged
+rem       host files (VideoGrabberApp.exe / VideoGrabberApp_internal).
+rem       It cannot swap those itself: its own process is running
+rem       inside them. The supervisor calls the bat once that process
+rem       has exited, and the bat swaps ONLY the host files.
+rem Arguments: %1 = install root, %2 = staged pkg, %3 = release tag,
+rem %4 = optional mode ("host").
+rem
+rem Discipline: renames always work where deletes fail; every step is
+rem error-checked; on failure we roll back only what THIS run changed
+rem (DID_* flags, reverse order). The pkg is COPIED from, never moved
+rem or deleted, so a failed rollback can never destroy the only copy
+rem of the new files; staging is wiped by the next update run. This
+rem script never launches the app: the supervisor relaunches.
 
 set "ROOT=%~1"
 set "PKG=%~2"
 set "NEWTAG=%~3"
-rem AUTO_LAUNCH=0: never start the app from here (loop safety). Set to 1 to restore
-rem relaunch-after-update once the single-instance mutex build is confirmed stable.
-set "AUTO_LAUNCH=0"
+set "MODE=%~4"
 set "DID_APP="
 set "DID_EXE="
 set "DID_INT="
 
-if not defined ROOT (echo usage: updater.bat ^<install-root^> ^<staged-pkg^> ^<tag^> & exit /b 1)
-if not defined PKG  (echo usage: updater.bat ^<install-root^> ^<staged-pkg^> ^<tag^> & exit /b 1)
+if not defined ROOT (echo usage: updater.bat ^<install-root^> ^<staged-pkg^> ^<tag^> [host] & exit /b 1)
+if not defined PKG  (echo usage: updater.bat ^<install-root^> ^<staged-pkg^> ^<tag^> [host] & exit /b 1)
 
+rem Wait for the app host to exit, at most ~30 seconds (fix 9: the
+rem old loop waited forever, and a ghost host would hang the whole
+rem update with the supervisor blocked inside this call). The match
+rem is by full image path under THIS install root where PowerShell
+rem can answer; the name-only tasklist check is the fallback for when
+rem PowerShell itself cannot run.
+set /a TRIES=0
 :waitloop
-tasklist /FI "IMAGENAME eq VideoGrabber.exe" 2>NUL | find /I "VideoGrabber.exe" >NUL
-if not errorlevel 1 (
+set "RUNNING="
+set "PSCHECK="
+for /f "delims=" %%P in ('powershell -NoProfile -Command "$p = Get-Process VideoGrabberApp -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '%ROOT%\*' }; if ($p) { 'yes' } else { 'no' }" 2^>NUL') do set "PSCHECK=%%P"
+if "%PSCHECK%"=="yes" set "RUNNING=1"
+if "%PSCHECK%"=="" (
+    tasklist /FI "IMAGENAME eq VideoGrabberApp.exe" 2>NUL | find /I "VideoGrabberApp.exe" >NUL
+    if not errorlevel 1 set "RUNNING=1"
+)
+if defined RUNNING (
+    set /a TRIES+=1
+    if %TRIES% GEQ 30 (
+        echo updater.bat: VideoGrabberApp.exe still running after ~30s - aborting untouched.
+        endlocal
+        exit /b 1
+    )
     timeout /t 1 /nobreak >NUL
     goto waitloop
 )
 
-rem Preflight: refuse to touch anything unless BOTH the staged pkg and
-rem the current install look like real app folders. Otherwise a bogus
-rem pkg would get the good app\ renamed away with nothing to restore.
+if "%MODE%"=="host" goto :host_preflight
+
+rem Preflight (full mode): refuse to touch anything unless BOTH the
+rem staged pkg and the current install look like real app folders.
 if not exist "%PKG%\app\server.py" (
-    echo updater.bat: staged pkg has no app\server.py — aborting untouched.
-    if "%AUTO_LAUNCH%"=="1" start "" "%ROOT%\VideoGrabber.exe"
+    echo updater.bat: staged pkg has no app\server.py - aborting untouched.
     endlocal
     exit /b 1
 )
 if not exist "%ROOT%\app\server.py" (
-    echo updater.bat: no app\server.py at "%ROOT%" — nothing to update.
+    echo updater.bat: no app\server.py at "%ROOT%" - nothing to update.
+    endlocal
+    exit /b 1
+)
+goto :clear_leftovers
+
+:host_preflight
+if not exist "%PKG%\VideoGrabberApp.exe" if not exist "%PKG%\VideoGrabberApp_internal" (
+    echo updater.bat: host mode but the pkg has no host files - aborting untouched.
     endlocal
     exit /b 1
 )
 
-rem Clear ALL leftovers from a previous aborted cycle BEFORE renaming
-rem anything. A leftover .old would collide with this run's renames, and
-rem a rollback would mistake the stale copy for this run's backup.
-if exist "%ROOT%\app.old" rmdir /s /q "%ROOT%\app.old"
-if exist "%ROOT%\VideoGrabber.exe.old" del /f /q "%ROOT%\VideoGrabber.exe.old" 2>NUL
-if exist "%ROOT%\VideoGrabber_internal.old" rmdir /s /q "%ROOT%\VideoGrabber_internal.old"
+:clear_leftovers
+rem Clear leftovers from a previous aborted cycle BEFORE renaming
+rem anything, so a rollback can never mistake a stale copy for this
+rem run's backup. In host mode the app folder is not ours to clear.
+if not "%MODE%"=="host" if exist "%ROOT%\app.old" rmdir /s /q "%ROOT%\app.old"
+if exist "%ROOT%\VideoGrabberApp.exe.old" del /f /q "%ROOT%\VideoGrabberApp.exe.old" 2>NUL
+if exist "%ROOT%\VideoGrabberApp_internal.old" rmdir /s /q "%ROOT%\VideoGrabberApp_internal.old"
 
-rem If anything survived the purge, a handle is still holding it —
-rem swapping now would fail mid-way. Abort untouched.
-if exist "%ROOT%\app.old" goto :blocked
-if exist "%ROOT%\VideoGrabber.exe.old" goto :blocked
-if exist "%ROOT%\VideoGrabber_internal.old" goto :blocked
+if not "%MODE%"=="host" if exist "%ROOT%\app.old" goto :blocked
+if exist "%ROOT%\VideoGrabberApp.exe.old" goto :blocked
+if exist "%ROOT%\VideoGrabberApp_internal.old" goto :blocked
 goto :swap
 
 :blocked
-echo updater.bat: previous update leftovers are locked — aborting untouched.
-if "%AUTO_LAUNCH%"=="1" start "" "%ROOT%\VideoGrabber.exe"
+echo updater.bat: previous update leftovers are locked - aborting untouched.
 endlocal
 exit /b 1
 
 :swap
+if "%MODE%"=="host" goto :swap_exe
 rename "%ROOT%\app" "app.old"
 if errorlevel 1 goto :fail
-rem Flag goes up right after the rename: from here the old app\ is the
-rem only copy, so a later failure MUST roll this step back.
 set "DID_APP=1"
-move "%PKG%\app" "%ROOT%\app" >NUL
-if errorlevel 1 goto :fail
+robocopy "%PKG%\app" "%ROOT%\app" /E /NFL /NDL /NJH /NJS /NP >NUL
+if errorlevel 8 goto :fail
 
-rem Rename-then-replace for the launcher exe: del on an .exe never works
-rem reliably (locks linger after exit), rename always does.
-if not exist "%PKG%\VideoGrabber.exe" goto :no_exe
-if not exist "%ROOT%\VideoGrabber.exe" goto :move_exe
-rename "%ROOT%\VideoGrabber.exe" "VideoGrabber.exe.old"
+:swap_exe
+rem App host exe: rename-then-replace (del on an .exe is unreliable).
+if not exist "%PKG%\VideoGrabberApp.exe" goto :no_exe
+if not exist "%ROOT%\VideoGrabberApp.exe" goto :copy_exe
+rename "%ROOT%\VideoGrabberApp.exe" "VideoGrabberApp.exe.old"
 if errorlevel 1 goto :fail
 set "DID_EXE=1"
-:move_exe
-move "%PKG%\VideoGrabber.exe" "%ROOT%\VideoGrabber.exe" >NUL
+:copy_exe
+copy /y "%PKG%\VideoGrabberApp.exe" "%ROOT%\VideoGrabberApp.exe" >NUL
 if errorlevel 1 goto :fail
 set "DID_EXE=1"
 :no_exe
 
-rem The launcher's bundled bits ride in the zip too — same rename pattern
-rem (its DLLs may still be memory-mapped by the just-exited process).
-if not exist "%PKG%\VideoGrabber_internal" goto :no_internal
-if not exist "%ROOT%\VideoGrabber_internal" goto :move_internal
-rename "%ROOT%\VideoGrabber_internal" "VideoGrabber_internal.old"
+rem The host's bundled bits ride in the zip too; same rename pattern.
+if not exist "%PKG%\VideoGrabberApp_internal" goto :no_internal
+if not exist "%ROOT%\VideoGrabberApp_internal" goto :copy_internal
+rename "%ROOT%\VideoGrabberApp_internal" "VideoGrabberApp_internal.old"
 if errorlevel 1 goto :fail
 set "DID_INT=1"
-:move_internal
-move "%PKG%\VideoGrabber_internal" "%ROOT%\VideoGrabber_internal" >NUL
-if errorlevel 1 goto :fail
+:copy_internal
+robocopy "%PKG%\VideoGrabberApp_internal" "%ROOT%\VideoGrabberApp_internal" /E /NFL /NDL /NJH /NJS /NP >NUL
+if errorlevel 8 goto :fail
 set "DID_INT=1"
 :no_internal
 
-rem Stamp the installed version so the updater compares against what is
-rem actually on disk — not the APP_VERSION baked into the old source.
+rem Supervisor files are never in a thin package (contract: the
+rem supervisor ships with the full setup only, like Recovery).
+
+rem Stamp the installed version so update checks compare against
+rem what is actually on disk.
 if defined NEWTAG (echo %NEWTAG%)> "%ROOT%\install-version.txt"
 
-rmdir /s /q "%PKG%" 2>NUL
-if "%AUTO_LAUNCH%"=="1" start "" "%ROOT%\VideoGrabber.exe"
 endlocal
 exit /b 0
 
 :fail
-rem Roll back only what THIS run changed, in reverse order, and only
-rem from .old copies this run actually made — never from stale leftovers.
+rem Roll back only what THIS run changed, in reverse order.
 if "%DID_INT%"=="1" (
-    if exist "%ROOT%\VideoGrabber_internal.old" (
-        if exist "%ROOT%\VideoGrabber_internal" rmdir /s /q "%ROOT%\VideoGrabber_internal"
-        rename "%ROOT%\VideoGrabber_internal.old" "VideoGrabber_internal"
+    if exist "%ROOT%\VideoGrabberApp_internal.old" (
+        if exist "%ROOT%\VideoGrabberApp_internal" rmdir /s /q "%ROOT%\VideoGrabberApp_internal"
+        rename "%ROOT%\VideoGrabberApp_internal.old" "VideoGrabberApp_internal"
+    ) else (
+        rem No .old means this run copied the folder onto an install
+        rem that had none; rolling back removes the copy, so a failed
+        rem swap never leaves half of the new host behind.
+        if exist "%ROOT%\VideoGrabberApp_internal" rmdir /s /q "%ROOT%\VideoGrabberApp_internal"
     )
 )
 if "%DID_EXE%"=="1" (
-    if exist "%ROOT%\VideoGrabber.exe.old" (
-        if exist "%ROOT%\VideoGrabber.exe" del /f /q "%ROOT%\VideoGrabber.exe" 2>NUL
-        rename "%ROOT%\VideoGrabber.exe.old" "VideoGrabber.exe"
+    if exist "%ROOT%\VideoGrabberApp.exe.old" (
+        if exist "%ROOT%\VideoGrabberApp.exe" del /f /q "%ROOT%\VideoGrabberApp.exe" 2>NUL
+        rename "%ROOT%\VideoGrabberApp.exe.old" "VideoGrabberApp.exe"
+    ) else (
+        rem Same rule for the exe: no .old, so delete the copy.
+        if exist "%ROOT%\VideoGrabberApp.exe" del /f /q "%ROOT%\VideoGrabberApp.exe" 2>NUL
     )
 )
 if "%DID_APP%"=="1" (
@@ -133,7 +169,6 @@ if "%DID_APP%"=="1" (
         rename "%ROOT%\app.old" "app"
     )
 )
-echo updater.bat: swap failed — rolled back to the previous version. Staged files left in "%PKG%".
-if "%AUTO_LAUNCH%"=="1" start "" "%ROOT%\VideoGrabber.exe"
+echo updater.bat: swap failed - rolled back to the previous version. The staged pkg is untouched at "%PKG%".
 endlocal
 exit /b 1
