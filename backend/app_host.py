@@ -75,6 +75,29 @@ def _fatal(msg: str) -> None:
             pass
 
 
+_stderr_file = None
+
+
+def _ensure_std_streams() -> None:
+    """console=False builds start with sys.stdout / sys.stderr = None.
+    Anything that writes to them (print, werkzeug, yt-dlp, click) can
+    then die with AttributeError, and every traceback vanishes. Give
+    them real sinks (stdout -> devnull, stderr -> launcher.log) and
+    switch on faulthandler so a native crash (Qt / DLL abort) leaves a
+    trace instead of a silent exit."""
+    global _stderr_file
+    try:
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        if sys.stderr is None:
+            _stderr_file = open(LOG, "a", encoding="utf-8", buffering=1)
+            sys.stderr = _stderr_file
+        import faulthandler
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+    except Exception:
+        pass
+
+
 # ---- 2. single-instance lock ------------------------------------------------
 def acquire_instance_lock() -> bool:
     """True if we are the only instance. Windows named mutex."""
@@ -269,6 +292,11 @@ def main() -> int:
     except Exception:
         pass
 
+    _ensure_std_streams()
+    _log("host start argv=%r supervised=%s smoke=%s entry=%s" % (
+        sys.argv[1:], os.environ.get("VG_SUPERVISED"),
+        os.environ.get("VG_SMOKE_TEST"), os.environ.get("VG_ENTRY_SCRIPT")))
+
     # 2. Under the supervisor, the supervisor holds the mutex (§1).
     # Smoke-test and updater-entry modes never take it either: they are
     # probes/guests, and blocking them on the app's mutex would make a
@@ -295,12 +323,17 @@ def main() -> int:
             # (paths were just set up) proves the environment is whole.
             # Quiet by design: no _fatal MessageBox - the caller reads
             # the exit code and stderr.
-            try:
-                import PySide6.QtWidgets  # noqa: F401
-                import flask              # noqa: F401
-                import yt_dlp             # noqa: F401
-            except BaseException as e:
-                print(f"SMOKE_FAIL: {e}")
+            failures = []
+            for modname in ("PySide6.QtWidgets", "requests", "flask",
+                            "yt_dlp", "yt_dlp.extractor", "server"):
+                try:
+                    __import__(modname)
+                except BaseException:
+                    failures.append(modname)
+                    _log(f"SMOKE import {modname} FAILED:\n"
+                         + traceback.format_exc()[-1500:])
+            if failures:
+                print("SMOKE_FAIL: " + ", ".join(failures))
                 return 1
             print("SMOKE_OK")
             return 0
@@ -328,6 +361,7 @@ def main() -> int:
         return 0
     except SystemExit as e:
         code = e.code
+        _log(f"SystemExit code={code!r}")
         return code if isinstance(code, int) else 0
     except BaseException:
         _fatal("Video Grabber crashed on startup:\n" + traceback.format_exc()[-1200:])

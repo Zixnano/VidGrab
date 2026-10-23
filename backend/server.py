@@ -107,9 +107,17 @@ def main():
     settings.HOME.mkdir(parents=True, exist_ok=True)
     load_settings()
     _ytdlp_version_check()
-    if _port_in_use(APP_PORT):
-        log(f"Port {APP_PORT} is already in use — another Video Grabber "
-            f"instance may be running. Exiting.")
+    # A just-killed previous host can hold the port for a moment; wait
+    # briefly before concluding that another instance really owns it.
+    for _ in range(20):
+        if not _port_in_use(APP_PORT):
+            break
+        time.sleep(0.5)
+    else:
+        msg = (f"Port {APP_PORT} is still in use after 10 s - another Video "
+               f"Grabber instance (or a ghost VideoGrabberApp.exe) holds it. Exiting.")
+        log(msg)
+        print(msg, file=sys.stderr)
         sys.exit(1)
     load_jobs_snapshot()
     _cleanup_stale_parts()
@@ -126,7 +134,10 @@ def main():
         launch_gui(new_job_hook=register_new_job_hook, home_dir=settings.HOME,
                    show_dialog_hook=register_show_dialog_hook)
     except ImportError as e:
-        log(f"PySide6 failed to import ({e}). This build is broken.")
+        import traceback
+        tb = traceback.format_exc()
+        log(f"GUI import failed ({e}). Full traceback:\n{tb}")
+        print(tb, file=sys.stderr)
         sys.exit(1)
     save_jobs_snapshot()
 

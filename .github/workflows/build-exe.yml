@@ -207,6 +207,21 @@ jobs:
           New-Item -ItemType Directory -Force $scratch | Out-Null
           "LOCALAPPDATA=$scratch" | Out-File $env:GITHUB_ENV -Append
 
+      - name: "(0) host imports everything from runtime"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:VG_SMOKE_TEST = '1'
+          $p = Start-Process (Join-Path $env:VG_ROOT 'VideoGrabberApp.exe') -WorkingDirectory $env:VG_ROOT -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force; throw "host smoke test hung" }
+          if ($p.ExitCode -ne 0) {
+            $log = Join-Path $env:VG_ROOT 'launcher.log'
+            if (Test-Path $log) { Get-Content $log -Tail 80 }
+            throw "host smoke test failed, exit $($p.ExitCode)"
+          }
+          Write-Host "Host smoke test: OK"
+
       - name: "(a) crash x3 -> Recovery"
         shell: pwsh
         run: |

@@ -74,6 +74,10 @@ def _all_stdlib_hiddenimports():
     # Fence 3b: the excluded heavyweights, by name, unconditionally.
     heavy = ("numpy", "PIL", "PySide6", "yt_dlp", "streamlink")
     names = {n for n in names if n.split(".")[0] not in heavy}
+    # Fence 3c: modules that only drag Tcl/Tk or demo code into the host.
+    unwanted = {"turtle", "_tkinter", "tkinter", "idlelib", "turtledemo",
+                "ensurepip", "this", "antigravity", "__phello__"}
+    names = {n for n in names if n.split(".")[0] not in unwanted}
     return sorted(names)
 
 
