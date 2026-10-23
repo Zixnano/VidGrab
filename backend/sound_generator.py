@@ -14,8 +14,10 @@ Run it with:
 
 Settings > Sounds opens SoundOptionsDialog (open_sound_options below): three
 sounds from three different style families out of a library of 100 style
-profiles, a length choice (1 / 3 / 5 / 10 s), Play, and Save as Default. That
-engine needs numpy; the older SoundGeneratorWindow below does not.
+profiles, a length choice (1 / 3 / 5 / 10 s), Play, a name box, Save to
+Library and Save as Default. Both save buttons write <home>/sounds/<name>.wav;
+Save as Default also makes it the completion sound. That engine needs numpy;
+the older SoundGeneratorWindow below does not.
 """
 
 import importlib
@@ -1432,18 +1434,41 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_") or "sound"
 
 
+_RESERVED_NAMES = {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} \
+    | {f"lpt{i}" for i in range(1, 10)}
+
+
+def _safe_stem(text: str) -> str:
+    """File-name stem for a sound name: letters, digits, space, - and _ only,
+    spaces become underscores, no Windows reserved names. Never empty."""
+    stem = re.sub(r"[^\w\- ]+", " ", text or "")
+    stem = re.sub(r"\s+", "_", stem.strip()).strip("._-")[:60]
+    if not stem:
+        stem = "sound"
+    if stem.lower() in _RESERVED_NAMES:
+        stem += "_sound"
+    return stem
+
+
 class SoundOptionsDialog(QDialog):
     """Generate 3 procedural completion sounds from 3 different style
     categories, audition them, and save one as the default.
 
-    on_saved(path, style_name) is called after a sound is saved so the host
-    (Settings > Sounds) can point the completion sound at the file."""
+    Each option has a name box. Save to Library writes <sounds>/<name>.wav;
+    Save as Default writes the same file and also makes it the completion sound.
 
-    def __init__(self, parent=None, on_saved=None, sounds_dir: str | Path | None = None) -> None:
+    on_saved(path, name) is called after Save as Default so the host
+    (Settings > Sounds) can point the completion sound at the file.
+    on_library_changed() is called after any save, so the host can refresh its
+    sound list without a restart."""
+
+    def __init__(self, parent=None, on_saved=None, sounds_dir: str | Path | None = None,
+                 on_library_changed=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Generate Sounds")
         self.setMinimumWidth(560)
         self._on_saved = on_saved
+        self._on_library_changed = on_library_changed
         self._sounds_dir = Path(sounds_dir) if sounds_dir else None
         self._picks: list = []
         self._bufs: list = [None] * 3
@@ -1455,8 +1480,8 @@ class SoundOptionsDialog(QDialog):
 
         root = QVBoxLayout(self)
         hint = QLabel("Three sounds from three different style families, built from "
-                      "scratch. Play them, then save the one you like as your "
-                      "completion sound.")
+                      "scratch. Play them, name the ones you like and save them to "
+                      "your library, or save one as your completion sound.")
         hint.setObjectName("CardHint")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -1493,21 +1518,34 @@ class SoundOptionsDialog(QDialog):
             play.clicked.connect(lambda _=False, k=i: self._play(k))
             stop = QPushButton("\u23f9 Stop")
             stop.clicked.connect(lambda _=False: stop_playback())
-            save = QPushButton("Save as Default")
-            save.clicked.connect(lambda _=False, k=i: self._save(k))
-            for b in (play, stop, save):
-                b.setEnabled(False)
             row.addWidget(play)
             row.addWidget(stop)
             row.addStretch(1)
-            row.addWidget(save)
+            save_row = QHBoxLayout()
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("Sound name")
+            name_edit.setMaxLength(60)
+            name_edit.setClearButtonEnabled(True)
+            name_edit.returnPressed.connect(lambda k=i: self._save_to_library(k))
+            lib = QPushButton("Save to Library")
+            lib.setToolTip("Keep this sound in your sounds folder under the name above.")
+            lib.clicked.connect(lambda _=False, k=i: self._save_to_library(k))
+            save = QPushButton("Save as Default")
+            save.setToolTip("Save to the library and use it as the completion sound.")
+            save.clicked.connect(lambda _=False, k=i: self._save(k))
+            for b in (play, stop, lib, save, name_edit):
+                b.setEnabled(False)
+            save_row.addWidget(name_edit, 1)
+            save_row.addWidget(lib)
+            save_row.addWidget(save)
             fl.addWidget(title)
             fl.addWidget(cat)
             fl.addWidget(wave_w)
             fl.addLayout(row)
+            fl.addLayout(save_row)
             root.addWidget(frame)
-            self._cards.append(dict(title=title, cat=cat, wave=wave_w,
-                                    play=play, stop=stop, save=save))
+            self._cards.append(dict(title=title, cat=cat, wave=wave_w, name=name_edit,
+                                    play=play, stop=stop, lib=lib, save=save))
 
         self.status = QLabel("")
         self.status.setObjectName("CardHint")
@@ -1524,6 +1562,9 @@ class SoundOptionsDialog(QDialog):
         self.install_btn.setVisible(False)
         bottom.insertWidget(1, self.install_btn)
         self._installer = None
+        # Enter in a name box saves; it must not also press Generate or Close.
+        for btn in self.findChildren(QPushButton):
+            btn.setAutoDefault(False)
         if not numpy_ok():
             self._show_numpy_missing()
         else:
@@ -1601,7 +1642,7 @@ class SoundOptionsDialog(QDialog):
     def _set_busy(self, busy: bool) -> None:
         self.gen_btn.setEnabled(not busy and numpy_ok())
         for c in self._cards:
-            for k in ("play", "stop", "save"):
+            for k in ("play", "stop", "lib", "save", "name"):
                 c[k].setEnabled(False if busy else c[k].isEnabled())
 
     def _on_failed(self, msg: str) -> None:
@@ -1622,6 +1663,7 @@ class SoundOptionsDialog(QDialog):
             style = self._picks[i][0]
             self._bufs[i], self._names[i] = buf, name
             c["title"].setText(name)
+            c["name"].setText(name)               # default library name; edit freely
             c["cat"].setText(style["cat"])
             c["wave"].set_samples(buf)
             try:
@@ -1630,7 +1672,7 @@ class SoundOptionsDialog(QDialog):
                 self._paths[i] = None
                 _vg_log(f"sound generator: couldn't write preview {i}: {exc}")
             ok = self._paths[i] is not None
-            for k in ("play", "stop", "save"):
+            for k in ("play", "stop", "lib", "save", "name"):
                 c[k].setEnabled(ok)
         self.gen_btn.setEnabled(True)
         self.status.setText(f"{self._length()} s sounds ready. Press Play to hear each one.")
@@ -1667,26 +1709,57 @@ class SoundOptionsDialog(QDialog):
         except Exception:
             return SOUNDS_DIR
 
-    def _save(self, i: int) -> None:
+    def _write_to_library(self, i: int):
+        """Copy option i's temp wav to <sounds>/<name>.wav. Returns (dest, name)
+        or None when nothing was written (no sound yet, a declined overwrite or
+        a write error). Asks before replacing an existing sound."""
         src = self._paths[i]
         if src is None or not Path(src).exists():
-            return
+            return None
+        name = self._cards[i]["name"].text().strip() or self._names[i]
+        dest = self._target_dir() / f"{_safe_stem(name)}.wav"
+        if dest.exists() and QMessageBox.question(
+                self, "Replace sound",
+                f"{dest.name} is already in your library. Replace it?") != QMessageBox.Yes:
+            return None
         stop_playback()                         # a playing file can be locked on Windows
-        dest = self._target_dir() / f"generated_{_slug(self._names[i])}_{self._length()}s.wav"
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(Path(src).read_bytes())
         except OSError as exc:
             _vg_log(f"sound generator: save failed: {exc}")
             QMessageBox.warning(self, "Save failed", f"Could not save the sound:\n{exc}")
+            return None
+        self._cards[i]["name"].setText(name)
+        if self._on_library_changed is not None:
+            try:
+                self._on_library_changed()
+            except Exception as exc:
+                _vg_log(f"sound generator: on_library_changed callback failed: {exc}")
+        return dest, name
+
+    def _save_to_library(self, i: int) -> None:
+        res = self._write_to_library(i)
+        if res is None:
             return
+        dest, name = res
+        _vg_log(f"sound generator: saved {self._names[i]} to the library as {dest}")
+        self.status.setText(f"Saved \u201c{name}\u201d to your library ({dest.name}).")
+
+    def _save(self, i: int) -> None:
+        """Save as Default: write to the library, then make it the completion sound."""
+        res = self._write_to_library(i)
+        if res is None:
+            return
+        dest, name = res
         _vg_log(f"sound generator: saved {self._names[i]} as the completion sound -> {dest}")
         if self._on_saved is not None:
             try:
-                self._on_saved(str(dest), self._names[i])
+                self._on_saved(str(dest), name)
             except Exception as exc:
                 _vg_log(f"sound generator: on_saved callback failed: {exc}")
-        self.status.setText(f"Saved \u201c{self._names[i]}\u201d as your completion sound ({dest.name}).")
+        self.status.setText(f"Saved \u201c{name}\u201d to your library and set it as your "
+                            f"completion sound ({dest.name}).")
 
     # ---- lifecycle ------------------------------------------------------------------
     def done(self, r: int) -> None:
@@ -1705,9 +1778,11 @@ class SoundOptionsDialog(QDialog):
         super().done(r)
 
 
-def open_sound_options(parent=None, on_saved=None, sounds_dir: str | Path | None = None) -> int:
+def open_sound_options(parent=None, on_saved=None, sounds_dir: str | Path | None = None,
+                       on_library_changed=None) -> int:
     """Open the Generate Sounds dialog (modal). Called from Settings > Sounds."""
-    dlg = SoundOptionsDialog(parent, on_saved=on_saved, sounds_dir=sounds_dir)
+    dlg = SoundOptionsDialog(parent, on_saved=on_saved, sounds_dir=sounds_dir,
+                             on_library_changed=on_library_changed)
     return dlg.exec()
 
 

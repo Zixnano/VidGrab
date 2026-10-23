@@ -556,6 +556,7 @@ class ThemePage(QWidget):
             frow.addWidget(b)
         frow.addStretch(1)
         lf.addLayout(frow)
+        self.folder_card, self.folder_layout = cf, lf   # SettingsDialog docks the Theme Engine button here
         cl.addWidget(cf)
 
         c2, l2 = _card("Accent color", "Used for buttons, progress bars and highlights.")

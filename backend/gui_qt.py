@@ -2399,7 +2399,9 @@ class SettingsDialog(QDialog):
         self.theme_engine_btn.setToolTip("Build a theme from an image or by picking colors. "
                                          "Changes preview live; saving writes a theme file.")
         self.theme_engine_btn.clicked.connect(self._open_theme_engine)
-        self.theme_page.controls.layout().addWidget(self.theme_engine_btn)
+        # Dock it directly under the Theme folder tiles and their Apply / Refresh row.
+        (getattr(self.theme_page, "folder_layout", None)
+         or self.theme_page.controls.layout()).addWidget(self.theme_engine_btn)
 
         # ---- Downloads ----
         d = QWidget()
@@ -2501,6 +2503,11 @@ class SettingsDialog(QDialog):
         self.sound_path = QLineEdit(s.get("completion_sound_path", ""))
         self.sound_path.setReadOnly(True)
         self.sound_path.setPlaceholderText("(no custom file chosen: .wav or .mp3)")
+        # Library sounds (<home>/sounds/*.wav) follow the "Custom file..." entry.
+        self._refresh_sound_library(
+            select_path=self.sound_path.text().strip()
+            if s.get("completion_sound") == _sounds.CUSTOM else None)
+        self.sound_preset.currentIndexChanged.connect(self._on_sound_preset_changed)
         _brow = QHBoxLayout()
         _brow.addWidget(self.sound_path, 1)
         _pick = QPushButton("Choose custom file\u2026")
@@ -2845,15 +2852,65 @@ class SettingsDialog(QDialog):
             self.sound_path.setText(path)
             self.sound_preset.setCurrentIndex(self.sound_preset.findData("custom"))
 
+    # --- sound library (v5.6) ---------------------------------------------
+    def _sound_library_dir(self):
+        """Where Save to Library / Save as Default put sounds: <home>/sounds."""
+        try:
+            import sounds as _sounds
+            return Path(_sounds._home()) / "sounds"
+        except Exception:
+            return Path(HOME) / "sounds"
+
+    def _refresh_sound_library(self, select_path=None):
+        """Rebuild the "Library: ..." entries of the Completion sound dropdown
+        from <home>/sounds/*.wav. Keeps the current choice, or selects
+        `select_path` when it is a library file. Safe to call at any time, so a
+        sound saved from the generator shows up without restarting."""
+        import sounds as _sounds
+        combo = self.sound_preset
+        cur = select_path or combo.currentData(Qt.UserRole + 1) or ""
+        on_lib = bool(combo.currentData(Qt.UserRole + 1))
+        custom_idx = combo.findData(_sounds.CUSTOM)
+        combo.blockSignals(True)
+        try:
+            for k in range(combo.count() - 1, custom_idx, -1):
+                combo.removeItem(k)
+            try:
+                files = sorted(self._sound_library_dir().glob("*.wav"),
+                               key=lambda p: p.name.lower())
+            except OSError:
+                files = []
+            target = -1
+            for p in files:
+                combo.addItem(f"Library: {p.stem}", userData=_sounds.CUSTOM)
+                combo.setItemData(combo.count() - 1, str(p), Qt.UserRole + 1)
+                combo.setItemData(combo.count() - 1, p.name, Qt.ToolTipRole)
+                if cur and Path(cur) == p:
+                    target = combo.count() - 1
+            if target >= 0:
+                combo.setCurrentIndex(target)
+            elif on_lib:                       # the selected library file is gone
+                combo.setCurrentIndex(custom_idx)
+        finally:
+            combo.blockSignals(False)
+
+    def _on_sound_preset_changed(self, _index=None):
+        """Picking a library sound points the custom path at that file; the
+        combo's data stays "custom", which is what Save already stores."""
+        path = self.sound_preset.currentData(Qt.UserRole + 1)
+        if path:
+            self.sound_path.setText(path)
+
     def _open_sound_generator(self):
-        open_sound_options(self, on_saved=self._on_generated_sound)
+        open_sound_options(self, on_saved=self._on_generated_sound,
+                           on_library_changed=self._refresh_sound_library)
 
     def _on_generated_sound(self, path, name):
         """Save as Default in the generator: point the completion sound at the
-        new file right away, so the choice holds even if Settings is closed
-        without pressing Save, and keep the widgets in step with it."""
+        new library file right away, so the choice holds even if Settings is
+        closed without pressing Save, and keep the widgets in step with it."""
         self.sound_path.setText(path)
-        self.sound_preset.setCurrentIndex(self.sound_preset.findData("custom"))
+        self._refresh_sound_library(select_path=path)   # selects "Library: <name>"
         turned_on = not self.play_sound_on_complete.isChecked()
         if turned_on:
             self.play_sound_on_complete.setChecked(True)   # a default you never hear is no default
@@ -3055,6 +3112,7 @@ class SettingsDialog(QDialog):
         from gui_theme_engine import ThemeEngineDialog
         dlg = ThemeEngineDialog(load_settings(), self)
         dlg.themeChanged.connect(self._theme_engine_live)
+        dlg.themeSaved.connect(lambda _path: self.theme_page._scan_themes())   # new theme shows at once
         try:
             dlg.exec()
         finally:
