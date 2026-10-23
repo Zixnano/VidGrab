@@ -8,14 +8,17 @@ a = Analysis(
     binaries=[],
     datas=[],
     hiddenimports=[
-        'http.cookies',
-        'logging.handlers',
-        'http.client',
-        'email.mime',
-        'urllib.request',
-        'email.utils',
-        'requests',
-        'flask'
+        # Standard library modules missed by PyInstaller
+        'http.cookies', 'logging.handlers', 'http.client', 
+        'email.mime', 'urllib.request', 'email.utils',
+        'optparse', 'getopt', 'shlex', 'base64', 
+        'binascii', 'calendar', 'copy', 'csv',
+        'hashlib', 'hmac', 'html', 'http', 'json',
+        'mimetypes', 'netrc', 'os', 're', 'socket',
+        'ssl', 'struct', 'sys', 'time', 'urllib',
+        'uuid', 'xml', 'zipfile', 'zlib',
+        # Third-party modules we are now bundling
+        'requests', 'flask'
     ],
     hookspath=[],
     runtime_hooks=[],
