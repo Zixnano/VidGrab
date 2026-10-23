@@ -81,10 +81,31 @@ def _all_stdlib_hiddenimports():
     return sorted(names)
 
 
+def _runtime_dlls():
+    """DLLs the thin host must carry so PySide6 / shiboken6 can load from
+    runtime\\site-packages. PySide6 wheels are abi3 builds that link
+    python3.dll (the stable-ABI forwarder), which PyInstaller does not
+    bundle on its own (it only ships python3XX.dll), and Qt needs the
+    MSVC C++ runtime. PyInstaller never saw these dependencies because
+    PySide6 is excluded from the analysis. Existing files only."""
+    found = []
+    p = os.path.join(sys.base_prefix, "python3.dll")
+    if os.path.isfile(p):
+        found.append((p, "."))
+    sysdir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    for n in ("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+              "vcruntime140_1.dll", "concrt140.dll"):
+        p = os.path.join(sysdir, n)
+        if os.path.isfile(p):
+            found.append((p, "."))
+    print("AppHost.spec: extra runtime DLLs:", [os.path.basename(x[0]) for x in found])
+    return found
+
+
 a = Analysis(
     ['app_host.py'],
     pathex=[],
-    binaries=[],
+    binaries=_runtime_dlls(),
     datas=[],
     hiddenimports=_all_stdlib_hiddenimports() + [
         # Third-party modules we are now bundling

@@ -77,6 +77,13 @@ jobs:
           }
           Write-Host "Supervisor and host are thin: OK"
 
+      - name: Assert host carries python3.dll
+        shell: pwsh
+        run: |
+          $int = 'dist-host/VideoGrabberApp/VideoGrabberApp_internal'
+          if (-not (Test-Path "$int/python3.dll")) { throw "python3.dll missing from $int; PySide6/shiboken6 cannot load from runtime" }
+          Write-Host "python3.dll present: OK"
+
       - name: Install runtime dependencies
         run: pip install --upgrade -r requirements.txt --target "staging\video 3 grabber\runtime\site-packages"
 
@@ -217,7 +224,20 @@ jobs:
           if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force; throw "host smoke test hung" }
           if ($p.ExitCode -ne 0) {
             $log = Join-Path $env:VG_ROOT 'launcher.log'
-            if (Test-Path $log) { Get-Content $log -Tail 80 }
+            if (Test-Path $log) { Get-Content $log -Tail 120 }
+            $sp = Join-Path $env:VG_ROOT 'runtime/site-packages'
+            $dirs = @((Join-Path $env:VG_ROOT 'VideoGrabberApp_internal'), (Join-Path $sp 'shiboken6'), (Join-Path $sp 'PySide6'), (Join-Path $env:VG_ROOT 'runtime'), "$env:SystemRoot\System32")
+            foreach ($f in @('shiboken6/shiboken6.abi3.dll', 'shiboken6/Shiboken.pyd')) {
+              $path = Join-Path $sp $f
+              if (-not (Test-Path $path)) { continue }
+              $txt = [System.Text.Encoding]::Latin1.GetString([System.IO.File]::ReadAllBytes($path))
+              $names = [regex]::Matches($txt, '(?i)[a-z0-9_\-\.]+\.dll') | ForEach-Object { $_.Value.ToLower() } | Sort-Object -Unique
+              foreach ($n in $names) {
+                if ($n -like 'api-ms-*' -or $n -like 'ext-ms-*') { continue }
+                $hit = $dirs | Where-Object { Test-Path (Join-Path $_ $n) } | Select-Object -First 1
+                if (-not $hit) { Write-Host "DLL candidate not found for ${f}: $n" }
+              }
+            }
             throw "host smoke test failed, exit $($p.ExitCode)"
           }
           Write-Host "Host smoke test: OK"

@@ -212,7 +212,8 @@ def setup_paths() -> None:
             sys.path.remove(p)
         sys.path.insert(0, p)
 
-    dll_dirs = [RUNTIME, SITE, SITE / "PySide6", SITE / "shiboken6",
+    dll_dirs = [Path(getattr(sys, "_MEIPASS", ROOT)), RUNTIME, SITE,
+                SITE / "PySide6", SITE / "shiboken6",
                 SITE / "numpy.libs", SITE / "numpy" / ".libs",
                 SITE / "pillow.libs", SITE / "PIL"]
     existing = [d for d in dll_dirs if d.is_dir()]
