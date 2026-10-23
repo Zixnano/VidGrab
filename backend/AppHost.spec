@@ -9,13 +9,25 @@
 # died one module at a time (http.cookies, logging.handlers,
 # optparse, xml.etree, fileinput, ...) as each was hand-added to a
 # list. A curated list can only ever contain the modules that have
-# already crashed. So the spec now enumerates the ENTIRE standard
-# library of the build Python from disk: every module that exists
-# is named, and the whack-a-mole class of bug is gone by
-# construction. Test suites and the Tk GUI toolkit are skipped (the
-# app never uses them and they bloat or destabilise the build).
-# Unresolvable names are warnings to PyInstaller, never errors, so
-# an over-inclusive list is safe.
+# already crashed, so this spec enumerates the standard library of
+# the build Python from disk instead.
+#
+# The enumeration is fenced to the TRUE standard library, three
+# ways, because the first version of this generator also walked a
+# root that contained the build machine's site-packages, named
+# third-party submodules as hidden imports, dragged numpy into the
+# host (its PyInstaller hook bundles numpy.libs), and tripped the
+# pipeline's "host stays thin" check:
+#   1. only the sysconfig "stdlib" root is walked (plus DLLs\ for
+#      the C accelerators); "platstdlib" is NOT trusted, it can
+#      point at the whole installation;
+#   2. any "site-packages" directory met during the walk is pruned;
+#   3. every surviving name must have its top-level component in
+#      sys.stdlib_module_names, and the heavy excluded packages are
+#      filtered out by name as a final belt-and-braces pass.
+# Test suites and the Tk GUI toolkit are skipped (the app never
+# uses them and they bloat or destabilise the build). Unresolvable
+# names are warnings to PyInstaller, never errors.
 import os
 import sys
 import sysconfig
@@ -23,15 +35,14 @@ import sysconfig
 
 def _all_stdlib_hiddenimports():
     skip_dirs = {"__pycache__", "test", "tests", "idlelib",
-                 "turtledemo", "tkinter", "turtle"}
+                 "turtledemo", "tkinter", "turtle", "site-packages"}
     roots = set()
-    for key in ("stdlib", "platstdlib"):
-        try:
-            p = sysconfig.get_path(key)
-            if p:
-                roots.add(p)
-        except Exception:
-            pass
+    try:
+        p = sysconfig.get_path("stdlib")
+        if p:
+            roots.add(p)
+    except Exception:
+        pass
     # Windows builds keep the C accelerator modules in DLLs\
     roots.add(os.path.join(sys.base_prefix, "DLLs"))
     names = set()
@@ -55,6 +66,14 @@ def _all_stdlib_hiddenimports():
                         names.add(pkg)
                 else:
                     names.add(pkg + "." + stem if pkg else stem)
+    # Fence 3a: nothing whose top level is not a genuine stdlib
+    # module of THIS Python may survive, wherever the walk went.
+    stdlib_tops = getattr(sys, "stdlib_module_names", None)
+    if stdlib_tops is not None:
+        names = {n for n in names if n.split(".")[0] in stdlib_tops}
+    # Fence 3b: the excluded heavyweights, by name, unconditionally.
+    heavy = ("numpy", "PIL", "PySide6", "yt_dlp", "streamlink")
+    names = {n for n in names if n.split(".")[0] not in heavy}
     return sorted(names)
 
 
