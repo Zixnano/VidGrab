@@ -7,10 +7,19 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['http.cookies'],
+    hiddenimports=[
+        'http.cookies',
+        'logging.handlers',
+        'http.client',
+        'email.mime',
+        'urllib.request',
+        'email.utils',
+        'requests',
+        'flask'
+    ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=['numpy', 'PIL', 'PySide6', 'flask', 'yt_dlp', 'streamlink'],
+    excludes=['numpy', 'PIL', 'PySide6', 'yt_dlp', 'streamlink'],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

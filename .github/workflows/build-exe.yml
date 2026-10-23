@@ -169,7 +169,7 @@ jobs:
           }
           $lines | Set-Content -Path "SHA256SUMS-v${env:GITHUB_RUN_NUMBER}.txt" -Encoding ascii
 
-      - name: Create or update release (prerelease)
+      - name: Create or update release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.run_number }}
@@ -183,7 +183,8 @@ jobs:
             backend/VideoGrabber-runtime-v${{ github.run_number }}.zip
             backend/SHA256SUMS-v${{ github.run_number }}.txt
           draft: false
-          prerelease: true
+          prerelease: false
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
