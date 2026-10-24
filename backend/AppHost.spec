@@ -102,6 +102,20 @@ def _runtime_dlls():
     return found
 
 
+# Icon for the exe (Explorer, taskbar, shortcuts). Put the .ico next to this
+# spec as icon.ico, or point ICON_PATH at it. If none is found the build
+# still succeeds with PyInstaller's default icon and prints a warning.
+ICON_PATH = 'icon.ico'   # change to e.g. 'path/to/icon.ico'
+_spec_dir = globals().get('SPECPATH', os.getcwd())
+_icon_candidates = [ICON_PATH, os.path.join(_spec_dir, ICON_PATH),
+                    os.path.join(_spec_dir, 'icons', 'icon.ico'),
+                    os.path.join(_spec_dir, 'assets', 'icon.ico')]
+ICON = next((os.path.abspath(p) for p in _icon_candidates if os.path.isfile(p)), None)
+if ICON is None:
+    print("WARNING: %s: no .ico found (tried %s); building with the default icon"
+          % ('AppHost.spec', _icon_candidates))
+
+
 a = Analysis(
     ['app_host.py'],
     pathex=[],
@@ -121,6 +135,7 @@ exe = EXE(
     pyz, a.scripts, [],
     exclude_binaries=True,
     name='VideoGrabberApp',
+    icon=ICON,
     debug=False, bootloader_ignore_signals=False, strip=False,
     upx=False, console=False,
     contents_directory='VideoGrabberApp_internal',

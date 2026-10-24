@@ -9,6 +9,7 @@ import os
 import re
 import requests
 import secrets
+import shutil
 import sys
 import threading
 import time
@@ -286,23 +287,90 @@ def portable_home():
 
 
 
+def _read_settings_json(path):
+    """Parse a settings file; must be a JSON object. Raises on anything else."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("settings file is not a JSON object")
+    return data
+
+
 def load_settings():
+    restored_from_bak = False
     if CONFIG_PATH.exists():
         try:
-            STATE.update(json.loads(CONFIG_PATH.read_text()))
+            STATE.update(_read_settings_json(CONFIG_PATH))
         except Exception as e:
-            log(f"couldn't read settings.json ({e}); using defaults")
+            log(f"couldn't read settings.json ({e}); quarantining it")
+            # Keep the unreadable file for inspection instead of letting the
+            # next save_settings() overwrite it with defaults.
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            corrupt = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.corrupt-{stamp}")
+            n = 1
+            while corrupt.exists():   # never overwrite an earlier quarantined file
+                n += 1
+                corrupt = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.corrupt-{stamp}-{n}")
+            try:
+                os.replace(CONFIG_PATH, corrupt)
+                log(f"corrupt settings saved as {corrupt.name}")
+            except OSError as e2:
+                log(f"couldn't rename corrupt settings.json: {e2}")
+            bak = CONFIG_PATH.with_name(CONFIG_PATH.name + ".bak")
+            if bak.exists():
+                try:
+                    STATE.update(_read_settings_json(bak))
+                    restored_from_bak = True
+                    log(f"settings restored from {bak.name}")
+                except Exception as e3:
+                    log(f"couldn't read {bak.name} either ({e3}); using defaults")
+            else:
+                log("no settings.json.bak to restore; using defaults")
     _migrate_settings(STATE)
     if not STATE.get("api_token"):
         STATE["api_token"] = secrets.token_hex(16)
         save_settings()
+    elif restored_from_bak:
+        save_settings()   # write the recovered settings back as settings.json
+
+
+# One writer at a time: the GUI thread and Flask request threads both call
+# save_settings(), and they used to share a single fixed .tmp file.
+_SETTINGS_SAVE_LOCK = threading.Lock()
 
 
 def save_settings():
-    HOME.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(STATE, indent=2))
-    os.replace(tmp, CONFIG_PATH)
+    with _SETTINGS_SAVE_LOCK:
+        HOME.mkdir(parents=True, exist_ok=True)
+        # STATE can be mutated by another thread mid-dump ("dictionary changed
+        # size during iteration"); a retry or two always gets a clean pass.
+        payload = None
+        for attempt in range(5):
+            try:
+                payload = json.dumps(STATE, indent=2)
+                break
+            except RuntimeError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.01)
+        tmp = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.tmp-{os.getpid()}")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            # Last-known-good copy for load_settings() to fall back on.
+            if CONFIG_PATH.exists():
+                try:
+                    shutil.copyfile(CONFIG_PATH, CONFIG_PATH.with_name(CONFIG_PATH.name + ".bak"))
+                except OSError as e:
+                    log(f"couldn't refresh settings.json.bak: {e}")
+            os.replace(tmp, CONFIG_PATH)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
 
 

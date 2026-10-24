@@ -1062,6 +1062,16 @@ def _handle_ytdlp_failure(job_id, job, exc):
     """Classify a yt-dlp failure and either auto-retry, hold YouTube, or fail."""
     raw = str(exc)
     kind = classify_ytdlp_error(raw)
+    # Twitter/X sometimes answers with an HTML/empty body, which yt-dlp
+    # reports as a JSONDecodeError. It is transient, so treat it like a
+    # network blip: auto-retry with the short backoff.
+    low = raw.lower()
+    json_broken = ("jsondecodeerror" in low or "failed to parse json" in low) \
+        and kind not in ("bot_check", "fatal")
+    if json_broken:
+        kind = "network"
+    shown = ("The site returned a broken response. Try again later or use a VPN."
+             if json_broken else raw)
     job["error_kind"] = kind
     youtube = _is_youtube_url(job["url"])
 
@@ -1086,7 +1096,7 @@ def _handle_ytdlp_failure(job_id, job, exc):
             transition(job, JobEvent.RETRY)
         except ValueError:
             _try_transition(job, JobEvent.FAIL)
-            job["error"] = raw
+            job["error"] = shown
             log(f"job {job_id}: FAILED — {raw}")
             return
         job["retry_count"] = attempt + 1
@@ -1100,7 +1110,7 @@ def _handle_ytdlp_failure(job_id, job, exc):
         return
 
     _try_transition(job, JobEvent.FAIL)
-    job["error"] = raw
+    job["error"] = shown   # friendly text for the row; the log keeps the raw error
     log(f"job {job_id}: FAILED ({kind}) — {raw}")
 
 

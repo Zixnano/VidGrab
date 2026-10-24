@@ -76,30 +76,9 @@ def save_jobs_snapshot():
                 # session cookies on disk are a privacy tradeoff not taken.
                 snap[jid] = {k: v for k, v in list(j.items())
                              if k not in ("pause_evt", "stop_evt", "cookie", "error")}
-            # Cap history at MAX_HISTORY jobs — always keep non-done jobs,
-            # fill the rest with the newest done ones.
-            MAX_HISTORY = 2000
-            if len(snap) > MAX_HISTORY:
-                entries = sorted(snap.items(),
-                                 key=lambda kv: kv[1].get("created_ts", 0),
-                                 reverse=True)
-                kept = {}
-                done_count = 0
-                for jid, j in entries:
-                    if j.get("status") != "done":
-                        kept[jid] = j
-                    elif done_count < MAX_HISTORY:
-                        kept[jid] = j
-                        done_count += 1
-                snap = kept
-            # Prune in-memory done jobs too so the GUI doesn't list thousands.
-            if len(JOBS) > MAX_HISTORY + 500:
-                done = sorted(((jid, j) for jid, j in list(JOBS.items())
-                               if j.get("status") == "done"),
-                              key=lambda kv: kv[1].get("completed_ts")
-                                             or kv[1].get("created_ts", 0))
-                for jid, _ in done[:-MAX_HISTORY]:
-                    JOBS.pop(jid, None)
+            # Permanent history: no cap on the snapshot, and no pruning of
+            # JOBS either (pruning memory would drop those rows from the
+            # next snapshot too).
             tmp = settings.JOBS_PATH.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(snap, indent=2))
             os.replace(tmp, settings.JOBS_PATH)

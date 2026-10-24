@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from urllib.parse import urlparse
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response, redirect
 from flask_cors import CORS
 
 from downloader import maybe_convert_to_mp4, _repair_recording, _probe_recording, _CREATE_NO_WINDOW, _WORKERS, queue_status
@@ -48,10 +48,54 @@ TOKEN_PROTECTED_PATHS = {
     "/open-folder",
 }
 
-# Random per-launch key, embedded in the LAN web UI's action links so that
-# unauthenticated page can still drive the token-protected action endpoints
-# without exposing them to anyone else on the network.
+# Random per-launch key. It is NO LONGER embedded in any page: /remote now
+# sits behind a login (see /remote-login). The key is only honoured, via
+# ?key=, on the three job-action routes listed in _KEY_ALLOWED_PREFIXES.
 REMOTE_KEY = secrets.token_hex(8)
+
+# Routes that may be driven with ?key= or with a /remote login cookie.
+# Everything else needs the real X-API-Token header.
+_KEY_ALLOWED_PREFIXES = ("/pause/", "/resume/", "/stop/")
+
+# /remote login sessions: random session id -> expiry timestamp. Held in
+# memory only, so every app restart logs remote devices out.
+_REMOTE_COOKIE = "vg_remote"
+_REMOTE_SESSION_TTL = 12 * 3600
+_REMOTE_SESSIONS = {}
+_REMOTE_SESSION_LOCK = threading.Lock()
+
+
+def _safe_digest_eq(a, b):
+    """Constant-time string compare that never raises on non-ASCII input
+    (secrets.compare_digest raises TypeError for non-ASCII str)."""
+    try:
+        return secrets.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _new_remote_session():
+    sid = secrets.token_urlsafe(32)
+    now = time.time()
+    with _REMOTE_SESSION_LOCK:
+        for k, exp in list(_REMOTE_SESSIONS.items()):
+            if exp <= now:
+                del _REMOTE_SESSIONS[k]
+        _REMOTE_SESSIONS[sid] = now + _REMOTE_SESSION_TTL
+    return sid
+
+
+def _valid_remote_session(sid):
+    if not sid:
+        return False
+    with _REMOTE_SESSION_LOCK:
+        exp = _REMOTE_SESSIONS.get(sid)
+        if exp is None:
+            return False
+        if exp <= time.time():
+            del _REMOTE_SESSIONS[sid]
+            return False
+    return True
 
 # One-time nonces for /upload: content scripts fetch the recording straight
 # to the backend (bypassing the ~32MB chrome.runtime.sendMessage cap), but
@@ -74,10 +118,12 @@ def _consume_upload_nonce(nonce):
     if not nonce:
         return False
     with _UPLOAD_NONCE_LOCK:
-        if nonce in _UPLOAD_NONCES:
-            del _UPLOAD_NONCES[nonce]
-            return True
-    return False
+        ts = _UPLOAD_NONCES.pop(nonce, None)   # one-time: always removed
+        if ts is None:
+            return False
+        if time.time() - ts > 300:             # expired: removed above, refuse
+            return False
+        return True
 
 # Auto-pairing: one successful /pair per app session. The endpoint is
 # deliberately NOT in TOKEN_PROTECTED_PATHS — it's guarded by the
@@ -98,10 +144,19 @@ def _require_api_token():
         request.path.startswith(p + "/") for p in TOKEN_PROTECTED_PATHS
     ):
         return
-    if secrets.compare_digest(request.args.get("key", ""), REMOTE_KEY):
-        return
+    # ?key= and the /remote login cookie unlock ONLY pause / resume / stop.
+    # Every other protected route (jobs, settings, delete, ...) needs the
+    # real token header.
+    if request.path.startswith(_KEY_ALLOWED_PREFIXES):
+        key = request.args.get("key", "")
+        if key and _safe_digest_eq(key, REMOTE_KEY):
+            return
+        if request.method == "POST" and _valid_remote_session(
+                request.cookies.get(_REMOTE_COOKIE)):
+            return
     supplied = request.headers.get("X-API-Token", "")
-    if not supplied or not secrets.compare_digest(supplied, STATE.get("api_token", "")):
+    real = STATE.get("api_token", "")
+    if not supplied or not real or not _safe_digest_eq(supplied, real):
         return jsonify({"error": "missing or invalid API token"}), 401
 
 def cleanup_partial_files(job):
@@ -1156,6 +1211,13 @@ def convert(job_id):
     _ffdir = find_ffmpeg_dir()
     ffmpeg = str(Path(_ffdir) / "ffmpeg.exe") if _ffdir else "ffmpeg"
     dst = src.with_suffix("." + fmt)
+    if dst.exists():
+        # Never overwrite: an earlier conversion, or the source itself when
+        # converting mp4 -> mp4, would otherwise be clobbered by ffmpeg -y.
+        try:
+            dst = _unique_path(dst)
+        except RuntimeError as e:
+            return jsonify({"error": str(e)}), 409
     cmd = [ffmpeg, "-y", "-i", str(src)]
     if fmt in ("mp3", "wav", "m4a", "flac", "opus"):
         cmd += ["-vn"]
@@ -1299,7 +1361,11 @@ def set_queue_running():
     data = request.get_json(force=True, silent=True) or {}
     if "running" not in data:
         return jsonify({"error": "missing running"}), 400
-    STATE["queue_running"] = bool(data["running"])
+    running = data.get("running")
+    if not isinstance(running, bool):
+        # bool("false") is True: a string, number or null must not flip the queue.
+        return jsonify({"error": "running must be true or false"}), 400
+    STATE["queue_running"] = running
     save_settings()
     return jsonify({"ok": True, "queue_running": STATE["queue_running"]})
 
@@ -1315,24 +1381,76 @@ def theme():
             "radius", "font", "font_mono")
     return jsonify({k: pal[k] for k in keys if k in pal})
 
+_REMOTE_CSS = ("body{font:14px sans-serif;padding:12px}"
+               "table{border-collapse:collapse;width:100%}"
+               "td,th{border:1px solid #ccc;padding:6px;text-align:left}"
+               "form{display:inline;margin:0}button{margin-right:4px}")
+
+
+def _remote_page(body, status=200):
+    resp = make_response(
+        "<!doctype html><meta name=viewport content=\"width=device-width\">"
+        f"<title>Video Grabber</title><style>{_REMOTE_CSS}</style>{body}", status)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
+
+
+def _remote_login_page(error="", status=200):
+    msg = f"<p style='color:#b00'>{html.escape(error)}</p>" if error else ""
+    return _remote_page(
+        "<h2>Video Grabber</h2>"
+        f"{msg}"
+        "<form method='POST' action='/remote-login'>"
+        "<p>Enter the API token from the app's settings to continue.</p>"
+        "<input type='password' name='token' autocomplete='off' autofocus required "
+        "style='width:100%;max-width:360px;padding:6px'> "
+        "<button type='submit'>Log in</button></form>", status)
+
+
+@app.route("/remote-login", methods=["POST"])
+def remote_login():
+    supplied = request.form.get("token", "")
+    real = STATE.get("api_token", "")
+    if not supplied or not real or not _safe_digest_eq(supplied, real):
+        log(f"remote login rejected from {request.remote_addr}")
+        time.sleep(0.5)   # blunt brute-force speed bump
+        return _remote_login_page("Wrong token.", 401)
+    log(f"remote login accepted from {request.remote_addr}")
+    resp = redirect("/remote", code=303)
+    # HttpOnly + SameSite=Strict always. Secure only over HTTPS: the LAN UI
+    # is plain HTTP, and browsers silently drop Secure cookies on http://.
+    resp.set_cookie(_REMOTE_COOKIE, _new_remote_session(),
+                    max_age=_REMOTE_SESSION_TTL, httponly=True,
+                    samesite="Strict", secure=request.is_secure)
+    return resp
+
+
+def _remote_action_form(action, jid):
+    # Plain POST form (works without JS). The inline handler just posts in
+    # the background and reloads, so the page doesn't navigate to raw JSON.
+    return (f"<form method='POST' action='/{action}/{html.escape(str(jid), quote=True)}' "
+            "onsubmit=\"fetch(this.action,{method:'POST',credentials:'same-origin'})"
+            ".then(function(){location.reload()});return false\">"
+            f"<button type='submit'>{action}</button></form>")
+
+
 @app.route("/remote", methods=["GET"])
 def remote_ui():
+    if not _valid_remote_session(request.cookies.get(_REMOTE_COOKIE)):
+        return _remote_login_page()
     rows = "".join(
-        f"<tr><td>{html.escape(j['filename'])}</td><td>{html.escape(j['status'])}</td>"
-        f"<td><a href='/pause/{jid}?key={REMOTE_KEY}'>pause</a> "
-        f"<a href='/resume/{jid}?key={REMOTE_KEY}'>resume</a> "
-        f"<a href='/stop/{jid}?key={REMOTE_KEY}'>stop</a></td></tr>"
+        f"<tr><td>{html.escape(str(j.get('filename') or ''))}</td>"
+        f"<td>{html.escape(str(j.get('status') or ''))}</td>"
+        f"<td>{_remote_action_form('pause', jid)}"
+        f"{_remote_action_form('resume', jid)}"
+        f"{_remote_action_form('stop', jid)}</td></tr>"
         for jid, j in list(JOBS.items())
     )
-    return f"""<!doctype html><meta name=viewport content="width=device-width">
-    <title>Video Grabber</title>
-    <style>body{{font:14px sans-serif;padding:12px}}table{{border-collapse:collapse;width:100%}}
-    td,th{{border:1px solid #ccc;padding:6px;text-align:left}}</style>
-    <h2>Video Grabber</h2><table>
-    <tr><th>File</th><th>Status</th><th>Actions</th></tr>{rows}</table>
-    <p><a href="/jobs?key={REMOTE_KEY}">raw JSON</a></p>"""
+    return _remote_page(
+        "<h2>Video Grabber</h2><table>"
+        f"<tr><th>File</th><th>Status</th><th>Actions</th></tr>{rows}</table>")
 
 def run_server():
     host = "0.0.0.0" if STATE.get("lan_access") else "127.0.0.1"
     app.run(host=host, port=APP_PORT, debug=False, use_reloader=False)
-

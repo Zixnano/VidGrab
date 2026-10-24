@@ -357,6 +357,7 @@
   const SNIFF_MEDIA_HOSTS = [
     /(^|\.)v\.redd\.it$/i, /(^|\.)redgifs\.com$/i,
     /(^|\.)x\.com$/i, /(^|\.)twitter\.com$/i,
+    /(^|\.)twimg\.com$/i,   // X/Twitter serve the actual video files from video.twimg.com
     /(^|\.)tiktok\.com$/i,
   ];
   const SNIFF_FILE_REGEX = /\.(mp4|webm|m4v|mov|mkv)(\?|#|$)/i;
@@ -1445,7 +1446,18 @@
       });
     }
 
-    const refresh = () => {
+    // A blob player is only "record only" when the sniffer found nothing
+    // to download. A manifest (m3u8/mpd) counts as downloadable on its own;
+    // a plain file must be over 10 KB so tiny player-metadata blobs don't.
+    const MIN_SNIFFED_BYTES = 10 * 1024;
+    const sniffedIsDownloadable = (best) => !!(best && best.url &&
+      (/m3u8|mpd/i.test(best.url) || (best.size || 0) > MIN_SNIFFED_BYTES));
+    let refreshSeq = 0;
+    let refreshTimer = null;
+
+    const refreshFor = (attempt) => {
+      const seq = ++refreshSeq;
+      if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
       if (RECORDERS.has(video)) return; // don't clobber label mid-recording
       if (isMseOnlySite()) {
         setLabel(overlay, "Send page URL ▾", TH.info);
@@ -1456,11 +1468,26 @@
         return;
       }
       if (isBlob()) {
+        // Fallback label first (no flicker if the sniffer has nothing),
+        // then upgrade to "Download ▾" when it finds a real file.
         setLabel(overlay, "Record this video ▾", TH.error);
+        querySniffedVideos((best) => {
+          // Ignore a late answer: a newer refresh ran, the clip changed,
+          // or a recording started in the meantime.
+          if (seq !== refreshSeq || !isBlob() || RECORDERS.has(video)) return;
+          if (sniffedIsDownloadable(best)) {
+            restoreLabel(overlay);   // "Download ▾"
+          } else if (attempt < 2 && video.isConnected) {
+            // The media request can land after loadedmetadata; look again.
+            refreshTimer = setTimeout(() => refreshFor(attempt + 1),
+              attempt === 0 ? 2000 : 4000);
+          }
+        });
       } else {
         restoreLabel(overlay);
       }
     };
+    const refresh = () => refreshFor(0);
     refresh();
     video.addEventListener("loadedmetadata", refresh);
     video.addEventListener("emptied", refresh);
@@ -1469,15 +1496,9 @@
       e.stopPropagation();
       e.preventDefault();
       if (RECORDERS.has(video)) { handleRecordToggle(video, overlay); return; }
-      // On extractor sites where the player only exposes a blob (Reddit,
-      // Redgifs, TikTok, X in-feed), there is no direct file to hand over.
-      // The page URL is the download, so make the pill a one-click send
-      // instead of forcing the user into the menu. This sits BEFORE the
-      // "nothing to do" bail below so an empty currentSrc still sends.
-      if (isOneClickSite() && (isBlob() || !video.currentSrc)) {
-        handleSendPageUrl(video, overlay, null);
-        return;
-      }
+      // (The old one-click "send page URL" shortcut for Reddit / Redgifs /
+      // TikTok / X blob players is gone: the pill always opens the menu,
+      // which offers the sniffed file, yt-dlp and the format list.)
       // MSE-only sites (Twitch) have no currentSrc yet but still need the menu —
       // it offers "Send page URL to yt-dlp". Only bail when there's truly nothing.
       if (!video.currentSrc && !isBlob() && !isMseOnlySite()) return;
