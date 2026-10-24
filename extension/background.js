@@ -9,21 +9,28 @@
 const BACKEND_BASE = "http://127.0.0.1:5757";
 
 // --- CIRCUIT BREAKER: Prevent browser lockups if the desktop app is dead ---
-const originalFetch = self.fetch;
-self.fetch = function(...args) {
-    // If it's not a request to the local app, let it pass through normally.
-    if (args[0] && typeof args[0] === 'string' && !args[0].includes('127.0.0.1') && !args[0].includes('localhost')) {
-        return originalFetch.apply(this, args);
-    }
-    // If it IS a request to the app, add a strict timeout.
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2-second max wait
-    
-    const options = args[1] || {};
-    options.signal = controller.signal;
-    args[1] = options;
-    
-    return originalFetch.apply(this, args).finally(() => clearTimeout(timeoutId));
+const originalFetch = self.fetch.bind(self);
+self.fetch = function (input, init) {
+  let urlStr = "";
+  try { urlStr = typeof input === "string" ? input : ((input && input.url) || String(input)); } catch (e) {}
+  // Anything that isn't the local app passes through untouched.
+  if (!/^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/i.test(urlStr)) {
+    return originalFetch(input, init);
+  }
+  // Health/ping checks fail fast (a dead app must never stall the browser).
+  // Real requests (/download, /show-add-dialog, /probe-formats) get longer:
+  // the old flat 2 s limit aborted them while the app was still working, and
+  // the click then looked dead.
+  const quick = /\/(health|ping)(\?|$)/.test(urlStr);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), quick ? 2000 : 20000);
+  const opts = { ...(init || {}) };
+  if (init && init.signal) {
+    if (init.signal.aborted) controller.abort();
+    else init.signal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+  opts.signal = controller.signal;
+  return originalFetch(input, opts).finally(() => clearTimeout(timeoutId));
 };
 // ---------------------------------------------------------------------------
 
@@ -302,29 +309,67 @@ chrome.webRequest.onHeadersReceived.addListener(
   ["responseHeaders", "extraHeaders"]
 );
 
+// Per-tab identity of the "page" the sniffer list belongs to. A hard
+// navigation always resets the page, so onBeforeNavigate clears
+// unconditionally. A soft (SPA) navigation only clears when the page
+// identity actually changed: X/Twitter fires history events for photo
+// modals and in-app tab switches that keep the same tweet on screen,
+// and wiping the list there forces a re-sniff of a video that never
+// left. For X the identity is the tweet (status id); /photo/1 and
+// /video/1 suffixes on the same tweet are the same page.
+const tabNavIdentity = new Map();   // tabId -> identity string
+
+function navIdentity(url) {
+  try {
+    const u = new URL(url);
+    if (/(^|\.)(x|twitter)\.com$/i.test(u.hostname)) {
+      const m = /^\/[^/?#]+\/status\/(\d+)/.exec(u.pathname);
+      if (m) return "x-status:" + m[1];
+      return "x-path:" + u.pathname.toLowerCase();
+    }
+    return u.origin + u.pathname;
+  } catch (e) {
+    return url || "";
+  }
+}
+
+function clearTabVideos(tabId) {
+  videoMap.delete(tabId);
+  clearRecentFor(tabId);
+  setBadge(tabId, "");
+  persistVideoMap(true);
+}
+
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId === 0) {
-    videoMap.delete(details.tabId);
-    clearRecentFor(details.tabId);
-    setBadge(details.tabId, "");
-    persistVideoMap(true);
+    tabNavIdentity.set(details.tabId, navIdentity(details.url));
+    clearTabVideos(details.tabId);
   }
 });
 
 // 6.3: single-page apps change the URL with pushState/replaceState and never
 // fire onBeforeNavigate, so the previous "page"'s media piled up in the list.
+// Clear only when the new URL is a different page. A tab with no stored
+// identity (service worker restarted, list hydrated from session storage)
+// adopts the current page without clearing: the hydrated list belongs to
+// the page the user is already on.
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
-  if (details.frameId === 0) {
-    videoMap.delete(details.tabId);
-    clearRecentFor(details.tabId);
-    setBadge(details.tabId, "");
-    persistVideoMap(true);
+  if (details.frameId !== 0) return;
+  const ident = navIdentity(details.url);
+  const prev = tabNavIdentity.get(details.tabId);
+  if (prev === undefined) {
+    tabNavIdentity.set(details.tabId, ident);
+    return;
   }
+  if (prev === ident) return;
+  tabNavIdentity.set(details.tabId, ident);
+  clearTabVideos(details.tabId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   videoMap.delete(tabId);
   clearRecentFor(tabId);
+  tabNavIdentity.delete(tabId);
   persistVideoMap();
 });
 
@@ -637,7 +682,7 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   }
 });
 
-async function sendToBackend({ url, pageUrl, filename, format_id, target_format }) {
+async function sendToBackend({ url, pageUrl, filename, format_id, target_format, download_playlist }) {
   const alive = await checkBackend();
   if (!alive) {
     return { ok: false, error: "Video Grabber app isn't running. Launch the desktop app, then try again." };
@@ -656,6 +701,7 @@ async function sendToBackend({ url, pageUrl, filename, format_id, target_format 
         filename: filename || null,
         format_id: format_id || null,
         target_format: target_format || null,
+        download_playlist: download_playlist || false,
       }),
     });
     if (unpaired) {
@@ -786,19 +832,30 @@ chrome.downloads.onCreated.addListener(async (item) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+// Never hang on session-storage hydration: after 3 s answer with what we have.
+function mapReadyOrTimeout() {
+  return Promise.race([
+    videoMapReady.catch(() => {}),
+    new Promise((r) => setTimeout(r, 3000)),
+  ]);
+}
+
+function vgHandleMessage(msg, sender, sendResponse) {
   if (msg.type === "RELAY_DOWNLOAD") {
     // From content.js overlay OR popup.js
     const tabId = sender.tab ? sender.tab.id : msg.tabId;
-    if (!msg.skipList) addItem(tabId, { url: msg.url, source: "overlay", contentType: null });
+    // A bookkeeping failure here must never block the download itself.
+    try {
+      if (!msg.skipList) addItem(tabId, { url: msg.url, source: "overlay", contentType: null });
+    } catch (e) { console.warn("[VG] addItem failed (ignored):", e); }
     sendToBackend({
       url: msg.url,
-      pageUrl: msg.pageUrl,
+      pageUrl: msg.pageUrl || msg.url,
       filename: msg.filename,
       format_id: msg.format_id,
       target_format: msg.target_format,
       download_playlist: msg.download_playlist || false,
-    }).then(sendResponse);
+    }).then(sendResponse).catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true; // async
   }
 
@@ -863,7 +920,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "GET_VIDEOS") {
     // Waits for the session-storage hydration (see videoMapReady).
-    videoMapReady.then(() => {
+    mapReadyOrTimeout().then(() => {
       const m = videoMap.get(msg.tabId);
       sendResponse({ videos: m ? Array.from(m.values()) : [] });
     });
@@ -871,7 +928,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "CLEAR_VIDEOS") {
-    videoMapReady.then(() => {
+    mapReadyOrTimeout().then(() => {
       videoMap.delete(msg.tabId);
       setBadge(msg.tabId, "");
       persistVideoMap(true);
@@ -884,7 +941,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Every tab with detected media: [{id, url, title, items}]. Tabs that
     // have been closed since detection are skipped.
     (async () => {
-      await videoMapReady;
+      await mapReadyOrTimeout();
       const out = [];
       for (const [tabId, m] of videoMap) {
         if (!m.size) continue;
@@ -935,7 +992,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "SHOW_ADD_DIALOG") {
     // Pill -> pre-download confirmation dialog in the desktop app.
-    showAddDialogFor(msg).then(sendResponse);
+    showAddDialogFor(msg).then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true; // async
   }
 
@@ -1021,6 +1079,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       });
     } catch (e) {}
     sendResponse({ ok: true });
+    return false;
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, rawSendResponse) => {
+  if (!msg || typeof msg !== "object") return false;
+  console.debug("[VG] onMessage", msg.type, "from", sender && sender.tab ? "tab " + sender.tab.id : "extension page");
+  // Single, guarded responder: one reply at most, and a closed port (the tab
+  // navigated away) is logged instead of throwing.
+  let responded = false;
+  const sendResponse = (payload) => {
+    if (responded) return;
+    responded = true;
+    try {
+      rawSendResponse(payload);
+    } catch (e) {
+      console.warn("[VG] sendResponse failed for", msg.type, e);
+    }
+    if (chrome.runtime.lastError) {
+      console.warn("[VG] lastError after reply to", msg.type, chrome.runtime.lastError.message);
+    }
+  };
+  try {
+    return vgHandleMessage(msg, sender, sendResponse) === true;
+  } catch (e) {
+    console.error("[VG] handler for", msg.type, "threw:", e);
+    sendResponse({ ok: false, error: "Background error: " + String(e && e.message ? e.message : e) });
     return false;
   }
 });

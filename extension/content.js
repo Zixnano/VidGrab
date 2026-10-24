@@ -22,6 +22,38 @@
     return;
   }
 
+
+  // v4.3.1: every message to background.js goes through vgSend(). It never
+  // throws, always calls cb exactly once as cb(resp, errMsg), logs
+  // chrome.runtime.lastError, and times out so a lost reply can't leave the
+  // pill on "Sending…" forever. errMsg is set on lastError, a synchronous
+  // throw (extension reloaded: context invalidated) or a timeout.
+  function vgSend(msg, cb, timeoutMs) {
+    let done = false;
+    let timer = null;
+    const finish = (resp, errMsg) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      if (errMsg) console.warn("[VG] message", msg && msg.type, "failed:", errMsg);
+      if (typeof cb === "function") {
+        try { cb(resp, errMsg); }
+        catch (e) { console.error("[VG] callback for", msg && msg.type, "threw:", e); }
+      }
+    };
+    timer = setTimeout(() => finish(undefined, "No reply from background (timed out)"),
+                       timeoutMs || 25000);
+    try {
+      chrome.runtime.sendMessage(msg, (resp) => {
+        const le = chrome.runtime.lastError;
+        if (le) { finish(undefined, le.message || "runtime error"); return; }
+        finish(resp, null);
+      });
+    } catch (e) {
+      finish(undefined, String(e && e.message ? e.message : e));
+    }
+  }
+
   // Theme colors copied from the app (see background.js refreshTheme).
   let TH = { bg_base: "#0a0a0f", bg_elevated: "#1a1a24", border_hi: "#33333f", text: "#e6e6eb",
              text_muted: "#8a8a95", accent: "#26c6da", success: "#4caf50", error: "#ef5350",
@@ -68,6 +100,7 @@
         }
         if (!cfg.microPill) hideMicro();
         if (cfg.pillCorner !== prev.pillCorner) syncAllPills();
+        if (cfg.oneClickMode !== prev.oneClickMode) syncAllPills();
         if (cfg.microPillPos !== prev.microPillPos && microTarget) placeMicro();
       }
       if (changes.pillPrefs) {
@@ -145,6 +178,7 @@
       .vg-pill-mini { padding: 3px 4px !important; gap: 2px !important; border-radius: 999px !important; }
       .vg-pill-mini .vg-pill-label { display: none !important; }
       .vg-pill-mini .vg-pill-btn { padding: 2px 6px !important; }
+      .vg-pill-mini .vg-pill-menubtn { padding: 2px 6px !important; }
     `;
     (document.head || document.documentElement).appendChild(s);
   }
@@ -258,9 +292,10 @@
   // the app's /queue-running route; the in-page toast confirms the result.
   function startQueue() {
     try {
-      chrome.runtime.sendMessage({ type: "START_QUEUE" }, (resp) => {
-        if (chrome.runtime.lastError) {
-          microToastShow(failLabel(null, chrome.runtime.lastError.message), true);
+      vgSend({ type: "START_QUEUE" }, (resp, vgErr) => {
+        const vgLE = (chrome.runtime.lastError && chrome.runtime.lastError.message) || vgErr;
+          if (vgLE) {
+          microToastShow(failLabel(null, vgLE), true);
           return;
         }
         if (resp && resp.ok) microToastShow("Queue started \u2713");
@@ -419,18 +454,37 @@
     return vids[vids.length - 1];
   }
 
+  // A pill belongs to ONE video, but the tab list holds every video the
+  // tab has sniffed, and an X feed never fires a navigation while the
+  // user scrolls it. So the pill must not take the tab-wide best: that
+  // is an earlier tweet's video, usually the largest one. sinceTs (the
+  // pill's wire time minus a grace window for late wiring) keeps only
+  // media first seen around the time this pill's video element
+  // appeared. When nothing is that fresh, cb(null): no "Download file"
+  // item is offered, and the exact tweet-permalink path stays available
+  // instead of a wrong file being sent.
+  const SNIFF_FRESH_GRACE_MS = 2000;
   // chrome.runtime.sendMessage callback pattern (content scripts can't
   // reliably use async/await with it). cb receives the best item or null.
-  function querySniffedVideos(cb) {
-    try {
-      chrome.runtime.sendMessage({ type: "GET_ALL_VIDEOS" }, (resp) => {
-        if (chrome.runtime.lastError || !resp) return cb(null);
-        const items = sniffedItemsForThisTab(resp.tabs || []);
-        cb(items ? bestSniffedVideo(items) : null);
-      });
-    } catch (e) {
-      cb(null);
-    }
+  function querySniffedVideos(cb, sinceTs) {
+    vgSend({ type: "GET_ALL_VIDEOS" }, (resp, errMsg) => {
+      let best = null;
+      try {
+        if (!errMsg && resp) {
+          let items = sniffedItemsForThisTab(resp.tabs || []);
+          if (items && sinceTs) {
+            const fresh = items.filter((it) => it && (it.timestamp || 0) >= sinceTs);
+            items = fresh.length ? fresh : null;
+          }
+          best = items ? bestSniffedVideo(items) : null;
+        }
+      } catch (e) {
+        console.warn("[VG] sniffer lookup failed:", e);
+        best = null;
+      }
+      try { cb(best); }
+      catch (e) { console.error("[VG] sniffer callback threw:", e); }
+    }, 4000);
   }
 
   function isVisible(el) {
@@ -477,11 +531,23 @@
     wrap.style.transition = "opacity 150ms ease";
     wrap.style.opacity = "0";
 
+    // Split pill: the old single button becomes the left half (one-click
+    // download) and a narrow dropdown half opens the menu. Both halves
+    // share one bordered box so normal and mini states look identical
+    // apart from the hidden label (see .vg-pill-mini CSS above).
+    const split = document.createElement("div");
+    // No border here: the pill wrap already draws the outer frame, and a
+    // bordered split box inside it is the double frame in the screenshot.
+    // The only line inside the pill is the divider between the halves.
+    split.style.cssText = `
+      display:flex; align-items:stretch; background:transparent;
+      border:none;
+    `;
     const btn = document.createElement("button");
     btn.className = "vg-pill-btn";
     btn.style.cssText = `
       display:flex; align-items:center; gap:6px; background:transparent;
-      border:1px solid ${TH.border_hi}; color:${TH.text}; border-radius:6px;
+      border:none; border-right:1px solid ${TH.border_hi}; color:${TH.text};
       padding:4px 10px; font: inherit; cursor:pointer;
     `;
     const icon = document.createElement("span");
@@ -491,6 +557,16 @@
     label.className = "vg-pill-label";
     btn.appendChild(icon);
     btn.appendChild(label);
+    const menuBtn = document.createElement("button");
+    menuBtn.className = "vg-pill-menubtn";
+    menuBtn.title = "More options";
+    menuBtn.style.cssText = `
+      background:transparent; border:none; color:${TH.text_muted};
+      cursor:pointer; padding:4px 8px; font: inherit;
+    `;
+    menuBtn.textContent = "▾";
+    split.appendChild(btn);
+    split.appendChild(menuBtn);
 
     const closeBtn = document.createElement("button");
     closeBtn.textContent = "✕";
@@ -516,7 +592,7 @@
       display: none; flex-direction: column; padding: 6px;
       font: 12px/1.4 -apple-system, Segoe UI, Roboto, sans-serif;
     `;
-    wrap.appendChild(btn);
+    wrap.appendChild(split);
     wrap.appendChild(closeBtn);
     wrap.appendChild(menu);
     document.documentElement.appendChild(wrap);
@@ -636,10 +712,12 @@
     function syncPrefs() {
       Object.assign(state, prefsFor(SITE));
       applyMini();
+      if (menuBtn) menuBtn.style.display = cfg.oneClickMode ? "none" : "";
+      btn.style.borderRight = cfg.oneClickMode ? "none" : `1px solid ${TH.border_hi}`;
       position();
     }
 
-    return { wrap, btn, label, icon, menu, position, cleanup, syncPrefs };
+    return { wrap, btn, menuBtn, label, icon, menu, position, cleanup, syncPrefs };
   }
 
   // v5: tell the user when a send was a repeat of something already queued.
@@ -671,9 +749,9 @@
   }
 
   // E1: put the pill back to its default label. wire() gives each overlay a
-  // defaultLabel() that adds the cached best quality ("Download 1080p ▾").
+  // defaultLabel() that adds the cached best quality ("Download 1080p").
   function restoreLabel(overlay) {
-    setLabel(overlay, overlay.defaultLabel ? overlay.defaultLabel() : "Download ▾", TH.accent);
+    setLabel(overlay, overlay.defaultLabel ? overlay.defaultLabel() : "Download", TH.accent);
   }
 
   // ---------- format-picker helpers ----------
@@ -736,7 +814,7 @@
     if (!FORMAT_CACHE.has(url)) {
       FORMAT_CACHE.set(url, new Promise((resolve) => {
         try {
-          chrome.runtime.sendMessage({ type: "PROBE_FORMATS", url, pageUrl: pageUrl || location.href }, (resp) => {
+          vgSend({ type: "PROBE_FORMATS", url, pageUrl: pageUrl || location.href }, (resp) => {
             // Don't cache failures — the app may just be starting up.
             if (chrome.runtime.lastError || !resp || resp.ok === false) {
               FORMAT_CACHE.delete(url);
@@ -808,36 +886,78 @@
     return norm(location.pathname); // tweet detail page
   }
 
-  async function handleSendPageUrl(video, overlay, closeMenu, download_playlist = false) {
+  // X/Twitter: document.title on a feed is "Home / X", and on SPA
+  // navigation it lags behind the tweet actually on screen, which is
+  // how downloads end up named "Home _ X". Name the file from the
+  // tweet itself: its visible text, else its status id, else the
+  // page title. Off X this degrades to the cleaned page title, so
+  // no other site's naming changes.
+  function tweetNameFor(video) {
+    const clean = (s, max) => (s || "")
+      .replace(/[\u0000-\u001f\\/:*?"<>|]/g, " ")
+      .replace(/\s+/g, " ").trim().slice(0, max)
+      .replace(/[. ]+$/g, "");
+    try {
+      const article = video && video.closest ? video.closest("article") : null;
+      const textEl = article && article.querySelector('[data-testid="tweetText"]');
+      const text = clean(textEl && textEl.innerText, 60);
+      if (text) return text;
+    } catch (e) {}
+    try {
+      const pu = pageUrlFor(video);
+      const m = pu && /\/status\/(\d+)/.exec(pu);
+      if (m) return "x_" + m[1];
+    } catch (e) {}
+    return clean(document.title, 80) || "video";
+  }
+
+  // onResult(ok), when given, reports the outcome to a caller that has a
+  // fallback (one-click on X tries the permalink first, then the sniffed
+  // file). Labels are set here exactly as before either way.
+  async function handleSendPageUrl(video, overlay, closeMenu, download_playlist = false, onResult = null) {
     if (closeMenu) closeMenu();
     const pu = pageUrlFor(video);
     if (!pu) {
       setLabel(overlay, "Couldn't find tweet link", TH.error);
+      if (onResult) onResult(false);
       return;
     }
     setLabel(overlay, "Sending…");
-    const guessName = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
-    chrome.runtime.sendMessage(
-      {
-        type: "RELAY_DOWNLOAD",
-        url: pu,
-        pageUrl: pu,
-        filename: guessName,
-        download_playlist: download_playlist,
-      },
-      (resp) => {
-        if (chrome.runtime.lastError) {
-          setLabel(overlay, failLabel(null, chrome.runtime.lastError.message), TH.error);
-          return;
+    const guessName = tweetNameFor(video);
+    try {
+      vgSend(
+        {
+          type: "RELAY_DOWNLOAD",
+          url: pu,
+          pageUrl: pu,
+          filename: guessName,
+          download_playlist: download_playlist,
+        },
+        (resp, vgErr) => {
+          const vgLE = (chrome.runtime.lastError && chrome.runtime.lastError.message) || vgErr;
+          if (vgLE) {
+            setLabel(overlay, failLabel(null, vgLE), TH.error);
+            if (onResult) onResult(false);
+            return;
+          }
+          if (resp && resp.ok) {
+            setLabel(overlay, sentLabel(resp, "Sent to app ✓"), TH.accent);
+            setTimeout(() => setLabel(overlay, "Send page URL to Grabber", TH.info), 2500);
+            if (onResult) onResult(true);
+          } else {
+            setLabel(overlay, failLabel(resp), TH.error);
+            if (onResult) onResult(false);
+          }
         }
-        if (resp && resp.ok) {
-          setLabel(overlay, sentLabel(resp, "Sent to app ✓"), TH.accent);
-          setTimeout(() => setLabel(overlay, "Send page URL to Grabber", TH.info), 2500);
-        } else {
-          setLabel(overlay, failLabel(resp), TH.error);
-        }
-      }
-    );
+      );
+    } catch (e) {
+      // Synchronous throw: the extension context is gone (the
+      // extension was reloaded/updated while this page was open).
+      // The callback never fires and lastError never arrives, so
+      // without this the click looks like it did nothing at all.
+      setLabel(overlay, failLabel(null, String(e && e.message ? e.message : e)), TH.error);
+      if (onResult) onResult(false);
+    }
   }
 
   function saveBlob(blob, filenameBase) {
@@ -890,7 +1010,7 @@
     // Web Notification API depended on each site's permission — so R.6
     // notifications rarely appeared. Best-effort, fire-and-forget.
     try {
-      chrome.runtime.sendMessage(
+      vgSend(
         { type: "SHOW_NOTIFICATION", title, message: body });
     } catch (e) {}
   }
@@ -1027,7 +1147,7 @@
       const blob = new Blob(chunks, { type: mime || "video/webm" });
       const guessName = recBaseName(usedMode);
       recNotify("Video Grabber", `Recording saved — ${usedMode} (${recQuality}).`);
-      chrome.runtime.sendMessage({ type: "GET_UPLOAD_NONCE" }, async (nresp) => {
+      vgSend({ type: "GET_UPLOAD_NONCE" }, async (nresp) => {
         if (chrome.runtime.lastError || !nresp || !nresp.ok || !nresp.nonce) {
           saveBlob(blob, guessName);
           setLabel(overlay, "Saved ✓ (browser) — Record again", TH.accent);
@@ -1097,13 +1217,17 @@
     HANDLED.add(video);
 
     const overlay = makeOverlay(video);
+    // When this pill's video element appeared. The sniffed-list filter
+    // below uses it: only media first seen around this time can be
+    // this tweet's stream.
+    overlay.wiredAt = Date.now();
     LIVE.push({ video, overlay });
     const isBlob = () => (video.currentSrc || "").startsWith("blob:");
-    // E1: "Download 1080p ▾" once a format probe for this source is cached.
+    // E1: "Download 1080p" once a format probe for this source is cached.
     // Read-only: this never starts a probe to fill the label.
     overlay.defaultLabel = () => {
       const hint = (isBlob() || isMseOnlySite()) ? "" : qualityHint(video.currentSrc);
-      return hint ? `Download ${hint} ▾` : "Download ▾";
+      return hint ? `Download ${hint}` : "Download";
     };
     let menuOpen = false;
     let menuSeq = 0;
@@ -1173,7 +1297,7 @@
         return;
       }
       setLabel(overlay, "Sending…");
-      let base = (document.title || "video").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+      let base = tweetNameFor(video);
       // Strip an extension the page title already carries so we never
       // produce "video.mp4.mp4".
       base = base.replace(/\.(mp4|m4v|mov|webm|mkv|mp3|m4a|aac|wav|flac)$/i, "");
@@ -1195,18 +1319,27 @@
         download_playlist: download_playlist,
         pick_playlist: pick_playlist,
       };
-      chrome.runtime.sendMessage(payload, (resp) => {
-        if (chrome.runtime.lastError) {
-          setLabel(overlay, failLabel(null, chrome.runtime.lastError.message), TH.error);
-          return;
-        }
-        if (resp && resp.ok) {
-          setLabel(overlay, sentLabel(resp, resp.auto_queued ? "Queued ✓" : "Sent to app ✓"), TH.accent);
-          setTimeout(() => restoreLabel(overlay), 2500);
-        } else {
-          setLabel(overlay, failLabel(resp), TH.error);
-        }
-      });
+      try {
+        vgSend(payload, (resp, vgErr) => {
+          const vgLE = (chrome.runtime.lastError && chrome.runtime.lastError.message) || vgErr;
+          if (vgLE) {
+            setLabel(overlay, failLabel(null, vgLE), TH.error);
+            return;
+          }
+          if (resp && resp.ok) {
+            setLabel(overlay, sentLabel(resp, resp.auto_queued ? "Queued ✓" : "Sent to app ✓"), TH.accent);
+            setTimeout(() => restoreLabel(overlay), 2500);
+          } else {
+            setLabel(overlay, failLabel(resp), TH.error);
+          }
+        });
+      } catch (e) {
+        // Synchronous throw: the extension context is gone (the
+        // extension was reloaded/updated while this page was open).
+        // The callback never fires and lastError never arrives, so
+        // without this the click looks like it did nothing at all.
+        setLabel(overlay, failLabel(null, String(e && e.message ? e.message : e)), TH.error);
+      }
     }
 
     // E2: copy to the clipboard, falling back to execCommand where a page's
@@ -1262,7 +1395,7 @@
         });
         menu.insertBefore(copyItem, menu.children[1] || null);
         placeMenu();
-      });
+      }, overlay.wiredAt - SNIFF_FRESH_GRACE_MS);
 
     if (isPlaylistUrl(location.href)) {
       // On YouTube (and any extractor site), video.currentSrc is a blob:
@@ -1305,7 +1438,7 @@
                 });
               menu.insertBefore(item, menu.firstChild);
               sniffPh.remove();
-            });
+            }, overlay.wiredAt - SNIFF_FRESH_GRACE_MS);
           }
           addMenuItem(menu, "Download with yt-dlp", {},
             () => handleSendPageUrl(video, overlay, closeMenu));
@@ -1338,17 +1471,17 @@
                     rememberQuality(f);
                     closeMenu();
                     setLabel(overlay, "Sending…");
-                    chrome.runtime.sendMessage({
+                    vgSend({
                       type: "SHOW_ADD_DIALOG",
                       url: pu,
                       pageUrl: pu,
-                      filename: (document.title || "video")
-                        .replace(/[\\/:*?"<>|]/g, "_").slice(0, 80),
+                      filename: tweetNameFor(video),
                       format_id: f.format_id,
                       target_format: tf,
-                    }, (resp) => {
-                      if (chrome.runtime.lastError) {
-                        setLabel(overlay, failLabel(null, chrome.runtime.lastError.message), TH.error);
+                    }, (resp, vgErr) => {
+                      const vgLE = (chrome.runtime.lastError && chrome.runtime.lastError.message) || vgErr;
+          if (vgLE) {
+                        setLabel(overlay, failLabel(null, vgLE), TH.error);
                         return;
                       }
                       if (resp && resp.ok) {
@@ -1460,7 +1593,7 @@
       if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
       if (RECORDERS.has(video)) return; // don't clobber label mid-recording
       if (isMseOnlySite()) {
-        setLabel(overlay, "Send page URL ▾", TH.info);
+        setLabel(overlay, "Send page URL", TH.info);
         return;
       }
       if (!video.currentSrc) {
@@ -1469,14 +1602,14 @@
       }
       if (isBlob()) {
         // Fallback label first (no flicker if the sniffer has nothing),
-        // then upgrade to "Download ▾" when it finds a real file.
-        setLabel(overlay, "Record this video ▾", TH.error);
+        // then upgrade to "Download" when it finds a real file.
+        setLabel(overlay, "Record this video", TH.error);
         querySniffedVideos((best) => {
           // Ignore a late answer: a newer refresh ran, the clip changed,
           // or a recording started in the meantime.
           if (seq !== refreshSeq || !isBlob() || RECORDERS.has(video)) return;
           if (sniffedIsDownloadable(best)) {
-            restoreLabel(overlay);   // "Download ▾"
+            restoreLabel(overlay);   // "Download"
           } else if (attempt < 2 && video.isConnected) {
             // The media request can land after loadedmetadata; look again.
             refreshTimer = setTimeout(() => refreshFor(attempt + 1),
@@ -1492,17 +1625,98 @@
     video.addEventListener("loadedmetadata", refresh);
     video.addEventListener("emptied", refresh);
 
+    // Split pill, left half: send without opening the menu. Blob players
+    // resolve through the same fresh-window sniffed query as the menu's
+    // "Download file" item; when nothing fresh is found, extractor sites
+    // fall back to the exact page/tweet URL, and anything else opens the
+    // menu rather than sending a stale file.
+    function oneClickFail(e) {
+      console.error("[VG] one-click failed:", e);
+      setLabel(overlay, "Extension error", TH.error);
+      setTimeout(() => restoreLabel(overlay), 3000);
+    }
+
+    function oneClickSend() {
+      try {
+        setLabel(overlay, "Sending…");
+        // X/Twitter only: the tweet permalink is exact, and the extractor
+        // resolves the complete video+audio set. A raw sniffed file can be
+        // a video-only variant, so it is the fallback here.
+        if (/(^|\.)(x|twitter)\.com$/i.test(location.hostname)) {
+          handleSendPageUrl(video, overlay, null, false, (ok) => {
+            if (!ok) sendSniffedOneClick();
+          });
+          return;
+        }
+        sendSniffedOneClick();
+      } catch (e) { oneClickFail(e); }
+    }
+
+    // One-click queues directly (bypass_dialog -> RELAY_DOWNLOAD). Before this
+    // it sent SHOW_ADD_DIALOG, so the job only existed once someone confirmed
+    // the app's dialog, which looked like "nothing queued".
+    function sendSniffedOneClick() {
+      try {
+        const direct = video.currentSrc || "";
+        if (isBlob() || !direct) {
+          querySniffedVideos((best) => {
+            try {
+              if (best && best.url) {
+                const directFile = /\.(mp4|webm|mkv|mov|m4v|avi)(\?|#|$)/i.test(best.url);
+                sendChoice(directFile
+                  ? { url: best.url, bypass_dialog: true }
+                  : { url: best.url, target_format: "mp4", bypass_dialog: true });
+                return;
+              }
+              // Sniffer found nothing (or failed): fall back, never go silent.
+              if (/^https?:/i.test(direct)) {
+                sendChoice({ url: direct, bypass_dialog: true });
+              } else if (pageUrlFor(video) && (isExtractorSite() || isMseOnlySite())) {
+                handleSendPageUrl(video, overlay, null);
+              } else if (pageUrlFor(video)) {
+                // Blob player on an unknown site: yt-dlp on the page URL is
+                // the best remaining shot (recording stays in the menu).
+                handleSendPageUrl(video, overlay, null);
+              } else {
+                setLabel(overlay, "No stream found", TH.error);
+                setTimeout(() => restoreLabel(overlay), 2500);
+                toggleMenu();
+              }
+            } catch (e) { oneClickFail(e); }
+          }, overlay.wiredAt - SNIFF_FRESH_GRACE_MS);
+        } else {
+          sendChoice({ url: direct, bypass_dialog: true });
+        }
+      } catch (e) { oneClickFail(e); }
+    }
+
+    function pillClick(fromMenuArrow) {
+      try {
+        if (RECORDERS.has(video)) { handleRecordToggle(video, overlay); return; }
+        // MSE-only sites (Twitch) have no currentSrc yet but still need the menu —
+        // it offers "Send page URL to yt-dlp".
+        if (!video.currentSrc && !isBlob() && !isMseOnlySite()) {
+          setLabel(overlay, "Waiting for video…", "#999");
+          setTimeout(() => { if (video.isConnected) refresh(); }, 1500);
+          return;
+        }
+        if (!fromMenuArrow && cfg.oneClickMode) { oneClickSend(); return; }
+        toggleMenu();
+      } catch (err) {
+        console.error("[VG] pill click failed:", err);
+        setLabel(overlay, "Extension error", TH.error);
+        setTimeout(() => restoreLabel(overlay), 3000);
+      }
+    }
     overlay.btn.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
-      if (RECORDERS.has(video)) { handleRecordToggle(video, overlay); return; }
-      // (The old one-click "send page URL" shortcut for Reddit / Redgifs /
-      // TikTok / X blob players is gone: the pill always opens the menu,
-      // which offers the sniffed file, yt-dlp and the format list.)
-      // MSE-only sites (Twitch) have no currentSrc yet but still need the menu —
-      // it offers "Send page URL to yt-dlp". Only bail when there's truly nothing.
-      if (!video.currentSrc && !isBlob() && !isMseOnlySite()) return;
-      toggleMenu();
+      pillClick(false);
+    });
+    overlay.menuBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      pillClick(true);
     });
   }
 
@@ -1911,12 +2125,13 @@
     const url = microUrlFor(el);   // re-read now: srcset may have changed since hover
     if (!url) { microToastShow("No image URL found", true); return; }
     try {
-      chrome.runtime.sendMessage(
+      vgSend(
         { type: "RELAY_DOWNLOAD", url, pageUrl: location.href,
           filename: microFilenameFor(url), skipList: true },
-        (resp) => {
-          if (chrome.runtime.lastError) {
-            microToastShow(failLabel(null, chrome.runtime.lastError.message), true);
+        (resp, vgErr) => {
+          const vgLE = (chrome.runtime.lastError && chrome.runtime.lastError.message) || vgErr;
+          if (vgLE) {
+            microToastShow(failLabel(null, vgLE), true);
             return;
           }
           if (resp && resp.ok) {
@@ -2025,7 +2240,7 @@
     microToastShow(`Sending ${urls.length} image(s)\u2026`);
     for (const url of urls) {
       try {
-        chrome.runtime.sendMessage(
+        vgSend(
           { type: "RELAY_DOWNLOAD", url, pageUrl: location.href,
             filename: microFilenameFor(url), skipList: true },
           (resp) => {
@@ -2094,7 +2309,7 @@
     function queryState() {
       return new Promise((resolve) => {
         try {
-          chrome.runtime.sendMessage({ type: "VG_STATE" }, (r) => {
+          vgSend({ type: "VG_STATE" }, (r) => {
             resolve(chrome.runtime.lastError || !r ? null : r);
           });
         } catch (e) { resolve(null); }
@@ -2139,7 +2354,7 @@
       const attempt = async () => {
         const nresp = await new Promise((resolve) => {
           try {
-            chrome.runtime.sendMessage({ type: "GET_UPLOAD_NONCE" }, (r) => {
+            vgSend({ type: "GET_UPLOAD_NONCE" }, (r) => {
               resolve(chrome.runtime.lastError ? null : r);
             });
           } catch (e) { resolve(null); }

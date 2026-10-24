@@ -15,6 +15,7 @@ const VG_DEFAULTS = {
   notifyRecording: true,   // desktop notifications for recordings
   notifyActions: true,     // desktop notifications for shortcuts and right-click sends
   interceptDownloads: false, // Batch 3: hand every browser download to the app.
+  oneClickMode: false,      // split pill: left half sends immediately, menu arrow hidden
                            // THE one source of truth for the interceptor: the
                            // old standalone "interceptDownloads" storage key is
                            // read once as a migration fallback (background.js,
@@ -41,5 +42,6 @@ function vgNormalize(raw) {
     notifyRecording: bool("notifyRecording"),
     notifyActions: bool("notifyActions"),
     interceptDownloads: bool("interceptDownloads"),
+    oneClickMode: bool("oneClickMode"),
   };
 }

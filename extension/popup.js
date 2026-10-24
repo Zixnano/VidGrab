@@ -837,6 +837,7 @@ async function setupSettings() {
   // [element id, setting key, kind]
   const controls = [
     ["setPillVisible", "pillVisible", "bool"],
+    ["setOneClick", "oneClickMode", "bool"],
     ["setMicroPill", "microPill", "bool"],
     ["setMicroPos", "microPillPos", "str"],
     ["setMicroSize", "microPillSize", "bool"],

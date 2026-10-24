@@ -739,14 +739,11 @@ class YtDlpEngine:
         if _imp is not None:
             ydl_opts["impersonate"] = _imp
 
-        # Twitter/X: most tweets need a logged-in session. Twitter hosts only,
-        # so the YouTube do-not-add rule for cookiesfrombrowser is untouched.
-        # Browser defaults to Chrome; settings.json "twitter_cookie_browser"
-        # (e.g. "vivaldi", "firefox", "edge") overrides it.
-        if _is_twitter_url(url):
-            _tw_browser = str(STATE.get("twitter_cookie_browser") or "chrome").strip().lower()
-            ydl_opts["cookiesfrombrowser"] = (_tw_browser,)
-
+        # Twitter/X: the extension now passes cookies directly in http_headers.
+        # We removed the forced cookiesfrombrowser read because Windows DPAPI
+        # blocks yt-dlp from decrypting Chrome's cookie database, which caused
+        # the "Failed to decrypt with DPAPI" error.
+        
         diag_opts = dict(ydl_opts)
         try:
             hdrs = dict(diag_opts.get("http_headers") or {})
@@ -777,6 +774,8 @@ class YtDlpEngine:
                 # Chrome locks its cookie DB / uses app-bound encryption, so
                 # reading it can fail. Public tweets still download without
                 # cookies, so retry once without them instead of failing.
+                # (This catches cases where some other part of the code adds
+                # cookiesfrombrowser, preventing a hard crash.)
                 if "cookiesfrombrowser" in ydl_opts and _is_cookie_read_error(_ce):
                     log(f"job {opts.get('job_id') or dest.name}: couldn't read "
                         f"browser cookies ({str(_ce)[:200]}); retrying without them")
