@@ -8,6 +8,7 @@ import glob
 import hashlib
 import os
 import json
+import math
 import random
 import re
 import shutil
@@ -17,12 +18,199 @@ import tempfile
 import threading
 import traceback
 import time
+import urllib.request
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
 from typing import Callable, Optional, Protocol
 
 from logging_setup import log
+
+
+# ---------------------------------------------------------------------------
+# Twitter/X direct-media resolver.
+#
+# yt-dlp's Twitter extractor goes through X's GraphQL API, which X blocks or
+# rate-limits for automated clients (symptom: JSONDecodeError / "Unable to
+# download JSON metadata"). The public Syndication endpoint used by embedded
+# tweets still serves the media list without a login, so for twitter.com /
+# x.com URLs we resolve the highest-bitrate progressive .mp4 ourselves and
+# hand THAT to yt-dlp (it downloads plain files fine). Tiers, in order:
+#   1. cdn.syndication.twimg.com  (first-party, no login)
+#   2. api.fxtwitter.com          (third-party mirror; sees only the public
+#                                  tweet id; disable with STATE
+#                                  "twitter_third_party_fallback": false)
+#   3. the normal yt-dlp extractor on the original URL (always the last
+#      resort; see YtDlpEngine.download).
+# stdlib urllib only: the frozen Host excludes `requests`.
+# ---------------------------------------------------------------------------
+_TW_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def _twitter_status_id(url):
+    """Tweet id from /user/status/ID, /i/status/ID, /i/web/status/ID and
+    /i/videos/ID style URLs, else None."""
+    try:
+        path = urlparse(url or "").path
+    except Exception:
+        return None
+    m = re.search(r"/(?:status(?:es)?|videos)/(\d{5,25})", path)
+    return m.group(1) if m else None
+
+
+def _http_get_json(url, proxy=None, timeout=15):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _TW_UA,
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(req, timeout=timeout) as r:
+        raw = r.read(4_000_000)
+    return json.loads(raw.decode("utf-8", "replace"))
+
+
+def _pick_mp4_variant(variants, prefer_kbps=None):
+    """Best progressive mp4 from a variants list (syndication: content_type/
+    url/bitrate; legacy: type/src). Highest bitrate wins, then resolution.
+    prefer_kbps (from a yt-dlp 'http-<kbps>' format id) selects that exact
+    variant when present. HLS playlists are never returned."""
+    cands = []
+    for v in variants or []:
+        if not isinstance(v, dict):
+            continue
+        u = v.get("url") or v.get("src")
+        if not isinstance(u, str) or not u.startswith("http"):
+            continue
+        path = urlparse(u).path.lower()
+        ctype = str(v.get("content_type") or v.get("type") or "").lower()
+        if "m3u8" in path or "mpegurl" in ctype:
+            continue
+        if not (ctype == "video/mp4" or path.endswith(".mp4")):
+            continue
+        br = v.get("bitrate")
+        br = int(br) if isinstance(br, (int, float)) else 0
+        m = re.search(r"/(\d{2,5})x(\d{2,5})/", path)
+        area = int(m.group(1)) * int(m.group(2)) if m else 0
+        cands.append((br, area, u))
+    if not cands:
+        return None
+    if prefer_kbps:
+        near = min(cands, key=lambda c: (abs(c[0] // 1000 - prefer_kbps), -c[0]))
+        if abs(near[0] // 1000 - prefer_kbps) <= 1:
+            return near[2]
+    return max(cands, key=lambda c: (c[0], c[1]))[2]
+
+
+def _tw_title(screen_name, text, tid):
+    text = re.sub(r"https?://t\.co/\S+", "", text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r'[\x00-\x1f\\/:*?"<>|]', " ", text)[:80].strip(" .")
+    who = re.sub(r"[^\w.\-]", "", screen_name or "") or "x"
+    return f"{who} - {text} [{tid}]" if text else f"{who} [{tid}]"
+
+
+def _twitter_syndication_info(url, proxy=None, prefer_kbps=None):
+    """{'url', 'title', 'id', 'source'} from the Syndication API, or None."""
+    tid = _twitter_status_id(url)
+    if not tid:
+        return None
+    tokens = ["4"]
+    try:
+        # Same token the embed widget computes; "4" is the long-standing
+        # fallback that works while X doesn't validate it.
+        from yt_dlp.utils import js_number_to_string
+        t = js_number_to_string((int(tid) / 1e15) * math.pi, 36)
+        t = str(t).replace("0", "").replace(".", "")
+        if t and t not in tokens:
+            tokens.insert(0, t)
+    except Exception:
+        pass
+    for token in tokens:
+        api = (f"https://cdn.syndication.twimg.com/tweet-result"
+               f"?id={tid}&lang=en&token={token}")
+        try:
+            data = _http_get_json(api, proxy)
+        except Exception as e:
+            log(f"twitter syndication token={token} failed: {str(e)[:160]}")
+            continue
+        if not isinstance(data, dict):
+            continue
+        direct = None
+        for m in data.get("mediaDetails") or []:
+            if isinstance(m, dict) and m.get("type") in ("video", "animated_gif"):
+                direct = _pick_mp4_variant(
+                    (m.get("video_info") or {}).get("variants"), prefer_kbps)
+                if direct:
+                    break
+        if not direct and isinstance(data.get("video"), dict):
+            direct = _pick_mp4_variant(data["video"].get("variants"), prefer_kbps)
+        if direct:
+            return {"url": direct, "id": tid, "source": "syndication",
+                    "title": _tw_title((data.get("user") or {}).get("screen_name"),
+                                       data.get("text"), tid)}
+    return None
+
+
+def _twitter_syndication_url(url, proxy=None, prefer_kbps=None):
+    """Highest-bitrate .mp4 URL for a tweet via the public Syndication API,
+    or None (no video, protected/sensitive tweet, blocked, network error)."""
+    info = _twitter_syndication_info(url, proxy, prefer_kbps)
+    return info["url"] if info else None
+
+
+def _twitter_fxtwitter_info(url, proxy=None, prefer_kbps=None):
+    tid = _twitter_status_id(url)
+    if not tid:
+        return None
+    try:
+        data = _http_get_json(f"https://api.fxtwitter.com/status/{tid}", proxy)
+    except Exception as e:
+        log(f"twitter fxtwitter failed: {str(e)[:160]}")
+        return None
+    tw = (data or {}).get("tweet") or {}
+    media = tw.get("media") or {}
+    items = list(media.get("videos") or [])
+    if not items:
+        items = [m for m in (media.get("all") or [])
+                 if isinstance(m, dict) and m.get("type") in ("video", "gif")]
+    for m in items:
+        if not isinstance(m, dict):
+            continue
+        direct = _pick_mp4_variant(m.get("variants"), prefer_kbps)
+        if not direct and isinstance(m.get("url"), str) \
+                and urlparse(m["url"]).path.lower().endswith(".mp4"):
+            direct = m["url"]
+        if direct:
+            return {"url": direct, "id": tid, "source": "fxtwitter",
+                    "title": _tw_title((tw.get("author") or {}).get("screen_name"),
+                                       tw.get("text"), tid)}
+    return None
+
+
+def _twitter_direct_info(url, format_id=None, proxy=None):
+    """Tier 1 then tier 2. Never raises."""
+    prefer = None
+    m = re.fullmatch(r"http-(\d+)", str(format_id or ""))
+    if m:
+        prefer = int(m.group(1))
+    try:
+        info = _twitter_syndication_info(url, proxy, prefer)
+        if info:
+            return info
+    except Exception as e:
+        log(f"twitter syndication error: {e}")
+    try:
+        if STATE.get("twitter_third_party_fallback", True):
+            return _twitter_fxtwitter_info(url, proxy, prefer)
+    except Exception as e:
+        log(f"twitter fxtwitter error: {e}")
+    return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +723,61 @@ class YtDlpEngine:
 
     # --- download (core of downloader.run_ytdlp, moved verbatim) ---
     def download(self, url, format_id, dest: Path, opts, progress_cb):
+        opts = opts or {}
+        # Twitter/X: resolve the direct .mp4 first (see the resolver above),
+        # BEFORE pace_before_start / any yt-dlp extraction. If the direct
+        # download fails for any reason other than a user cancel, fall back
+        # to the stock yt-dlp path on the original URL.
+        if _is_twitter_url(url) and not opts.get("download_playlist"):
+            info = None
+            try:
+                info = _twitter_direct_info(url, format_id, proxy_for(url))
+            except Exception as e:
+                log(f"twitter resolver crashed (ignored): {e}")
+            if info:
+                d_dest = dest
+                d_opts = dict(opts)
+                if opts.get("use_title"):
+                    safe = re.sub(r'[\x00-\x1f\\/:*?"<>|]', "_", info["title"]).strip(" .")
+                    d_dest = dest.parent / (safe[:150] + ".mp4")
+                    d_opts["use_title"] = False
+                # twimg needs no login: never send the user's X cookies or
+                # tokens to video.twimg.com.
+                keep = ("user-agent", "accept-language")
+                d_opts["headers"] = {k: v for k, v in (opts.get("headers") or {}).items()
+                                     if str(k).lower() in keep}
+                d_opts["headers"]["Referer"] = "https://x.com/"
+                log(f"job {opts.get('job_id') or dest.name}: twitter direct "
+                    f"via {info['source']}: {info['url'][:120]}")
+                try:
+                    return self._download_impl(info["url"], None, d_dest, d_opts, progress_cb)
+                except DownloadCancelled:
+                    raise
+                except Exception as e:
+                    cc = opts.get("cancel_check")
+                    try:
+                        cancelled = bool(cc and cc())
+                    except Exception:
+                        cancelled = False
+                    if cancelled:
+                        raise
+                    log(f"job {opts.get('job_id') or dest.name}: twitter direct "
+                        f"download failed ({str(e)[:200]}); falling back to yt-dlp")
+                    # Don't let the fallback resume a half-written file that
+                    # came from a different source.
+                    try:
+                        stem = glob.escape(d_dest.stem)
+                        for pat in (stem + "*.part", stem + "*.ytdl"):
+                            for f in d_dest.parent.glob(pat):
+                                f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            else:
+                log(f"job {opts.get('job_id') or dest.name}: no direct twitter "
+                    f"media found; using yt-dlp extractor")
+        return self._download_impl(url, format_id, dest, opts, progress_cb)
+
+    def _download_impl(self, url, format_id, dest: Path, opts, progress_cb):
         opts = opts or {}
         headers = opts.get("headers") or {}
         is_playlist = bool(opts.get("download_playlist"))
