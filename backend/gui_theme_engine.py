@@ -50,7 +50,14 @@ CHIPS = (
     ("border", "Border"),
 )
 CHIP_KEYS = tuple(k for k, _ in CHIPS)
-LOW_CONTRAST_CHIPS = ("text_muted",)   # each is checked against bg_base
+LOW_CONTRAST_CHIPS = ("text_muted",)   # kept for older callers; see AA_RULES
+# WCAG AA, per chip: (ratio needed, surfaces it is drawn on). Text sits on the
+# background and on panels; the accent is a UI color, so AA's 3:1 non-text rule.
+AA_RULES = {
+    "text": (4.5, ("bg_base", "bg_panel")),
+    "text_muted": (4.5, ("bg_base", "bg_panel")),
+    "accent": (3.0, ("bg_base",)),
+}
 MIN_TEXT_CONTRAST = 4.5                # WCAG AA for normal text
 LIVE_DEBOUNCE_MS = 75
 DEFAULT_NAME = "My Theme"
@@ -58,7 +65,7 @@ MAX_NAME_LEN = 60
 SMART_MIN_SAT = 0.35                   # best accent candidate below this is "not a real accent"
 SMART_TINT_SAT = 0.12                  # below this a color has no usable hue (grayscale)
 ACCENT_MIN_CONTRAST = 3.0              # a generated accent must stand out from the background
-MUTED_MIN_CONTRAST = 3.0               # Scramble repairs text_muted below this
+MUTED_MIN_CONTRAST = MIN_TEXT_CONTRAST  # muted text is text too: WCAG AA 4.5:1
 _RESERVED = {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} \
     | {f"lpt{i}" for i in range(1, 10)}
 MAX_THEME_BYTES = 256 * 1024           # the Theme tab skips bigger files
@@ -190,6 +197,69 @@ def _readable_muted(muted, text, bg):
         if contrast(c, bg) >= MUTED_MIN_CONTRAST:
             return c
     return text
+
+
+def _min_contrast(color, surfaces):
+    return min(contrast(color, b) for b in surfaces)
+
+
+def _readable_on(text, surfaces):
+    """Like _readable_text, but the color must read on every surface."""
+    if _min_contrast(text, surfaces) >= MIN_TEXT_CONTRAST:
+        return text
+    best = text
+    for pair in (("#f2f2f2", "#111111"), ("#ffffff", "#000000")):
+        best = max(pair, key=lambda c: _min_contrast(c, surfaces))
+        if _min_contrast(best, surfaces) >= MIN_TEXT_CONTRAST:
+            return best
+    return best
+
+
+def _muted_on(muted, text, surfaces):
+    """`muted` if it holds AA on every surface; else the text color blended
+    toward the background as far as AA allows."""
+    if _min_contrast(muted, surfaces) >= MUTED_MIN_CONTRAST:
+        return muted
+    for t in (0.35, 0.25, 0.15, 0.0):
+        c = _mix(text, surfaces[0], t)
+        if _min_contrast(c, surfaces) >= MUTED_MIN_CONTRAST:
+            return c
+    return text
+
+
+def _accent_on(accent, bg):
+    """`accent` if it stands out from `bg` by ACCENT_MIN_CONTRAST; else the
+    same hue, stepped lighter (dark bg) or darker (light bg) until it does."""
+    if contrast(accent, bg) >= ACCENT_MIN_CONTRAST:
+        return accent
+    q = QColor(accent)
+    hue, sat, light = max(q.hslHueF(), 0.0), q.hslSaturationF(), q.lightnessF()
+    dark_bg = QColor(bg).lightnessF() < 0.5
+    out = accent
+    for _ in range(30):
+        light = min(0.95, light + 0.03) if dark_bg else max(0.05, light - 0.03)
+        out = QColor.fromHslF(hue, sat, light).name()
+        if contrast(out, bg) >= ACCENT_MIN_CONTRAST:
+            break
+    return out
+
+
+def _aa_repair(pal):
+    """The chip changes that bring `pal` up to WCAG AA: {key: new color}.
+    Empty when it already passes. Backgrounds and borders are never touched:
+    the user's surfaces stay, the colors drawn on them move."""
+    surfaces = (pal["bg_base"], pal["bg_panel"])
+    out = {}
+    text = _readable_on(pal["text"], surfaces)
+    if text != pal["text"]:
+        out["text"] = text
+    muted = _muted_on(pal["text_muted"], text, surfaces)
+    if muted != pal["text_muted"]:
+        out["text_muted"] = muted
+    accent = _accent_on(pal["accent"], pal["bg_base"])
+    if accent != pal["accent"]:
+        out["accent"] = accent
+    return out
 
 
 def generate_accent(colors, bg):
@@ -367,10 +437,14 @@ class ImageDropZone(QFrame):
         if self._pix is None:
             return
         box = self.rect().adjusted(10, 10, -10, -10)
-        pm = self._pix.scaled(box.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # Fill the box and crop the overflow (no letterbox bars).
+        pm = self._pix.scaled(box.size(), Qt.KeepAspectRatioByExpanding,
+                              Qt.SmoothTransformation)
         p = QPainter(self)
+        p.setClipRect(box)
         p.drawPixmap(box.x() + (box.width() - pm.width()) // 2,
                      box.y() + (box.height() - pm.height()) // 2, pm)
+        p.end()
 
 
 class ColorChip(QWidget):
@@ -413,6 +487,9 @@ class ThemeEngineDialog(QDialog):
     themeChanged = Signal(dict)
     # Emitted after a theme file is written. Payload: its path.
     themeSaved = Signal(str)
+    # Emitted when the theme being edited should become the saved theme
+    # (Save, or Apply on the close prompt). Payload: the full settings state.
+    themeApplied = Signal(dict)
 
     def __init__(self, base_settings=None, parent=None):
         super().__init__(parent)
@@ -428,6 +505,7 @@ class ThemeEngineDialog(QDialog):
         self._extracted = []
         self._picker = None
         self._undo = None           # (accent, tokens) before the last Fill or Scramble
+        self._dirty = False         # edits made since the theme was last applied
 
         # A color drag fires many changes; the app restyles once per pause.
         self._timer = QTimer(self)
@@ -438,8 +516,8 @@ class ThemeEngineDialog(QDialog):
         root = QVBoxLayout(self)
 
         hint = QLabel(f"Starting from {PRESET_NAMES[self._preset]}. Changes show in the app as "
-                      "you make them. Save writes a theme file; closing this window puts "
-                      "back your saved theme.")
+                      "you make them. Save writes a theme file and applies it. If you close "
+                      "with changes that are not applied, you are asked first.")
         hint.setObjectName("CardHint")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -462,9 +540,13 @@ class ThemeEngineDialog(QDialog):
         self.scramble_btn.clicked.connect(self._scramble)
         self.undo_btn = QPushButton("Undo")
         self.undo_btn.setEnabled(False)
-        self.undo_btn.setToolTip("Undo the last Fill chips or Scramble.")
+        self.undo_btn.setToolTip("Undo the last Fill chips, Scramble or Fix contrast.")
         self.undo_btn.clicked.connect(self._undo_last)
-        for b in (self.fill_btn, self.scramble_btn, self.undo_btn):
+        self.fix_btn = QPushButton("Fix contrast")
+        self.fix_btn.setToolTip("Adjust text, muted text and accent so they meet WCAG AA "
+                                "(4.5:1 for text, 3:1 for the accent). Backgrounds are kept.")
+        self.fix_btn.clicked.connect(self._fix_contrast)
+        for b in (self.fill_btn, self.scramble_btn, self.fix_btn, self.undo_btn):
             img_row.addWidget(b)
         img_row.addStretch(1)
         root.addLayout(img_row)
@@ -503,6 +585,7 @@ class ThemeEngineDialog(QDialog):
         self.name_edit.returnPressed.connect(self._save)
         self.save_btn = QPushButton("Save Theme")
         self.save_btn.clicked.connect(self._save)
+        self.save_btn.setToolTip("Write the theme file and apply it to the app.")
         save_row.addWidget(self.name_edit, 1)
         save_row.addWidget(self.save_btn)
         root.addLayout(save_row)
@@ -539,7 +622,34 @@ class ThemeEngineDialog(QDialog):
         return resolve_palette(self._state())
 
     def _schedule(self):
+        self._dirty = True
         self._timer.start()
+
+    def _apply_now(self):
+        """Make the theme being edited the saved theme (the host writes it)."""
+        self._timer.stop()
+        self.themeApplied.emit(self._state())
+        self._dirty = False
+
+    def reject(self):
+        # Close button, Esc and the window X all end here.
+        if self._dirty:
+            box = QMessageBox(QMessageBox.Question, "Apply before closing?",
+                              "This theme has changes that are not applied. "
+                              "Apply them before closing?", QMessageBox.NoButton, self)
+            apply_b = box.addButton("Apply", QMessageBox.AcceptRole)
+            box.addButton("Discard", QMessageBox.DestructiveRole)
+            cancel_b = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(apply_b)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is None or clicked is cancel_b:
+                return
+            if clicked is apply_b:
+                self._apply_now()
+            else:
+                self._dirty = False       # Discard: the host puts the saved theme back
+        super().reject()
 
     def _emit_live(self):
         self.themeChanged.emit(self._state())
@@ -556,8 +666,37 @@ class ThemeEngineDialog(QDialog):
         pal = self._pal()
         for key, chip in self._chips.items():
             chip.set_color(pal[key], pal["border_hi"])
-            if key in LOW_CONTRAST_CHIPS:
-                chip.warn.setVisible(contrast(pal[key], pal["bg_base"]) < MIN_TEXT_CONTRAST)
+            rule = AA_RULES.get(key)
+            if rule:
+                need, surfaces = rule
+                ratio = _min_contrast(pal[key], [pal[b] for b in surfaces])
+                chip.warn.setText(f"contrast {ratio:.1f}:1, AA needs {need:g}:1")
+                chip.warn.setVisible(ratio < need)
+        self.fix_btn.setEnabled(bool(_aa_repair(pal)))
+
+    def _aa_fix(self):
+        """Apply _aa_repair to the chips being edited. Returns the labels of
+        the chips that changed (empty when nothing needed fixing)."""
+        fixes = _aa_repair(self._pal())
+        for key, value in fixes.items():
+            if key == "accent":
+                self._accent = value
+            else:
+                self._tokens[key] = value
+        names = dict(CHIPS)
+        return [names[k] for k in fixes]
+
+    def _fix_contrast(self):
+        before = (self._accent, dict(self._tokens))
+        fixed = self._aa_fix()
+        if not fixed:
+            self.status.setText("Contrast already meets WCAG AA.")
+            return
+        self._undo = before
+        self.undo_btn.setEnabled(True)
+        self._refresh_chips()
+        self._schedule()
+        self.status.setText("Adjusted " + ", ".join(fixed).lower() + " to meet WCAG AA.")
 
     def _set_chip(self, key, hex_value):
         if not QColor(hex_value).isValid():
@@ -618,8 +757,10 @@ class ThemeEngineDialog(QDialog):
                 self._accent = value
             else:
                 self._tokens[key] = value
+        fixed = self._aa_fix()              # Fill and Scramble always land on AA
         self._refresh_chips()
         self._schedule()
+        return fixed
 
     def _undo_last(self):
         if self._undo is None:
@@ -635,12 +776,15 @@ class ThemeEngineDialog(QDialog):
         suggested = suggest_chips(self._extracted, smart=True)
         if not suggested:
             return
-        self._apply_chips(suggested)
+        fixed = self._apply_chips(suggested)
         if suggested.get("accent") not in self._extracted:
-            self.status.setText("The image had no strong accent color, so a complementary one "
-                                "was generated. Click any chip to adjust it.")
+            msg = ("The image had no strong accent color, so a complementary one "
+                   "was generated. Click any chip to adjust it.")
         else:
-            self.status.setText("Filled from the image. Click any chip to adjust it.")
+            msg = "Filled from the image. Click any chip to adjust it."
+        if fixed:
+            msg += " Adjusted " + ", ".join(fixed).lower() + " to meet WCAG AA."
+        self.status.setText(msg)
 
     def _scramble(self):
         """Shuffle colors across the seven chips. The pool is the extracted
@@ -669,8 +813,11 @@ class ThemeEngineDialog(QDialog):
         bg = mapping["bg_base"]
         mapping["text"] = _readable_text(mapping["text"], bg)
         mapping["text_muted"] = _readable_muted(mapping["text_muted"], mapping["text"], bg)
-        self._apply_chips(mapping)
-        self.status.setText("Scrambled. Press Scramble again for another arrangement, or Undo.")
+        fixed = self._apply_chips(mapping)
+        msg = "Scrambled. Press Scramble again for another arrangement, or Undo."
+        if fixed:
+            msg += " Adjusted " + ", ".join(fixed).lower() + " to meet WCAG AA."
+        self.status.setText(msg)
 
     def _show_swatches(self, colors):
         while self._swatch_row.count():
@@ -769,4 +916,5 @@ class ThemeEngineDialog(QDialog):
         self.name_edit.setText(display)
         self._scan_files(select=str(target))      # new file shows in the dropdown, selected
         self.themeSaved.emit(str(target))
-        self.status.setText(f"Saved \u201c{display}\u201d as {target.name}.")
+        self._apply_now()                         # Save = Apply: one click does both
+        self.status.setText(f"Saved \u201c{display}\u201d as {target.name} and applied it.")

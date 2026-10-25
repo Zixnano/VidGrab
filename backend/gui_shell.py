@@ -90,9 +90,20 @@ COLUMN = 210   # width of the controls column
 # stays white unless each top-level window opts in to the immersive dark mode
 # through DWM. No custom frameless title bar: the standard one just goes dark.
 # ---------------------------------------------------------------------------
-def apply_dark_titlebar(widget, dark=True):
+def _colorref(hex_value):
+    """'#rrggbb' -> Windows COLORREF (0x00BBGGRR), or None if unparseable."""
+    c = QColor(hex_value)
+    if not c.isValid():
+        return None
+    return (c.blue() << 16) | (c.green() << 8) | c.red()
+
+
+def apply_dark_titlebar(widget, dark=True, caption=None, text=None):
     """Switch one top-level window's native title bar to dark (or back to
-    light). Returns True when Windows accepted it. A no-op off Windows."""
+    light). `caption` / `text` ('#rrggbb') also color the bar and its title
+    on Windows 11, so every window matches the theme exactly instead of just
+    being black or white. Returns True when Windows accepted the dark mode.
+    A no-op off Windows."""
     if sys.platform != "win32":
         return False
     try:
@@ -107,6 +118,14 @@ def apply_dark_titlebar(widget, dark=True):
             if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
                 ok = True
                 break
+        # Windows 11 (build 22000+) only; older builds return an error that is
+        # ignored, and keep the plain dark / light bar from above.
+        # DWMWA_BORDER_COLOR = 34, DWMWA_CAPTION_COLOR = 35, DWMWA_TEXT_COLOR = 36
+        for attr, col in ((35, caption), (34, caption), (36, text)):
+            ref = _colorref(col) if col else None
+            if ref is not None:
+                c_ref = ctypes.c_uint(ref)
+                dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(c_ref), ctypes.sizeof(c_ref))
         if ok:
             # Repaint the frame so the change shows without a focus change.
             SWP = 0x0002 | 0x0001 | 0x0004 | 0x0020 | 0x0010   # NOMOVE|NOSIZE|NOZORDER|FRAMECHANGED|NOACTIVATE
@@ -119,30 +138,54 @@ def apply_dark_titlebar(widget, dark=True):
 class DarkTitleBarFilter(QObject):
     """Application-wide event filter: every normal top-level window (main
     window, dialogs, message boxes) gets the title bar matching the theme the
-    moment it is shown. `dark_fn()` says whether the current theme is dark."""
+    moment it is shown. `dark_fn()` says whether the current theme is dark;
+    `colors_fn()` (optional) returns (caption, text) hex colors for the bar.
+    The bar is re-applied whenever a window is shown or activated, so dialogs
+    that were created before a theme change cannot keep a stale bar."""
+    _TYPES = (Qt.Window, Qt.Dialog, Qt.Tool)
 
-    def __init__(self, dark_fn, parent=None):
+    def __init__(self, dark_fn, parent=None, colors_fn=None):
         super().__init__(parent)
         self._dark_fn = dark_fn
+        self._colors_fn = colors_fn
+
+    def _apply(self, w):
+        """Apply the current theme's bar to `w`, skipping work when this
+        window already has exactly this look."""
+        flags = w.windowFlags()
+        if w.windowType() not in self._TYPES or (flags & Qt.FramelessWindowHint):
+            return
+        dark = bool(self._dark_fn())
+        cap = txt = None
+        if self._colors_fn is not None:
+            try:
+                cap, txt = self._colors_fn()
+            except Exception:
+                cap = txt = None
+        key = f"{int(dark)}|{cap}|{txt}"   # a str: Qt properties turn tuples into lists
+        if w.property("_vg_titlebar") == key and w.isVisible():
+            return
+        apply_dark_titlebar(w, dark, cap, txt)
+        w.setProperty("_vg_titlebar", key)
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.Show and isinstance(obj, QWidget) and obj.isWindow():
+        if (event.type() in (QEvent.Show, QEvent.WindowActivate)
+                and isinstance(obj, QWidget) and obj.isWindow()):
             try:
-                flags = obj.windowFlags()
-                if (obj.windowType() in (Qt.Window, Qt.Dialog)
-                        and not (flags & Qt.FramelessWindowHint)):
-                    apply_dark_titlebar(obj, bool(self._dark_fn()))
+                self._apply(obj)
             except Exception:
                 pass
         return False
 
     def refresh(self):
-        """Re-apply to every open window (theme changed light <-> dark)."""
+        """Re-apply to every open window (the theme changed)."""
         from PySide6.QtWidgets import QApplication
         for w in QApplication.topLevelWidgets():
-            if w.isVisible() and w.windowType() in (Qt.Window, Qt.Dialog) \
-                    and not (w.windowFlags() & Qt.FramelessWindowHint):
-                apply_dark_titlebar(w, bool(self._dark_fn()))
+            if w.isVisible():
+                try:
+                    self._apply(w)
+                except Exception:
+                    pass
 
 
 class _Backlight(QWidget):

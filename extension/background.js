@@ -39,7 +39,7 @@ self.fetch = function (input, init) {
 // read lands it holds the defaults, so nothing is dropped on a cold wake.
 importScripts("vgsettings.js");
 let VGCFG = vgNormalize({});
-chrome.storage.local.get(VG_SETTINGS_KEY).then(
+const vgcfgReady = chrome.storage.local.get(VG_SETTINGS_KEY).then(
   (st) => { VGCFG = vgNormalize(st[VG_SETTINGS_KEY]); },
   () => {}
 );
@@ -409,20 +409,39 @@ async function cookieHeaderForItem(url, pageUrl) {
 const HEALTH_CACHE_MS = 30000;
 let lastHealthCheck = 0;   // timestamp of the last successful /health, 0 = none / last one failed
 
-async function checkBackend() {
-  try {
-    const res = await fetch(`${BACKEND_BASE}/health`, { method: "GET" });
-    lastHealthCheck = res.ok ? Date.now() : 0;
-    return res.ok;
-  } catch (e) {
-    lastHealthCheck = 0;
-    return false;
-  }
+// v4.4: one /health probe at a time. Many tabs and frames (the blob-hook state
+// query, popups, sends) can ask at once, most of all right after browser start
+// when the app may not be up yet; they now share one request, and a failure is
+// remembered for a few seconds so a dead app is not hammered by every frame.
+let _healthInFlight = null;
+let lastHealthFail = 0;   // timestamp of the last failed /health, 0 = none / last one passed
+const HEALTH_FAIL_CACHE_MS = 5000;
+
+function checkBackend() {
+  if (_healthInFlight) return _healthInFlight;
+  const p = (async () => {
+    try {
+      const res = await fetch(`${BACKEND_BASE}/health`, { method: "GET" });
+      lastHealthCheck = res.ok ? Date.now() : 0;
+      lastHealthFail = res.ok ? 0 : Date.now();
+      return res.ok;
+    } catch (e) {
+      lastHealthCheck = 0;
+      lastHealthFail = Date.now();
+      return false;
+    }
+  })();
+  _healthInFlight = p;
+  const clear = () => { if (_healthInFlight === p) _healthInFlight = null; };
+  p.then(clear, clear);
+  return p;
 }
 
-// Same as checkBackend, but trusts a successful check made < 30 s ago.
+// Same as checkBackend, but trusts a successful check made < 30 s ago, and a
+// failed one made < 5 s ago (state queries only; real sends call checkBackend).
 async function checkBackendCached() {
   if (lastHealthCheck && Date.now() - lastHealthCheck < HEALTH_CACHE_MS) return true;
+  if (lastHealthFail && Date.now() - lastHealthFail < HEALTH_FAIL_CACHE_MS) return false;
   return checkBackend();
 }
 
@@ -581,6 +600,7 @@ function ensureContextMenus() {
 }
 chrome.runtime.onInstalled.addListener(ensureContextMenus);
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  markGesture();   // v4.4: a menu click is user input
   // v4.2: right-clicking an image skips the DOM and the Add dialog: srcUrl
   // goes straight to the queue. Links, video and audio keep the old path.
   if (info.mediaType === "image" && info.srcUrl) {
@@ -654,7 +674,12 @@ function pickLargestItem(items) {
 }
 
 chrome.commands.onCommand.addListener(async (command, tab) => {
+  markGesture();   // v4.4: a shortcut is user input
   try {
+    if (command === "toggle-intercept") {   // v4.4: works on any tab, even a non-http one
+      await toggleIntercept();
+      return;
+    }
     let t = tab;
     if (!t || !t.id || !t.url) {
       [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -752,18 +777,140 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
+// ---- v4.4: download-interceptor gate ---------------------------------------
+// The interceptor used to cancel and forward EVERY download the browser
+// created, including ones nobody asked for: resumed or restored items, and
+// files that restored tabs (X, Claude, DeepSeek...) trigger while they load.
+// That flooded the app's queue at browser start. A download is now handed
+// over only when ALL of these hold:
+//   - it was created by the browser, not by an extension (no loops with other
+//     download managers, none with our own re-issue);
+//   - it is a fresh in_progress item that started in THIS browser session;
+//   - it is not on the user's ignore list (Settings > Downloads);
+//   - a real user action (trusted click, key press, right-click, shortcut or
+//     menu pick) happened in the last 30 s, unless the user turned that
+//     requirement off. content.js reports the actions; page scripts can't
+//     fake them (isTrusted);
+//   - it is not a repeat of one handed over in the last 10 s, and the burst
+//     cap (25 per 30 s) hasn't been hit.
+// Everything else is left to the browser, untouched.
+const SESSION_START_KEY = "vgSessionStart";
+const GESTURE_KEY = "vgLastGesture";
+const GESTURE_WINDOW_MS = 30000;
+const INTERCEPT_DEDUP_MS = 10000;
+const BURST_MAX = 25;
+const BURST_MS = 30000;
+let sessionStartMs = 0;
+let lastGestureAt = 0;
+let _gesturePersistAt = 0;
+let burstTimes = [];
+const RECENT_INTERCEPT = new Map();   // url -> time it was handed over
+
+// storage.session survives service-worker restarts but not a browser restart,
+// so it is the right place for "when did this browser session begin".
+const sessionReady = (async () => {
+  try {
+    const st = await chrome.storage.session.get([SESSION_START_KEY, GESTURE_KEY]);
+    sessionStartMs = Number(st[SESSION_START_KEY]) || 0;
+    if (!sessionStartMs) {
+      sessionStartMs = Date.now();
+      await chrome.storage.session.set({ [SESSION_START_KEY]: sessionStartMs });
+    }
+    lastGestureAt = Math.max(lastGestureAt, Number(st[GESTURE_KEY]) || 0);
+  } catch (e) {
+    if (!sessionStartMs) sessionStartMs = Date.now();
+  }
+})();
+chrome.runtime.onStartup.addListener(() => {
+  sessionStartMs = Date.now();
+  try { chrome.storage.session.set({ [SESSION_START_KEY]: sessionStartMs }).catch(() => {}); } catch (e) {}
+});
+
+function markGesture() {
+  const now = Date.now();
+  lastGestureAt = now;
+  if (now - _gesturePersistAt > 2000) {   // persisted for cold service-worker wakes
+    _gesturePersistAt = now;
+    try { chrome.storage.session.set({ [GESTURE_KEY]: now }).catch(() => {}); } catch (e) {}
+  }
+}
+
+async function hasRecentGesture() {
+  if (Date.now() - lastGestureAt < GESTURE_WINDOW_MS) return true;
+  try {
+    const st = await chrome.storage.session.get(GESTURE_KEY);
+    const t = Number(st[GESTURE_KEY]) || 0;
+    if (t > lastGestureAt) lastGestureAt = t;
+  } catch (e) {}
+  return Date.now() - lastGestureAt < GESTURE_WINDOW_MS;
+}
+
+let _ignoreSrc = null, _ignoreHosts = [], _ignoreExts = [];
+function hostOf(u) {
+  try { return new URL(u).hostname.toLowerCase(); } catch (e) { return ""; }
+}
+function isIgnoredDownload(item) {
+  const src = VGCFG.interceptIgnore || "";
+  if (src !== _ignoreSrc) {
+    _ignoreSrc = src;
+    _ignoreHosts = [];
+    _ignoreExts = [];
+    for (const tok of src.toLowerCase().split(/[\s,;]+/)) {
+      if (!tok) continue;
+      if (tok[0] === ".") _ignoreExts.push(tok.slice(1));
+      else _ignoreHosts.push(tok.replace(/^https?:\/\//, "").replace(/^\*\./, "").replace(/\/.*$/, ""));
+    }
+  }
+  if (!_ignoreHosts.length && !_ignoreExts.length) return false;
+  const hosts = [hostOf(item.url), hostOf(item.finalUrl || ""), hostOf(item.referrer || "")];
+  for (const h of _ignoreHosts) {
+    if (!h) continue;
+    for (const x of hosts) if (x && (x === h || x.endsWith("." + h))) return true;
+  }
+  if (_ignoreExts.length) {
+    let path = "";
+    try { path = new URL(item.url).pathname.toLowerCase(); } catch (e) {}
+    const name = (item.filename || "").toLowerCase();
+    for (const ext of _ignoreExts) {
+      if (ext && (path.endsWith("." + ext) || name.endsWith("." + ext))) return true;
+    }
+  }
+  return false;
+}
+
+// Shortcut: flip the interceptor from the keyboard (no default key; bind one
+// at chrome://extensions/shortcuts or vivaldi://extensions/shortcuts).
+async function toggleIntercept() {
+  try {
+    const st = await chrome.storage.local.get(VG_SETTINGS_KEY);
+    const cur = vgNormalize(st[VG_SETTINGS_KEY]);
+    const next = { ...cur, interceptDownloads: !cur.interceptDownloads };
+    await chrome.storage.local.set({ [VG_SETTINGS_KEY]: next });
+    chrome.notifications.create("", {
+      type: "basic",
+      iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+      title: "Video Grabber",
+      message: next.interceptDownloads
+        ? "Download interception is ON."
+        : "Download interception is OFF. Browser downloads stay in the browser.",
+    });
+  } catch (e) { /* storage or notifications unavailable: nothing to do */ }
+}
+
 chrome.downloads.onCreated.addListener(async (item) => {
   console.debug("[VG] onCreated fired:", (item.url || "").slice(0, 120),
-                "byExtensionId:", item.byExtensionId);
+                "byExtensionId:", item.byExtensionId, "state:", item.state);
   const t0 = Date.now();
   // Only true on the very first event after a cold service-worker wake,
-  // before the startup read above has landed. Normally skipped (no await).
+  // before the startup reads above have landed. Normally skipped (no await).
   if (!interceptLoaded) await interceptReady;
   if (!interceptDownloads) return;
 
   if (!item.url) return;
   if (item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
-  if (item.byExtensionId === chrome.runtime.id) return;
+  // v4.4: any extension's download, not just ours. Those are programmatic
+  // (another download manager, a re-issue) and must never be pulled back in.
+  if (item.byExtensionId) return;
 
   // Every intercepted download opens the app's Add dialog; the app decides
   // what to do with it. Only the backend's own traffic (localhost / raw IP)
@@ -772,6 +919,44 @@ chrome.downloads.onCreated.addListener(async (item) => {
   const isLocalhost = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])/i.test(item.url);
   const isIpAddress = /^https?:\/\/\d{1,3}(\.\d{1,3}){3}/.test(item.url);
   if (isLocalhost || isIpAddress) return;
+
+  // v4.4 gate (see the block comment above).
+  if (item.state && item.state !== "in_progress") return;
+  await Promise.all([sessionReady, vgcfgReady]);
+  const started = item.startTime ? Date.parse(item.startTime) : NaN;
+  if (Number.isFinite(started) && started < sessionStartMs - 3000) {
+    console.debug("[VG] intercept skipped: started before this browser session");
+    return;
+  }
+  if (isIgnoredDownload(item)) {
+    console.debug("[VG] intercept skipped: on the ignore list");
+    return;
+  }
+  if (VGCFG.interceptNeedsGesture && !(await hasRecentGesture())) {
+    console.debug("[VG] intercept skipped: no user action in the last",
+                  GESTURE_WINDOW_MS / 1000, "s (browser-initiated download)");
+    return;
+  }
+  const now = Date.now();
+  const prevAt = RECENT_INTERCEPT.get(item.url);
+  if (prevAt && now - prevAt < INTERCEPT_DEDUP_MS) {
+    // Already handed over a moment ago: drop the browser's duplicate copy.
+    try { await chrome.downloads.cancel(item.id); } catch (e) {}
+    try { await chrome.downloads.erase({ id: item.id }); } catch (e) {}
+    return;
+  }
+  burstTimes = burstTimes.filter((t) => now - t < BURST_MS);
+  if (burstTimes.length >= BURST_MAX) {
+    console.warn("[VG] intercept burst cap hit; leaving this download to the browser");
+    return;
+  }
+  burstTimes.push(now);
+  RECENT_INTERCEPT.set(item.url, now);
+  if (RECENT_INTERCEPT.size > 200) {
+    for (const [u, ts] of RECENT_INTERCEPT) {
+      if (now - ts >= INTERCEPT_DEDUP_MS) RECENT_INTERCEPT.delete(u);
+    }
+  }
 
   // Cancel first, everything else after: the browser keeps writing until
   // this runs. Note Chrome only creates the download item once the server
@@ -821,14 +1006,21 @@ chrome.downloads.onCreated.addListener(async (item) => {
   console.debug(`[VG] intercept: browser lag ${browserLag}ms, handoff ${Date.now() - t0}ms, ok=${handedOff} cancelled=${cancelled}`);
   if (handedOff) {
     noteFavicon(item.referrer || item.url);
-  } else if (cancelled) {
-    // The browser download was already cancelled: give it back if the app
-    // rejected the handoff so the user's click never just vanishes. When the
-    // cancel failed the browser's copy is complete, so re-issuing would only
-    // create a duplicate.
-    try {
-      chrome.downloads.download({ url: item.url, filename: filename || undefined });
-    } catch (_) {}
+    // v4.4: tidy the browser's downloads list. Only when the cancel worked;
+    // a finished download's entry (cancel failed) stays, it is a real file.
+    if (cancelled) { try { await chrome.downloads.erase({ id: item.id }); } catch (e) {} }
+  } else {
+    RECENT_INTERCEPT.delete(item.url);
+    if (cancelled) {
+      // The browser download was already cancelled: give it back if the app
+      // rejected the handoff so the user's click never just vanishes. When the
+      // cancel failed the browser's copy is complete, so re-issuing would only
+      // create a duplicate.
+      commandNotify("Video Grabber couldn't take that download. Saving it with the browser instead.");
+      try {
+        chrome.downloads.download({ url: item.url, filename: filename || undefined });
+      } catch (_) {}
+    }
   }
 });
 
@@ -997,6 +1189,14 @@ function vgHandleMessage(msg, sender, sendResponse) {
     return true; // async
   }
 
+  if (msg.type === "VG_GESTURE") {
+    // v4.4: content.js saw a trusted click / key press / right-click. Feeds the
+    // download interceptor's gate (see markGesture).
+    markGesture();
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (msg.type === "VG_STATE") {
     // Armed-state query for the blob-download hook (content.js). "intercept"
     // is the mirrored interceptDownloads flag; awaiting interceptReady keeps
@@ -1085,7 +1285,9 @@ function vgHandleMessage(msg, sender, sendResponse) {
 
 chrome.runtime.onMessage.addListener((msg, sender, rawSendResponse) => {
   if (!msg || typeof msg !== "object") return false;
-  console.debug("[VG] onMessage", msg.type, "from", sender && sender.tab ? "tab " + sender.tab.id : "extension page");
+  if (msg.type !== "VG_GESTURE") {
+    console.debug("[VG] onMessage", msg.type, "from", sender && sender.tab ? "tab " + sender.tab.id : "extension page");
+  }
   // Single, guarded responder: one reply at most, and a closed port (the tab
   // navigated away) is logged instead of throwing.
   let responded = false;

@@ -1,4 +1,4 @@
-// vgsettings.js: shared extension settings (v4.3). Loaded by background.js
+// vgsettings.js: shared extension settings (v4.3, extended in v4.4). Loaded by background.js
 // (importScripts), content.js (manifest content_scripts) and popup.html.
 // Stored in chrome.storage.local under VG_SETTINGS_KEY. Always read through
 // vgNormalize() so a missing or damaged value falls back to the defaults.
@@ -14,12 +14,23 @@ const VG_DEFAULTS = {
   snifferMode: "all",      // "all" tabs | "active" tab only
   notifyRecording: true,   // desktop notifications for recordings
   notifyActions: true,     // desktop notifications for shortcuts and right-click sends
-  interceptDownloads: false, // Batch 3: hand every browser download to the app.
+  // Batch 3: hand every browser download to the app. THE one source of truth
+  // for the interceptor: the old standalone "interceptDownloads" storage key is
+  // read once as a migration fallback (background.js, options.js) and never
+  // written again.
+  interceptDownloads: false,
   oneClickMode: false,      // split pill: left half sends immediately, menu arrow hidden
-                           // THE one source of truth for the interceptor: the
-                           // old standalone "interceptDownloads" storage key is
-                           // read once as a migration fallback (background.js,
-                           // options.js) and never written again.
+  // v4.4: only intercept a download that follows a real click / key press /
+  // right-click on a page (or a shortcut / menu action). Downloads the
+  // browser starts by itself, such as session restore, resumed downloads and
+  // page scripts firing on load, are left alone. This is what stops a
+  // startup flood. Turn off only if you start downloads from the browser UI
+  // (address bar) and want those caught too.
+  interceptNeedsGesture: true,
+  // v4.4: never intercept these. Hosts ("example.com" also matches its
+  // subdomains) and file extensions (".exe"), separated by spaces, commas or
+  // new lines.
+  interceptIgnore: "",
 };
 function vgNormalize(raw) {
   const r = (raw && typeof raw === "object") ? raw : {};
@@ -30,6 +41,7 @@ function vgNormalize(raw) {
     const n = (typeof r[k] === "number") ? r[k] : NaN;
     return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : d[k];
   };
+  const str = (k, max) => (typeof r[k] === "string" ? r[k].slice(0, max) : d[k]);
   return {
     pillVisible: bool("pillVisible"),
     pillCorner: pick("pillCorner", ["", "tl", "tr", "bl", "br"]),
@@ -43,5 +55,7 @@ function vgNormalize(raw) {
     notifyActions: bool("notifyActions"),
     interceptDownloads: bool("interceptDownloads"),
     oneClickMode: bool("oneClickMode"),
+    interceptNeedsGesture: bool("interceptNeedsGesture"),
+    interceptIgnore: str("interceptIgnore", 2000),
   };
 }

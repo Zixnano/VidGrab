@@ -51,6 +51,16 @@
   </div>
   <div class="card">
     <div class="checkbox-row">
+      <input type="checkbox" id="interceptNeedsGesture" />
+      <label for="interceptNeedsGesture">Only intercept downloads that follow a click or key press</label>
+    </div>
+    <p class="hint">On by default. Downloads the browser starts by itself (restored tabs at startup, resumed downloads, scripts firing on page load) are left to the browser instead of flooding the app. Turn off only if you want downloads started from the browser's own UI (address bar) caught too.</p>
+    <label for="interceptIgnore" style="display:block; margin-top:10px;">Never intercept these</label>
+    <input id="interceptIgnore" type="text" placeholder="example.com .exe .iso" />
+    <p class="hint">Sites (subdomains included) and file extensions, separated by spaces or commas.</p>
+  </div>
+  <div class="card">
+    <div class="checkbox-row">
       <input type="checkbox" id="blobHookEnabled" />
       <label for="blobHookEnabled">Catch in-page (blob) downloads on claude.ai</label>
     </div>

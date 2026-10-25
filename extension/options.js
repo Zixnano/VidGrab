@@ -29,10 +29,27 @@
       [VG_SETTINGS_KEY]: { ...cur, interceptDownloads: interceptCheckbox.checked },
     });
   });
+  // v4.4: the click-required switch and the ignore list live in vgSettings too.
+  const gestureCheckbox = document.getElementById("interceptNeedsGesture");
+  const ignoreInput = document.getElementById("interceptIgnore");
+  {
+    const cur = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    gestureCheckbox.checked = cur.interceptNeedsGesture;
+    ignoreInput.value = cur.interceptIgnore;
+  }
+  async function saveVg(patch) {
+    const cur = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    await chrome.storage.local.set({ [VG_SETTINGS_KEY]: vgNormalize({ ...cur, ...patch }) });
+  }
+  gestureCheckbox.addEventListener("change", () => saveVg({ interceptNeedsGesture: gestureCheckbox.checked }));
+  ignoreInput.addEventListener("change", () => saveVg({ interceptIgnore: ignoreInput.value }));
   // Keep this page honest if the popup toggle flips the switch meanwhile.
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && changes[VG_SETTINGS_KEY]) {
-      interceptCheckbox.checked = !!vgNormalize(changes[VG_SETTINGS_KEY].newValue).interceptDownloads;
+      const nv = vgNormalize(changes[VG_SETTINGS_KEY].newValue);
+      interceptCheckbox.checked = !!nv.interceptDownloads;
+      gestureCheckbox.checked = nv.interceptNeedsGesture;
+      if (document.activeElement !== ignoreInput) ignoreInput.value = nv.interceptIgnore;
     }
   });
 

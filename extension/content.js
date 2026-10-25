@@ -54,6 +54,28 @@
     }
   }
 
+  // v4.4: tell background.js when the user really did something (trusted click,
+  // key press, right-click, touch). The download interceptor only takes over a
+  // browser download that follows such an action, so downloads the browser
+  // starts by itself (session restore, page scripts on load) are left alone.
+  // Throttled to one message per 5 s, fire-and-forget, never throws.
+  (() => {
+    let last = 0;
+    const report = (e) => {
+      if (!e.isTrusted) return;
+      const now = Date.now();
+      if (now - last < 5000) return;
+      last = now;
+      try {
+        const p = chrome.runtime.sendMessage({ type: "VG_GESTURE" });
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      } catch (err) { /* extension reloaded: nothing to report to */ }
+    };
+    for (const ev of ["pointerdown", "keydown", "contextmenu", "touchstart"]) {
+      try { window.addEventListener(ev, report, { capture: true, passive: true }); } catch (e) {}
+    }
+  })();
+
   // Theme colors copied from the app (see background.js refreshTheme).
   let TH = { bg_base: "#0a0a0f", bg_elevated: "#1a1a24", border_hi: "#33333f", text: "#e6e6eb",
              text_muted: "#8a8a95", accent: "#26c6da", success: "#4caf50", error: "#ef5350",
@@ -2434,9 +2456,17 @@
         // there (not the old standalone key) is what re-arms the hook.
         if (c.blobHookEnabled || c[VG_SETTINGS_KEY] || c.apiToken) syncArmed(true);
       });
+      // v4.4: the first state query waits a random moment and is skipped in
+      // hidden tabs. A restored session used to fire one per frame of every
+      // claude.ai tab at the same instant; visibilitychange, pointerdown and
+      // the 15 s timer arm the hook when the tab is actually used.
+      const firstSync = () => {
+        if (document.hidden) return;
+        setTimeout(() => syncArmed(true), 150 + Math.random() * 1500);
+      };
       chrome.storage.local.get("blobHookEnabled").then((st) => {
         hookEnabled = st.blobHookEnabled !== false;
-      }).catch(() => {}).finally(() => syncArmed(true));
-    } catch (e) { syncArmed(true); }
+      }).catch(() => {}).finally(firstSync);
+    } catch (e) { if (!document.hidden) syncArmed(true); }
   })();
 })();

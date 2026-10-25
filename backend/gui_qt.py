@@ -120,7 +120,7 @@ _SVG_PATHS = {
     "queue_play": '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7zm10 7l4-4-4-4v8z"/>',
     "queue_pause": '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7zm10 5v4l-4-2 4-2z"/>',
     "settings": '<path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>',
-    "all": '<path d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z"/>',
+    "all": '<path d="M4 8h4V4H4v4zm6 12h4v-4h-4v4zm-6 0h4v-4H4v4zm0-6h4v-4H4v4zm6 0h4v-4h-4v4zm6-10v4h4V4h-4zm-6 4h4V4h-4v4zm6 6h4v-4h-4v4zm0 6h4v-4h-4v4z"/>',
     "active": '<path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>',
     "finished": '<path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>',
     "unfinished": '<path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/>',
@@ -196,6 +196,15 @@ def _sync_palette(settings=None):
     _STATUS_COLORS.update({"downloading": SUCCESS, "done": SUCCESS, "paused": WARN,
                            "stopped": DANGER, "error": DANGER, "queued": MUTED,
                            "skipped": _PAL["text_dim"]})
+
+
+def _title_bar_colors():
+    """(caption, text) colors for native title bars, from the live theme, so
+    every window matches the app instead of only being light or dark."""
+    try:
+        return _PAL["bg_base"], _PAL["text"]
+    except Exception:
+        return None, None
 
 
 def _title_bar_dark():
@@ -328,6 +337,41 @@ def _bring_to_front(widget):
         pass
 
 
+def _app_icon_path():
+    """icon.ico next to this module (CI copies it into app\\), else the
+    usual places next to the source. None when no icon is shipped."""
+    for base in (Path(__file__).resolve().parent, HOME):
+        for rel in ("icon.ico", "icons/icon.ico", "assets/icon.ico"):
+            cand = base / rel
+            try:
+                if cand.is_file():
+                    return cand
+            except OSError:
+                continue
+    return None
+
+
+def _apply_app_icon(app, window=None):
+    """Give the Qt app and window the Video Grabber icon (title bar, taskbar,
+    Alt+Tab). Also sets an explicit Windows AppUserModelID so the taskbar
+    groups under this icon instead of python's. Returns the QIcon or None."""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("VideoGrabber.App")
+        except Exception:
+            pass
+    path = _app_icon_path()
+    if path is None:
+        return None
+    ic = QIcon(str(path))
+    if ic.isNull():
+        return None
+    app.setWindowIcon(ic)
+    if window is not None:
+        window.setWindowIcon(ic)
+    return ic
+
+
 def _icons_dir():
     try:
         from settings import icons_dir
@@ -425,13 +469,28 @@ def _in_queue_view(j):
     return _is_active(j) or j.get("status") in ("queued", "held")
 
 
-def _sidebar_counts(items):
+def _sidebar_counts(items, hide_hours=0):
+    """Counts for the sidebar. All and Unfinished leave out failed downloads
+    older than `hide_hours` (the hide_old_errors_hours setting), exactly like
+    the table does in those two views (see MainWindow.apply_filter). The
+    Failed view and the category views still show every failure, so their
+    counts stay complete."""
+    try:
+        hrs = float(hide_hours or 0)
+    except (TypeError, ValueError):
+        hrs = 0
+    shown = items
+    if hrs > 0:
+        cutoff = time.time() - hrs * 3600
+        shown = [j for j in items
+                 if not (j.get("status") == "error"
+                         and (j.get("failed_ts") or j.get("created_ts") or 0) < cutoff)]
     c = {
-        "All": len(items),
+        "All": len(shown),
         "Active": sum(1 for j in items if _is_active(j)),
         "Queue": sum(1 for j in items if _in_queue_view(j)),
         "Finished": sum(1 for j in items if j.get("status") == "done"),
-        "Unfinished": sum(1 for j in items if j.get("status") != "done"),
+        "Unfinished": sum(1 for j in shown if j.get("status") != "done"),
         "Failed": sum(1 for j in items if j.get("status") == "error"),
     }
     for cat in CATEGORIES:
@@ -919,6 +978,30 @@ class DownloadModel(QAbstractTableModel):
             return QMimeData()  # empty drag payload, never None
         mime = QMimeData()
         mime.setUrls(urls)
+        return mime
+
+    def mimeDataForJobs(self, ids):
+        """File-drag payload for the given job ids (in the order given). The
+        table calls this from _start_file_drag. Ids, not rows, because the
+        model refreshes every second and rows can move before a drag starts.
+        Only finished jobs whose file still exists are carried."""
+        by_id = {j.get("id"): j for j in self.items}
+        urls, seen = [], set()
+        for jid in ids:
+            j = by_id.get(jid)
+            if j is None or j.get("status") != "done":
+                continue
+            try:
+                path = _path_for(j)
+                if not path.exists() or str(path) in seen:
+                    continue
+            except (OSError, ValueError, KeyError):
+                continue
+            seen.add(str(path))
+            urls.append(QUrl.fromLocalFile(str(path)))
+        mime = QMimeData()
+        if urls:
+            mime.setUrls(urls)
         return mime
 
 
@@ -2424,6 +2507,8 @@ class SettingsDialog(QDialog):
             _fams = []
         for _fam in _fams:
             self.app_font.addItem(_fam, userData=_fam)
+            # Live preview inside the dropdown: each family drawn in itself.
+            self.app_font.setItemData(self.app_font.count() - 1, QFont(_fam), Qt.FontRole)
         _saved_font = str(s.get("app_font", "") or "")
         if _saved_font and self.app_font.findData(_saved_font) < 0:
             self.app_font.addItem(_saved_font, userData=_saved_font)   # not installed here: keep it
@@ -2432,12 +2517,24 @@ class SettingsDialog(QDialog):
         self.app_font.setMaxVisibleItems(20)
         self.app_font.setToolTip("Overrides the theme's font everywhere in the app.")
         gl.addRow("App Font", self.app_font)
+        # Test notepad: type here to try the chosen font at the chosen size.
+        # Nothing typed here is saved.
+        self.font_notepad = QTextEdit()
+        self.font_notepad.setAcceptRichText(False)
+        self.font_notepad.setFixedHeight(76)
+        self.font_notepad.setPlaceholderText(
+            "Type here to try this font. The quick brown fox jumps over the lazy dog. 0123456789")
+        self.font_notepad.setToolTip("Test area for the App Font and Text size. Not saved.")
+        gl.addRow("Test text", self.font_notepad)
         # Batch 3: live font preview. The dropdown re-skins the running app
         # the moment it changes; nothing is written to settings until Save,
         # and Cancel puts the saved font back (see done() below).
         self._saved_app_font = _saved_font
         self._font_preview_on = False
         self.app_font.currentIndexChanged.connect(self._preview_app_font)
+        self.app_font.currentIndexChanged.connect(lambda *_: self._update_font_notepad())
+        self.text_scale.valueChanged.connect(lambda *_: self._update_font_notepad())
+        self._update_font_notepad()
         tabs.addTab(g, "General")
 
         # ---- Theme tab (gui_theme_page.py) ----
@@ -3142,6 +3239,23 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
+    def _update_font_notepad(self):
+        """Show the test notepad (and the Aa label) in the font and size the
+        dropdown and slider currently hold, before anything is saved."""
+        pad = getattr(self, "font_notepad", None)
+        if pad is None:
+            return
+        fam = (self.app_font.currentData() or "").replace('"', "").replace("\\", "")
+        size = max(9, int(10 * (self.text_scale.value() / 100)))
+        css = f"font-size: {size}pt;"
+        if fam:
+            css = f'font-family: "{fam}"; ' + css
+        pad.setStyleSheet(css)
+        try:
+            self.text_preview.setStyleSheet(css)
+        except Exception:
+            pass
+
     def _update_text_preview(self, val):
         """Batch 4: scale the "Aa Preview" label with the Text size slider."""
         self.text_preview.setStyleSheet(
@@ -3166,11 +3280,37 @@ class SettingsDialog(QDialog):
         dlg = ThemeEngineDialog(load_settings(), self)
         dlg.themeChanged.connect(self._theme_engine_live)
         dlg.themeSaved.connect(lambda _path: self.theme_page._scan_themes())   # new theme shows at once
+        dlg.themeApplied.connect(self._theme_engine_apply)
         try:
             dlg.exec()
         finally:
             reapply_theme()                    # back to the saved theme, however the engine closed
             self.theme_page._scan_themes()     # so a new custom.json shows in the Theme tab
+
+    def _theme_engine_apply(self, state):
+        """Save = Apply: the engine's theme becomes the saved theme. Writes the
+        three theme settings, then brings the Theme tab in step so a later
+        Settings Save cannot write the old theme back over it."""
+        pg = self.theme_page
+        preset = state.get("theme_preset")
+        accent = state.get("accent")
+        toks = {k: v for k, v in (state.get("theme_tokens") or {}).items() if v and k != "accent"}
+        if self.api:
+            old = (load_settings().get("theme_tokens") or {})
+            # the server merges dicts key by key: "" clears a color that was dropped
+            send = {k: toks.get(k, "") for k in set(old) | set(toks) if k != "accent"}
+            self.api.save_setting("theme_preset", preset)
+            self.api.save_setting("accent", accent)
+            self.api.save_setting("theme_tokens", send)
+        try:
+            pg._preset, pg._accent, pg._ov = preset, accent, toks
+            for k, tile in pg._tiles.items():
+                tile.setChecked(k == preset)
+            pg.fine_toggle.setChecked(bool(toks))
+            pg._refresh()
+        except Exception:
+            pass
+        reapply_theme()
 
     def _theme_engine_live(self, state):
         from gui_style import build_qss
@@ -5215,7 +5355,7 @@ class MainWindow(QMainWindow):
     def _on_refreshed(self, payload):
         items, settings = payload
         self.all_items = items
-        self.sidebar.set_counts(_sidebar_counts(items))
+        self.sidebar.set_counts(_sidebar_counts(items, settings.get("hide_old_errors_hours", 24)))
         self._gui_settings = settings
         self._track_batch(items)
         # 11.3: re-read every tick — a Settings-dialog toggle propagates
@@ -6068,13 +6208,15 @@ def launch_gui(new_job_hook=None, home_dir=None, show_dialog_hook=None):
     _sync_palette(load_settings())
     _app.setStyleSheet(build_qss(load_settings()))
     _app.setApplicationName("Video Grabber")
+    _apply_app_icon(_app)
     _app.setFont(QFont("Segoe UI", 10))
     _app.setQuitOnLastWindowClosed(False)
     # Batch 4 #4: dark native title bars on the main window and every dialog.
     from gui_shell import DarkTitleBarFilter
-    _app._vg_dark_filter = DarkTitleBarFilter(_title_bar_dark, _app)
+    _app._vg_dark_filter = DarkTitleBarFilter(_title_bar_dark, _app, _title_bar_colors)
     _app.installEventFilter(_app._vg_dark_filter)
     _window = MainWindow()
+    _apply_app_icon(_app, _window)
     _window.show()
     if new_job_hook is not None:
         new_job_hook(_window.new_job_hook())

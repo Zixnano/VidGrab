@@ -842,6 +842,8 @@ async function setupSettings() {
     ["setMicroPos", "microPillPos", "str"],
     ["setMicroSize", "microPillSize", "bool"],
     ["setIntercept", "interceptDownloads", "bool"],
+    ["setNeedsClick", "interceptNeedsGesture", "bool"],
+    ["setIgnore", "interceptIgnore", "str"],
     ["setCorner", "pillCorner", "str"],
     ["setQuality", "defaultQuality", "num"],
     ["setMenuH", "maxMenuHeight", "num"],

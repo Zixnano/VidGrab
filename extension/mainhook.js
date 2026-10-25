@@ -7,16 +7,40 @@
 // app. If anything goes wrong the original click is replayed on a fresh
 // object URL, so the browser still saves the file.
 //
+// v4.4: it also only intercepts a click that follows real user input (a
+// trusted click / key press / touch in the last 15 s, or the browser's own
+// transient user activation). SPA code that builds a blob and clicks an anchor
+// by itself, with nobody asking for a download (state exports, cache
+// writes, startup work in restored tabs), now falls straight through to the
+// browser untouched. No size floor on purpose: a real download from the page
+// (a 200-byte code file, say) must still be caught.
+//
 // The hook only intercepts while "armed". content.js decides that (app
 // running + paired + intercept option on + blobHookEnabled on) and pushes it
 // in. Not armed means every click falls straight through, unchanged.
 (() => {
   const ACK_MS = 1500;   // isolated side must ack within this or we replay natively
   const LRU_CAP = 50;
+  const GESTURE_MS = 15000;  // how long a click / key press keeps the hook willing
 
   let armed = false;
   let secret = null;     // adopted from the first vg-armed message (nuisance barrier only)
   let debug = false;
+
+  // ---- real user input tracking -----------------------------------------
+  // Capture phase on window runs before any page handler, and isTrusted is
+  // false for events a page script dispatches itself.
+  let lastGesture = 0;
+  const markGesture = (e) => { try { if (e && e.isTrusted) lastGesture = Date.now(); } catch (err) {} };
+  for (const ev of ["pointerdown", "mousedown", "keydown", "touchstart", "click"]) {
+    try { window.addEventListener(ev, markGesture, true); } catch (e) {}
+  }
+  const hasGesture = () => {
+    try {
+      if (navigator.userActivation && navigator.userActivation.isActive) return true;
+    } catch (e) {}
+    return Date.now() - lastGesture < GESTURE_MS;
+  };
 
   const dbg = (...a) => { if (debug) { try { console.log("[VG hook]", ...a); } catch (e) {} } };
 
@@ -84,6 +108,25 @@
     }
   }
 
+  // download="" (no name) is common for generated files: build a name from the
+  // Blob's MIME type so the file lands with a usable extension.
+  const TYPE_EXT = {
+    "application/pdf": ".pdf", "application/zip": ".zip", "application/json": ".json",
+    "text/plain": ".txt", "text/markdown": ".md", "text/csv": ".csv", "text/html": ".html",
+    "text/css": ".css", "text/javascript": ".js", "application/javascript": ".js",
+    "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp",
+    "image/svg+xml": ".svg", "video/mp4": ".mp4", "audio/mpeg": ".mp3",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+  };
+  function nameFor(name, blob) {
+    if (name) return name;
+    let ext = "";
+    try { ext = TYPE_EXT[String(blob.type || "").split(";")[0].trim().toLowerCase()] || ""; } catch (e) {}
+    return "download" + ext;
+  }
+
   function blobAnchorInfo(a) {
     try {
       if (!a || typeof a.hasAttribute !== "function" || !a.hasAttribute("download")) return null;
@@ -91,7 +134,7 @@
       if (typeof href !== "string" || !href.startsWith("blob:")) return null;
       const blob = BLOBS.get(href);
       if (!blob) return null;
-      return { blob, filename: a.getAttribute("download") || "" };
+      return { blob, filename: nameFor(a.getAttribute("download") || "", blob) };
     } catch (e) {
       return null;
     }
@@ -102,6 +145,8 @@
     if (!armed || secret === null) return false;
     const info = blobAnchorInfo(a);
     if (!info) return false;
+    if (!hasGesture()) { dbg("no user input, left to the browser"); return false; }
+    try { if (info.blob.size === 0) return false; } catch (e) {}   // nothing to upload
     const id = newId();
     const timer = setTimeout(() => replay(id), ACK_MS);
     PENDING.set(id, { blob: info.blob, filename: info.filename, timer });
@@ -133,6 +178,26 @@
       return Reflect.apply(target, thisArg, args);
     },
   });
+
+  // A person physically clicking a visible <a download href="blob:..."> never
+  // calls .click() from script, so the patches above cannot see it. Catch it
+  // here, in the capture phase on window, before the browser starts the save.
+  // Only trusted clicks (real input), only plain left clicks, and the same
+  // armed / gesture / replay rules as every other path.
+  window.addEventListener("click", (e) => {
+    try {
+      if (!e.isTrusted || e.defaultPrevented || e.button !== 0) return;
+      if (e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return;   // browser shortcuts stay native
+      const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+      let a = null;
+      for (const n of path) {
+        if (n && n.tagName === "A") { a = n; break; }
+      }
+      if (!a || !tryIntercept(a)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    } catch (err) {}
+  }, true);
 
   // ---- messages from content.js (isolated world) -------------------------
   window.addEventListener("message", (e) => {

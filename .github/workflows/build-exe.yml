@@ -120,6 +120,15 @@ jobs:
             $_.Name -notin 'launcher.py','app_host.py','recovery_ui.py'
           } | Copy-Item -Destination "$root/app/"
           if (-not (Test-Path "$root/app/vg_state.py")) { throw "app/vg_state.py missing" }
+          # App icon: the Qt window loads app/icon.ico at runtime (the .spec files
+          # use the same file for the exe). Looks where the specs look.
+          $icon = @('icon.ico', 'icons/icon.ico', 'assets/icon.ico') |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($icon) {
+            Copy-Item $icon "$root/app/icon.ico"
+          } else {
+            Write-Warning "no icon.ico in backend/, backend/icons or backend/assets: the window will use the default icon"
+          }
           Copy-Item -Path updater.bat, restore.bat -Destination "$root/"
           Set-Content "$root/install-version.txt" "v${env:GITHUB_RUN_NUMBER}" -NoNewline
           Copy-Item -Path 'dist-supervisor/VideoGrabber/VideoGrabber.exe' -Destination "$root/VideoGrabber.exe"
