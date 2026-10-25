@@ -1276,6 +1276,37 @@ class DownloadTable(QTableView):
         if cur is not None:
             sm.setCurrentIndex(cur, QItemSelectionModel.NoUpdate)
 
+    def _drag_pixmap(self, names):
+        """Small rounded badge shown under the cursor during a file drag:
+        the file name for one file, "N files" for several. Returns a null
+        QPixmap on any failure so the drag still starts without it."""
+        try:
+            from PySide6.QtGui import QFontMetrics
+            if not names:
+                return QPixmap()
+            text = names[0] if len(names) == 1 else f"{len(names)} files"
+            if len(text) > 40:
+                text = text[:37] + "..."
+            font = QFont(self.font())
+            fm = QFontMetrics(font)
+            w, h = fm.horizontalAdvance(text) + 28, fm.height() + 14
+            ratio = self.devicePixelRatioF()
+            pm = QPixmap(int(w * ratio), int(h * ratio))
+            pm.setDevicePixelRatio(ratio)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setPen(QColor(255, 255, 255, 90))
+            p.setBrush(QColor(32, 36, 44, 235))
+            p.drawRoundedRect(QRect(0, 0, w - 1, h - 1), 8, 8)
+            p.setPen(QColor(255, 255, 255))
+            p.setFont(font)
+            p.drawText(QRect(0, 0, w, h), Qt.AlignCenter, text)
+            p.end()
+            return pm
+        except Exception:
+            return QPixmap()
+
     def _start_file_drag(self, pressed_id):
         model = self.model()
         rows = sorted({i.row() for i in self.selectionModel().selectedIndexes()})
@@ -1286,10 +1317,35 @@ class DownloadTable(QTableView):
         if not mime.hasUrls():
             return
         # Windows drop fix: Explorer/Discord want plain text alongside the URLs.
-        mime.setText("\n".join(u.toLocalFile() for u in mime.urls()))
+        # Test switch: set VG_DRAG_NOTEXT=1 to drop the text/plain part and see
+        # whether Discord's stop icon goes away (urls only, like Explorer).
+        if os.environ.get("VG_DRAG_NOTEXT") != "1":
+            mime.setText("\n".join(u.toLocalFile() for u in mime.urls()))
         drag = QDrag(self)
         drag.setMimeData(mime)
-        drag.exec(Qt.CopyAction)
+        # Electron/Chromium targets (Discord, Slack, Telegram Desktop) behave
+        # better when the drag carries a real image, so give it a small badge.
+        pm = self._drag_pixmap([Path(u.toLocalFile()).name for u in mime.urls()])
+        if not pm.isNull():
+            drag.setPixmap(pm)
+            ratio = pm.devicePixelRatio() or 1.0
+            drag.setHotSpot(QPoint(14, int(pm.height() / ratio / 2)))
+        # Copy only, on purpose: offering MoveAction lets Explorer MOVE the file
+        # out of the download folder when you drop on the same drive.
+        res = drag.exec(Qt.CopyAction)
+        try:
+            # What the drop target answered (CopyAction = accepted, IgnoreAction
+            # = the stop icon), plus elevation, since an admin-run app cannot
+            # drop onto a normal-user app (Windows UIPI).
+            try:
+                _admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                _admin = None
+            from settings import log as _dlog
+            _dlog(f"file drag: {len(mime.urls())} file(s), result={res}, "
+                  f"admin={_admin}, text={'no' if os.environ.get('VG_DRAG_NOTEXT') == '1' else 'yes'}")
+        except Exception:
+            pass
         try:
             self.setState(QAbstractItemView.NoState)   # the drag swallowed the mouse release
         except Exception:
