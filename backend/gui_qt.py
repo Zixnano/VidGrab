@@ -1321,6 +1321,37 @@ class DownloadTable(QTableView):
         # whether Discord's stop icon goes away (urls only, like Explorer).
         if os.environ.get("VG_DRAG_NOTEXT") != "1":
             mime.setText("\n".join(u.toLocalFile() for u in mime.urls()))
+        # Preferred path on Windows: the same drag Explorer starts (a real shell
+        # data object handed to the shell's own drag loop), which is what Discord
+        # and other Electron apps accept. Set VG_DRAG_QT=1 to force the Qt drag
+        # below instead. Any failure here falls through to the Qt drag.
+        if sys.platform == "win32" and os.environ.get("VG_DRAG_QT") != "1":
+            native = None
+            try:
+                native = _native_file_drag(
+                    int(self.window().winId()),
+                    [u.toLocalFile() for u in mime.urls()])
+            except Exception:
+                native = None
+            try:
+                from settings import log as _nlog
+                try:
+                    _nadmin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+                except Exception:
+                    _nadmin = None
+                _nlog(f"file drag: native shell drag, {len(mime.urls())} file(s), "
+                      f"effect={native} (1=copied, 0=refused, -1=Esc, None=fell back to Qt), "
+                      f"admin={_nadmin}")
+            except Exception:
+                pass
+            if native is not None:
+                try:
+                    self.setState(QAbstractItemView.NoState)   # the drag swallowed the mouse release
+                except Exception:
+                    pass
+                self._band_end()
+                self.viewport().update()
+                return
         drag = QDrag(self)
         drag.setMimeData(mime)
         # Electron/Chromium targets (Discord, Slack, Telegram Desktop) behave
@@ -1352,6 +1383,98 @@ class DownloadTable(QTableView):
             pass
         self._band_end()
         self.viewport().update()
+
+
+def _native_file_drag(hwnd, paths):
+    """Windows only. Start the same kind of drag Explorer starts: a real shell
+    data object (CF_HDROP, Shell IDList Array, drag image) run by the shell's
+    own drag loop. Returns None when it could not start (the caller then falls
+    back to Qt's QDrag), otherwise the final drop effect: 1 = copied,
+    0 = refused by the target, -1 = cancelled with Esc.
+    Copy only, on purpose: no Move, so a drop can never take the file out of
+    the download folder. Runs on the GUI thread, which Qt already put in OLE."""
+    if sys.platform != "win32" or not paths:
+        return None
+    import uuid
+    from ctypes import wintypes
+    c_void_p = ctypes.c_void_p
+    ole32 = None
+    pidls, pdo, inited = [], None, False
+    try:
+        shell32 = ctypes.WinDLL("shell32")
+        ole32 = ctypes.WinDLL("ole32")
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                        ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+        u = uuid.UUID("0000010e-0000-0000-c000-000000000046")   # IID_IDataObject
+        iid = _GUID(u.time_low, u.time_mid, u.time_hi_version,
+                    (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+
+        ole32.OleInitialize.argtypes = [c_void_p]
+        ole32.OleInitialize.restype = ctypes.c_long
+        ole32.OleUninitialize.argtypes = []
+        ole32.OleUninitialize.restype = None
+        ole32.CoTaskMemFree.argtypes = [c_void_p]
+        ole32.CoTaskMemFree.restype = None
+        shell32.SHParseDisplayName.argtypes = [
+            wintypes.LPCWSTR, c_void_p, ctypes.POINTER(c_void_p),
+            wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+        shell32.SHParseDisplayName.restype = ctypes.c_long
+        shell32.SHCreateDataObject.argtypes = [
+            c_void_p, wintypes.UINT, ctypes.POINTER(c_void_p), c_void_p,
+            ctypes.POINTER(_GUID), ctypes.POINTER(c_void_p)]
+        shell32.SHCreateDataObject.restype = ctypes.c_long
+        shell32.SHDoDragDrop.argtypes = [
+            wintypes.HWND, c_void_p, c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD)]
+        shell32.SHDoDragDrop.restype = ctypes.c_long
+
+        hr = ole32.OleInitialize(None)      # S_OK / S_FALSE both count, balanced below
+        if hr < 0:
+            return None
+        inited = True
+
+        for p in paths:                      # one absolute PIDL per file
+            pidl = c_void_p()
+            hr = shell32.SHParseDisplayName(os.path.normpath(p), None,
+                                            ctypes.byref(pidl), 0, None)
+            if hr >= 0 and pidl.value:
+                pidls.append(pidl.value)
+        if not pidls:
+            return None
+
+        arr = (c_void_p * len(pidls))(*pidls)
+        out = c_void_p()
+        hr = shell32.SHCreateDataObject(None, len(pidls), arr, None,
+                                        ctypes.byref(iid), ctypes.byref(out))
+        if hr < 0 or not out.value:
+            return None
+        pdo = out.value
+
+        effect = wintypes.DWORD(0)
+        # pdsrc=None: the shell supplies its default drop source and builds the
+        # drag image from the data object, exactly like an Explorer drag.
+        hr = shell32.SHDoDragDrop(hwnd, pdo, None, 1, ctypes.byref(effect))   # 1 = DROPEFFECT_COPY
+        if hr < 0:
+            return None
+        if hr == 0x40101:                    # DRAGDROP_S_CANCEL
+            return -1
+        return int(effect.value)
+    finally:
+        try:
+            if pdo:                          # IUnknown::Release (vtable slot 2)
+                vt = ctypes.cast(pdo, ctypes.POINTER(c_void_p))[0]
+                rel = ctypes.WINFUNCTYPE(ctypes.c_ulong, c_void_p)(
+                    ctypes.cast(vt, ctypes.POINTER(c_void_p))[2])
+                rel(pdo)
+            if ole32 is not None:
+                for pl in pidls:
+                    ole32.CoTaskMemFree(pl)
+                if inited:
+                    ole32.OleUninitialize()
+        except Exception:
+            pass
 
 
 def _path_for(job):
