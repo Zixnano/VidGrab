@@ -60,12 +60,17 @@ from vg_state import (StateLock, load_state, mutate_state, save_state,
                       set_update_result, sha256_file, state_dir)
 
 STATE_DIR = state_dir()
-STATE_FILE = STATE_DIR / "recovery_state.json"
-STATE_LOCK = STATE_DIR / "recovery_state.lock"
-BACKUPS_DIR = STATE_DIR / "backups"
-STAGING = STATE_DIR / "staging"
+STATE_FILE = vg_state.state_file()
+STATE_LOCK = vg_state.lock_file()
+BACKUPS_DIR = vg_state.backups_dir()
+STAGING = vg_state.staging_dir()
 DEFAULT_STATE = vg_state.DEFAULT_STATE
 _pid_alive = vg_state.pid_alive
+
+
+def log(msg: str) -> None:
+    """Append to recovery.log under the 'updater' source tag."""
+    vg_state.recovery_log(msg, source="updater")
 
 
 # -------------------------------------------------------- version logic ----
@@ -90,12 +95,15 @@ def pick_candidate(releases, blacklist, installed_tag):
     installed = tag_num(installed_tag)
     usable = []
     newer_blocked = False
+    downgrades = []
     for rel in releases or []:
         if rel.get("draft") or rel.get("prerelease"):
             continue
         if app_asset(rel) is None:
             continue
         n = tag_num(rel.get("tag_name"))
+        if 0 <= n < installed:
+            downgrades.append(rel.get("tag_name"))
         if n <= installed:
             continue
         if rel.get("tag_name") in (blacklist or []):
@@ -105,6 +113,11 @@ def pick_candidate(releases, blacklist, installed_tag):
     if usable:
         usable.sort(key=lambda r: tag_num(r.get("tag_name")), reverse=True)
         return usable[0], "update"
+    if downgrades and not newer_blocked:
+        # Explicit downgrade guard: every usable release on the list is OLDER
+        # than what is installed, so nothing is offered. Say why.
+        log(f"pick_candidate: refusing to downgrade from {installed_tag}; "
+            f"every usable release is older ({', '.join(map(str, downgrades))})")
     return None, ("blacklisted" if newer_blocked else "uptodate")
 
 
@@ -224,17 +237,19 @@ def sums_asset(release: dict, tag: str):
 def verify_download(release: dict, tag: str, asset_name: str,
                       zpath: Path, size: int, got: int) -> None:
     """Fix 11: the byte count must match the asset size exactly, and
-    when the release carries a SHA256SUMS asset (CI publishes one per
-    release) the zip's hash must match it. When no sums asset exists
-    (releases published before it), fall back to the size check plus
-    the manifest verification inside the package, and say so."""
+    the release must carry a SHA256SUMS asset (CI publishes one per
+    release) and the zip's hash must match it. A release without one is
+    refused: the size check plus the in-package manifest alone are not
+    enough to install an update."""
     if size and got != size:
         raise RuntimeError(
             f"download truncated or overlong: got {got} bytes, "
             f"the asset is {size}")
     sums = sums_asset(release, tag)
     if sums is None:
-        return
+        log(f"verify_download: {tag} has no SHA256SUMS-{tag}.txt asset; "
+            "refusing to install an unverifiable download")
+        raise RuntimeError("release has no SHA256SUMS")
     req = urllib.request.Request(sums["browser_download_url"],
                                  headers={"User-Agent": "VideoGrabber-Updater"})
     with urllib.request.urlopen(req, timeout=30) as r:
@@ -319,8 +334,8 @@ class UpdateWorker(QThread):
             try:
                 set_update_result(getattr(self, "_target_tag", None),
                                   False, str(e))
-            except Exception:
-                pass
+            except Exception as exc:
+                log(f"could not record the failed update result: {exc}")
             self.failed.emit(str(e))
 
     def _run(self):

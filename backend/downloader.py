@@ -132,8 +132,8 @@ def maybe_open_folder(dest):
     if STATE.get("open_folder_on_complete") and dest.exists():
         try:
             os.startfile(str(dest.parent))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"open folder after download failed: {e}")
 
 
 def maybe_play_sound():
@@ -200,8 +200,8 @@ def maybe_convert_target(job, dest):
         if r.returncode == 0 and target_path.exists() and target_path.stat().st_size > 0:
             try:
                 dest.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                log(f"could not delete source {dest.name} after conversion: {e}")
             job["filename"] = target_path.name
             log(f"converted {dest.name} → {target_path.name}")
             return target_path
@@ -356,8 +356,8 @@ def maybe_convert_to_mp4(job, dest):
             if r.returncode == 0 and target.exists() and target.stat().st_size > 0:
                 try:
                     dest.unlink()
-                except OSError:
-                    pass
+                except OSError as e:
+                    log(f"could not delete source {dest.name} after conversion: {e}")
                 log(f"converted {dest.name} → {target.name}")
                 if Path(job["filename"]).suffix.lower() != ".mp4":
                     job["filename"] = target.name
@@ -701,8 +701,8 @@ def run_generic_segmented(job_id, probe=None):
         for p in [merge_path] + parts:
             try:
                 p.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                log(f"job {job_id}: could not delete {p.name} after failed merge: {exc}")
         job["error"] = f"merge failed: {e}"
         _try_transition(job, JobEvent.FAIL)
         log(f"job {job_id}: FAILED (merge) — {e}")
@@ -711,8 +711,8 @@ def run_generic_segmented(job_id, probe=None):
     for p in parts:
         try:
             p.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            log(f"job {job_id}: could not delete segment {p.name}: {e}")
     # Many CDNs misreport Content-Length — warn, don't fail.
     actual = dest.stat().st_size
     if total and actual < total - 1:
@@ -749,8 +749,8 @@ def run_generic(job_id):
             total, ok = _probe_ranges(job["url"], _generic_headers(job))
             if ok and total >= SEGMENT_THRESHOLD:
                 return run_generic_segmented(job_id, probe=(total, ok))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"job {job_id}: segmented probe failed, using single stream: {e}")
     return _run_generic_single(job_id)
 
 
@@ -1025,8 +1025,8 @@ def run_ytdlp(job_id):
     # Recompute now that we know the final name.
     try:
         job["category"] = category_for(job["filename"])
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"job {job_id}: category recompute failed: {e}")
     if not _try_transition(job, JobEvent.COMPLETE):
         save_jobs_snapshot()
         return
@@ -1047,8 +1047,8 @@ def run_ytdlp(job_id):
             if not _playlist_group_pending(job):
                 maybe_open_folder(d)
                 maybe_play_sound()
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"job {job_id}: post-complete steps failed: {e}")
     maybe_shutdown_if_idle()
     save_jobs_snapshot()
 

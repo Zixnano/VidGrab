@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import glob
+import ipaddress
 import os
 import re
 import requests
@@ -32,28 +33,32 @@ app = Flask(__name__)
 # Safe: /upload is gated by a one-time nonce that can only be obtained with
 # the API token — a random web page can't forge one, so wider origins here
 # expose nothing. Every other route stays extension-origin-only.
+#
+# The extension origin is pinned to ONE extension ID. The ID is fixed by the
+# "key" field in extension/manifest.json (see the generate-key command in the
+# release notes). Set it here, or override with the VG_EXTENSION_ID env var.
+EXTENSION_ID = os.environ.get("VG_EXTENSION_ID", "").strip() or "REPLACE_WITH_EXTENSION_ID"
+_EXT_ORIGIN = "chrome-extension://" + EXTENSION_ID
+if not re.fullmatch(r"[a-p]{32}", EXTENSION_ID):
+    log("api: EXTENSION_ID is not set to a valid 32-letter extension ID; "
+        "the extension will be refused by CORS and /pair until it is set")
 CORS(app, resources={
-    r"/*": {"origins": r"chrome-extension://.*"},
+    r"/*": {"origins": [_EXT_ORIGIN]},
     r"/upload": {"origins": r".*"},
 }, supports_credentials=False)
 
 TOKEN_PROTECTED_PATHS = {
     "/download", "/batch", "/pause", "/resume", "/stop", "/delete",
-    "/probe", "/rules", "/jobs", "/stats", "/convert", "/logs",
+    "/probe", "/jobs", "/stats", "/convert", "/logs",
     "/category", "/probe-head", "/settings", "/probe-formats",
     "/upload-token", "/redownload", "/show-add-dialog",
     "/clear-failed", "/queue-status", "/dup-check", "/favicon",
     "/update-status", "/update-skip", "/ytdlp-update", "/ytdlp-rollback",
     "/reorder", "/theme", "/queue-running", "/delete-file", "/toolkit",
-    "/open-folder",
+    "/open-folder", "/diskspace",
 }
 
-# Random per-launch key. It is NO LONGER embedded in any page: /remote now
-# sits behind a login (see /remote-login). The key is only honoured, via
-# ?key=, on the three job-action routes listed in _KEY_ALLOWED_PREFIXES.
-REMOTE_KEY = secrets.token_hex(8)
-
-# Routes that may be driven with ?key= or with a /remote login cookie.
+# Routes that may be driven with a /remote login cookie.
 # Everything else needs the real X-API-Token header.
 _KEY_ALLOWED_PREFIXES = ("/pause/", "/resume/", "/stop/")
 
@@ -130,6 +135,45 @@ def _consume_upload_nonce(nonce):
 # localhost-only check and this once-per-session flag instead.
 _PAIR_GRANTED = False
 
+_LOCAL_HOSTS = ("127.0.0.1", "localhost")
+
+
+def _host_only(raw):
+    """Host header -> lowercase hostname without the port ('' if malformed)."""
+    h = (raw or "").strip().lower()
+    if h.startswith("["):                       # [::1]:5757
+        end = h.find("]")
+        return h[1:end] if end > 0 else ""
+    return h.partition(":")[0]
+
+
+@app.before_request
+def _require_local_host():
+    """DNS-rebinding guard: only answer requests addressed to 127.0.0.1 or
+    localhost. A rebinding page reaches us under ITS hostname, so the Host
+    header gives it away. With LAN access switched on the phone UI is reached
+    by IP address, so raw IP literals are also accepted then (rebinding needs
+    a hostname, never an IP literal). Single-label and .local names are
+    accepted in that mode too, for phones that use the PC name."""
+    host = _host_only(request.headers.get("Host", ""))
+    if host in _LOCAL_HOSTS:
+        return
+    if STATE.get("lan_access") and host:
+        try:
+            ipaddress.ip_address(host)
+            return
+        except ValueError:
+            pass
+        # PC names on the home network (DESKTOP-X, mypc.local) have no dots
+        # or end in .local; an attacker's rebinding domain is a public
+        # multi-label name, so it still fails here.
+        if "." not in host or host.endswith(".local"):
+            return
+    log(f"rejected request with Host header {request.headers.get('Host', '')!r} "
+        f"from {request.remote_addr} for {request.path}")
+    return jsonify({"error": "bad host"}), 403
+
+
 @app.before_request
 def _require_api_token():
     if request.method == "OPTIONS":
@@ -144,13 +188,10 @@ def _require_api_token():
         request.path.startswith(p + "/") for p in TOKEN_PROTECTED_PATHS
     ):
         return
-    # ?key= and the /remote login cookie unlock ONLY pause / resume / stop.
+    # The /remote login cookie unlocks ONLY pause / resume / stop.
     # Every other protected route (jobs, settings, delete, ...) needs the
     # real token header.
     if request.path.startswith(_KEY_ALLOWED_PREFIXES):
-        key = request.args.get("key", "")
-        if key and _safe_digest_eq(key, REMOTE_KEY):
-            return
         if request.method == "POST" and _valid_remote_session(
                 request.cookies.get(_REMOTE_COOKIE)):
             return
@@ -162,20 +203,21 @@ def _require_api_token():
 def cleanup_partial_files(job):
     try:
         dest = _dest_for(job)
-    except Exception:
+    except Exception as e:
+        log(f"cleanup_partial_files: cannot resolve destination: {e}")
         return
     part = dest.with_suffix(dest.suffix + ".part")
     if part.exists():
         try:
             part.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            log(f"cleanup_partial_files: could not delete {part.name}: {e}")
     if dest.parent.exists():
         for sibling in dest.parent.glob(glob.escape(dest.name) + ".part*"):
             try:
                 sibling.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                log(f"cleanup_partial_files: could not delete {sibling.name}: {e}")
 
 # --------------------------------------------------------------- API ------
 @app.route("/health", methods=["GET"])
@@ -194,6 +236,13 @@ def pair():
     if request.remote_addr not in ("127.0.0.1", "::1"):
         log(f"pair attempt rejected: remote_addr={request.remote_addr}")
         return jsonify({"error": "pairing only allowed from localhost"}), 403
+    # Browsers always attach Origin to a cross-origin POST, so a web page
+    # cannot pair. Only the pinned extension origin may. (No Origin header =
+    # a non-browser local process, which can read settings.json anyway.)
+    origin = request.headers.get("Origin")
+    if origin is not None and origin != _EXT_ORIGIN:
+        log(f"pair attempt rejected: Origin={origin!r}")
+        return jsonify({"error": "pairing only allowed from the Video Grabber extension"}), 403
     if _PAIR_GRANTED:
         log("pair attempt rejected: already granted this session")
         return jsonify({"error": "pairing already granted this session"}), 403
@@ -481,8 +530,8 @@ def delete_job_and_file(job_id):
         cands.append(Path(job["dest"]))
     try:
         cands.append(_dest_for(job))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"delete-file: cannot resolve destination for job {job_id}: {e}")
     uniq = []
     for c in cands:
         if c not in uniq:
@@ -515,13 +564,13 @@ def delete_job_and_file(job_id):
             _oc.append(Path(_other["dest"]))
         try:
             _oc.append(_dest_for(_other))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"delete-file: cannot resolve destination for job {_oid}: {e}")
         for _c in _oc:
             try:
                 _shared.add(Path(_c).resolve())
-            except (OSError, ValueError):
-                pass
+            except (OSError, ValueError) as e:
+                log(f"delete-file: cannot resolve {_c}: {e}")
     _kept = [t for t in targets if t in _shared]
     if _kept:
         log(f"delete-file: job {job_id} shares {[str(t) for t in _kept]} with another job; "
@@ -565,8 +614,8 @@ def open_folder():
         cands.append(Path(job["dest"]))
     try:
         cands.append(_dest_for(job))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"open-folder: cannot resolve destination for job {job_id}: {e}")
     target = None
     for c in cands:
         try:
@@ -634,8 +683,8 @@ def _toolkit_source(data):
         cands = [Path(job["dest"])] if job.get("dest") else []
         try:
             cands.append(_dest_for(job))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"toolkit: cannot resolve destination for job {jid}: {e}")
         for c in cands:
             if c.is_file():
                 return c

@@ -83,10 +83,10 @@ from vg_state import (DEFAULT_STATE, StateLock, load_state, mutate_state,
                       pid_alive, save_state, state_dir)
 
 STATE_DIR = state_dir()
-STATE_FILE = STATE_DIR / "recovery_state.json"
-STATE_LOCK = STATE_DIR / "recovery_state.lock"
-RECOVERY_LOG = STATE_DIR / "recovery.log"
-BOOT_FLAG = STATE_DIR / "boot_recovery.flag"
+STATE_FILE = vg_state.state_file()
+STATE_LOCK = vg_state.lock_file()
+RECOVERY_LOG = vg_state.log_file()
+BOOT_FLAG = vg_state.boot_flag()
 APP_ALIVE = STATE_DIR / "app_alive.tmp"
 STARTUP_OK = STATE_DIR / "startup_ok.tmp"
 
@@ -376,7 +376,7 @@ def run_updater_flow() -> None:
     a staging copy) and falls back to updater.bat on a non-zero exit.
     The updater swaps the app folder only; host files it staged are swapped by
     updater.bat AFTER the updater host has exited (fix 3)."""
-    staging = STATE_DIR / "staging"
+    staging = vg_state.staging_dir()
     staging.mkdir(parents=True, exist_ok=True)
     src = APP_DIR / "updater_ui.py"
     staged_script = staging / "updater_ui.py"

@@ -37,10 +37,10 @@ from vg_state import (StateLock, load_state, mutate_state, save_state,
                       sha256_file, state_dir)
 
 STATE_DIR = state_dir()
-STATE_FILE = STATE_DIR / "recovery_state.json"
-STATE_LOCK = STATE_DIR / "recovery_state.lock"
-RECOVERY_LOG = STATE_DIR / "recovery.log"
-BACKUPS_DIR = STATE_DIR / "backups"
+STATE_FILE = vg_state.state_file()
+STATE_LOCK = vg_state.lock_file()
+RECOVERY_LOG = vg_state.log_file()
+BACKUPS_DIR = vg_state.backups_dir()
 DEFAULT_STATE = vg_state.DEFAULT_STATE
 _pid_alive = vg_state.pid_alive
 

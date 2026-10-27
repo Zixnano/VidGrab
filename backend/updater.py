@@ -1,8 +1,9 @@
 """updater.py — thin-update check, download, stage, handoff (Session 9).
 
-No UI yet: check_for_update() / apply_update() are plain functions a
-future menu item can call. Compares the latest release tag against the
-version actually installed on disk (install-version.txt, stamped by
+No UI: check_for_update() is a plain function the background scheduler
+below calls. Download, staging and the swap live in updater_ui.py, run by
+the supervisor; the in-process download path was removed. Compares the
+latest release tag against the version actually installed on disk (install-version.txt, stamped by
 updater.bat after each successful swap) numerically — v42 vs 4.0.9 —
 falling back to APP_VERSION on first install. Downloads
 VideoGrabber-app-v*.zip, stages it under %LOCALAPPDATA%\\VideoGrabber\\
@@ -143,74 +144,6 @@ def check_for_update(current: str = None):
             return tag, asset["browser_download_url"]
     log(f"updater: release {tag} has no app zip asset")
     return None, None
-
-
-def download_and_stage(url: str) -> Path:
-    """Download the thin zip, verify and extract it; return the pkg dir
-    (the single top-level folder inside the zip, e.g. 'video 3 grabber')."""
-    stage = _staging_root()
-    if stage.exists():
-        shutil.rmtree(stage, ignore_errors=True)
-    stage.mkdir(parents=True, exist_ok=True)
-    zip_path = stage / "update.zip"
-    log(f"updater: downloading {url}")
-    req = Request(url, headers={"User-Agent": "VideoGrabber-Updater"})
-    with urlopen(req, timeout=60) as r, open(zip_path, "wb") as f:
-        shutil.copyfileobj(r, f)
-    stage_real = stage.resolve()
-    with zipfile.ZipFile(zip_path) as zf:
-        for m in zf.infolist():
-            target = (stage / m.filename).resolve()
-            # Path.is_relative_to beats str.startswith: no string-prefix
-            # false positives (e.g. "stage2" vs "stage").
-            if not target.is_relative_to(stage_real):
-                raise RuntimeError(f"updater: unsafe path in zip: {m.filename}")
-        zf.extractall(stage)
-    zip_path.unlink(missing_ok=True)
-    for child in stage.iterdir():
-        if child.is_dir() and (child / "app").is_dir():
-            return child
-    return stage
-
-
-def apply_update() -> bool:
-    """Check, download, stage, hand off to updater.bat. Returns True if an
-    update was staged; the bat finishes the job after this process exits."""
-    if not getattr(sys, "frozen", False):
-        log("updater: source run — updates only apply to the installed exe")
-        return False
-    root = _install_root()
-    current = _installed_tag(root)
-    tag, url = check_for_update(current)
-    if not url:
-        return False
-    pkg = download_and_stage(url)
-    bat = root / "updater.bat"
-    if not bat.is_file():
-        log(f"updater: {bat} missing — can't apply update")
-        return False
-    log(f"updater: staged {tag} (current {current}); handing off to {bat}")
-    creationflags = 0
-    if sys.platform == "win32":
-        # CREATE_NO_WINDOW, not DETACHED_PROCESS: DETACHED makes every
-        # tasklist/timeout inside the bat pop its own console window and
-        # the wait loop spins hot.
-        creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    # Third arg is the tag: updater.bat stamps install-version.txt with it
-    # after the swap, so the next check compares against the NEW version
-    # instead of the APP_VERSION baked into the just-replaced source.
-    subprocess.Popen(
-        [str(bat), str(root), str(pkg), tag],
-        cwd=str(root),
-        close_fds=True,
-        creationflags=creationflags,
-    )
-    return True
-
-
-if __name__ == "__main__":
-    apply_update()
-
 
 
 # --------------------------------------------------------------------------

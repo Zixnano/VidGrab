@@ -70,6 +70,12 @@ def _vg_state_dir():
     return Path.home() / "AppData" / "Local" / "VideoGrabber"
 
 
+def _vg_boot_flag():
+    if _vg_state_mod is not None:
+        return _vg_state_mod.boot_flag()
+    return _vg_state_dir() / "boot_recovery.flag"
+
+
 def _vg_write_marker(name):
     if not _VG_LAUNCH_ID:
         return
@@ -99,6 +105,7 @@ CONFIG_PATH = HOME / "settings.json"
 # Palette-derived (single source of truth: palette.py).
 from palette import resolve_palette
 from settings import CATEGORIES, DISPLAY_VERSION, detect_type  # single source of truth: settings.py
+from settings import _dest_for
 from gui_detail import IMAGE_EXT, VIDEO_EXT, DetailPane, ThumbLoader
 # Batch 3 (moved): the procedural completion-sound maker (sound_generator.py,
 # same folder) opens from Settings > Sounds through open_sound_options. It no
@@ -1321,10 +1328,10 @@ class DownloadTable(QTableView):
         # whether Discord's stop icon goes away (urls only, like Explorer).
         if os.environ.get("VG_DRAG_NOTEXT") != "1":
             mime.setText("\n".join(u.toLocalFile() for u in mime.urls()))
-        # Preferred path on Windows: the same drag Explorer starts (a real shell
-        # data object handed to the shell's own drag loop), which is what Discord
-        # and other Electron apps accept. Set VG_DRAG_QT=1 to force the Qt drag
-        # below instead. Any failure here falls through to the Qt drag.
+        # Preferred path on Windows: a drag that carries only the native CF_HDROP
+        # file list, like Explorer's (Discord refuses drags that advertise
+        # text/uri-list, which Qt always adds). Set VG_DRAG_QT=1 to force the Qt
+        # drag below instead. Any failure here falls through to the Qt drag.
         if sys.platform == "win32" and os.environ.get("VG_DRAG_QT") != "1":
             native = None
             try:
@@ -1339,7 +1346,7 @@ class DownloadTable(QTableView):
                     _nadmin = bool(ctypes.windll.shell32.IsUserAnAdmin())
                 except Exception:
                     _nadmin = None
-                _nlog(f"file drag: native shell drag, {len(mime.urls())} file(s), "
+                _nlog(f"file drag: native CF_HDROP drag, {len(mime.urls())} file(s), "
                       f"effect={native} (1=copied, 0=refused, -1=Esc, None=fell back to Qt), "
                       f"admin={_nadmin}")
             except Exception:
@@ -1385,94 +1392,264 @@ class DownloadTable(QTableView):
         self.viewport().update()
 
 
+_LIVE_DRAG_OBJECTS = set()   # COM objects (and their callbacks) stay alive until the last Release
+
+
 def _native_file_drag(hwnd, paths):
-    """Windows only. Start the same kind of drag Explorer starts: a real shell
-    data object (CF_HDROP, Shell IDList Array, drag image) run by the shell's
-    own drag loop. Returns None when it could not start (the caller then falls
-    back to Qt's QDrag), otherwise the final drop effect: 1 = copied,
-    0 = refused by the target, -1 = cancelled with Esc.
+    """Windows only. Start a drag that carries exactly what Explorer carries
+    for a file drag: the native CF_HDROP file list and nothing else. Qt cannot
+    do this, because it only makes CF_HDROP from text/uri-list, and Discord
+    refuses any drag that advertises text/uri-list (drag test bench, test 3).
+    Built from a small hand-made IDataObject and IDropSource run through the
+    standard OLE DoDragDrop, with no shell helper calls.
+    Returns None when it could not start (the caller then falls back to Qt's
+    QDrag), otherwise the final drop effect: 1 = copied, 0 = refused by the
+    target, -1 = cancelled with Esc. hwnd is accepted for the caller's sake
+    and is not needed here.
     Copy only, on purpose: no Move, so a drop can never take the file out of
     the download folder. Runs on the GUI thread, which Qt already put in OLE."""
     if sys.platform != "win32" or not paths:
         return None
+    import struct
     import uuid
-    from ctypes import wintypes
-    c_void_p = ctypes.c_void_p
-    ole32 = None
-    pidls, pdo, inited = [], None, False
+    c_void_p, HR, WINF = ctypes.c_void_p, ctypes.c_long, ctypes.WINFUNCTYPE
+
+    def _hr(v):                      # unsigned HRESULT constant to the signed value ctypes returns
+        return v - (1 << 32) if v & 0x80000000 else v
+    E_NOINTERFACE, E_NOTIMPL, E_FAIL = _hr(0x80004002), _hr(0x80004001), _hr(0x80004005)
+    DV_E_FORMATETC, DV_E_TYMED = _hr(0x80040064), _hr(0x80040069)
+    ADVISE_NOTSUPPORTED = _hr(0x80040003)
+    DATA_S_SAMEFORMATETC = 0x40130
+    DRAGDROP_S_DROP, DRAGDROP_S_CANCEL, DRAGDROP_S_USEDEFAULTCURSORS = 0x40100, 0x40101, 0x40102
+    CF_HDROP, TYMED_HGLOBAL, DVASPECT_CONTENT = 15, 1, 1
+    IID_UNK = uuid.UUID("00000000-0000-0000-c000-000000000046").bytes_le
+    IID_DATAOBJ = uuid.UUID("0000010e-0000-0000-c000-000000000046").bytes_le
+    IID_DROPSRC = uuid.UUID("00000121-0000-0000-c000-000000000046").bytes_le
+
+    class _FORMATETC(ctypes.Structure):
+        _fields_ = [("cfFormat", ctypes.c_ushort), ("ptd", c_void_p),
+                    ("dwAspect", ctypes.c_uint32), ("lindex", ctypes.c_int32),
+                    ("tymed", ctypes.c_uint32)]
+
+    class _STGMEDIUM(ctypes.Structure):
+        _fields_ = [("tymed", ctypes.c_uint32), ("hGlobal", c_void_p),
+                    ("pUnkForRelease", c_void_p)]
+
+    class _Obj(ctypes.Structure):    # a COM object is just a pointer to its vtable
+        _fields_ = [("vtbl", c_void_p)]
+
+    def _make_vtbl(names):
+        return type("_Vtbl", (ctypes.Structure,), {"_fields_": [(n, c_void_p) for n in names]})()
+
+    FE, SM = ctypes.POINTER(_FORMATETC), ctypes.POINTER(_STGMEDIUM)
+    PPV = ctypes.POINTER(c_void_p)
+
+    ole32 = ctypes.WinDLL("ole32")
+    shell32 = ctypes.WinDLL("shell32")
+    kernel32 = ctypes.WinDLL("kernel32")
+    user32 = ctypes.WinDLL("user32")
+    ole32.OleInitialize.argtypes = [c_void_p]
+    ole32.OleInitialize.restype = HR
+    ole32.OleUninitialize.argtypes = []
+    ole32.OleUninitialize.restype = None
+    ole32.DoDragDrop.argtypes = [c_void_p, c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+    ole32.DoDragDrop.restype = HR
+    shell32.SHCreateStdEnumFmtEtc.argtypes = [ctypes.c_uint32, FE, PPV]
+    shell32.SHCreateStdEnumFmtEtc.restype = HR
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint32, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = c_void_p
+    kernel32.GlobalLock.argtypes = [c_void_p]
+    kernel32.GlobalLock.restype = c_void_p
+    kernel32.GlobalUnlock.argtypes = [c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_int
+    kernel32.GlobalFree.argtypes = [c_void_p]
+    kernel32.GlobalFree.restype = c_void_p
+    user32.ReleaseCapture.argtypes = []
+    user32.ReleaseCapture.restype = ctypes.c_int
+
+    # DROPFILES header (pFiles, pt.x, pt.y, fNC, fWide) + UTF-16 paths, double-null ended.
+    blob = struct.pack("<IiiII", 20, 0, 0, 0, 1) + b"".join(
+        os.path.normpath(q).encode("utf-16-le") + b"\x00\x00" for q in paths) + b"\x00\x00"
+
+    class _Holder:
+        pass
+    h = _Holder()
+    h.refs = 1
+
+    def _drop_ref():
+        h.refs -= 1
+        if h.refs <= 0:
+            _LIVE_DRAG_OBJECTS.discard(h)
+        return max(h.refs, 0)
+
+    # ---- IDataObject ---------------------------------------------------
+    def d_qi(this, riid, ppv):
+        try:
+            if ctypes.string_at(riid, 16) in (IID_UNK, IID_DATAOBJ):
+                ppv[0] = ctypes.addressof(h.dobj)
+                h.refs += 1
+                return 0
+            ppv[0] = None
+        except Exception:
+            pass
+        return E_NOINTERFACE
+
+    def d_addref(this):
+        h.refs += 1
+        return h.refs
+
+    def d_release(this):
+        return _drop_ref()
+
+    def _check(fe):
+        if fe.cfFormat != CF_HDROP or not (fe.dwAspect & DVASPECT_CONTENT):
+            return DV_E_FORMATETC
+        if not (fe.tymed & TYMED_HGLOBAL):
+            return DV_E_TYMED
+        return 0
+
+    def d_getdata(this, pfe, pmed):
+        try:
+            bad = _check(pfe.contents)
+            if bad:
+                return bad
+            hg = kernel32.GlobalAlloc(0x2, len(blob))      # GMEM_MOVEABLE
+            if not hg:
+                return E_FAIL
+            ptr = kernel32.GlobalLock(hg)
+            if not ptr:
+                kernel32.GlobalFree(hg)
+                return E_FAIL
+            ctypes.memmove(ptr, blob, len(blob))
+            kernel32.GlobalUnlock(hg)
+            m = pmed.contents
+            m.tymed = TYMED_HGLOBAL
+            m.hGlobal = hg
+            m.pUnkForRelease = None
+            return 0
+        except Exception:
+            return E_FAIL
+
+    def d_getdatahere(this, pfe, pmed):
+        return E_NOTIMPL
+
+    def d_query(this, pfe):
+        try:
+            return _check(pfe.contents)
+        except Exception:
+            return E_FAIL
+
+    def d_canonical(this, pin, pout):
+        try:
+            if pout:
+                pout.contents.ptd = None
+        except Exception:
+            pass
+        return DATA_S_SAMEFORMATETC
+
+    def d_setdata(this, pfe, pmed, release):
+        return E_NOTIMPL
+
+    def d_enum(this, direction, ppenum):
+        try:
+            if direction != 1:                       # DATADIR_GET only
+                return E_NOTIMPL
+            fe = _FORMATETC(CF_HDROP, None, DVASPECT_CONTENT, -1, TYMED_HGLOBAL)
+            pen = c_void_p()
+            hr = shell32.SHCreateStdEnumFmtEtc(1, ctypes.byref(fe), ctypes.byref(pen))
+            if hr >= 0:
+                ppenum[0] = pen.value
+            return hr
+        except Exception:
+            return E_FAIL
+
+    def d_dadvise(this, pfe, flags, padv, pconn):
+        return ADVISE_NOTSUPPORTED
+
+    def d_dunadvise(this, conn):
+        return ADVISE_NOTSUPPORTED
+
+    def d_enumdadvise(this, ppenum):
+        return ADVISE_NOTSUPPORTED
+
+    # ---- IDropSource ---------------------------------------------------
+    def s_qi(this, riid, ppv):
+        try:
+            if ctypes.string_at(riid, 16) in (IID_UNK, IID_DROPSRC):
+                ppv[0] = ctypes.addressof(h.dsrc)
+                return 0
+            ppv[0] = None
+        except Exception:
+            pass
+        return E_NOINTERFACE
+
+    def s_addref(this):
+        return 2
+
+    def s_release(this):
+        return 1
+
+    def s_continue(this, esc, keys):
+        if esc:
+            return DRAGDROP_S_CANCEL
+        if not (keys & 1):                           # MK_LBUTTON released: drop
+            return DRAGDROP_S_DROP
+        return 0
+
+    def s_feedback(this, effect):
+        return DRAGDROP_S_USEDEFAULTCURSORS
+
+    d_protos = [
+        (WINF(HR, c_void_p, c_void_p, PPV), d_qi),
+        (WINF(ctypes.c_ulong, c_void_p), d_addref),
+        (WINF(ctypes.c_ulong, c_void_p), d_release),
+        (WINF(HR, c_void_p, FE, SM), d_getdata),
+        (WINF(HR, c_void_p, FE, SM), d_getdatahere),
+        (WINF(HR, c_void_p, FE), d_query),
+        (WINF(HR, c_void_p, FE, FE), d_canonical),
+        (WINF(HR, c_void_p, FE, SM, ctypes.c_int), d_setdata),
+        (WINF(HR, c_void_p, ctypes.c_uint32, PPV), d_enum),
+        (WINF(HR, c_void_p, FE, ctypes.c_uint32, c_void_p, ctypes.POINTER(ctypes.c_uint32)), d_dadvise),
+        (WINF(HR, c_void_p, ctypes.c_uint32), d_dunadvise),
+        (WINF(HR, c_void_p, PPV), d_enumdadvise),
+    ]
+    s_protos = [
+        (WINF(HR, c_void_p, c_void_p, PPV), s_qi),
+        (WINF(ctypes.c_ulong, c_void_p), s_addref),
+        (WINF(ctypes.c_ulong, c_void_p), s_release),
+        (WINF(HR, c_void_p, ctypes.c_int, ctypes.c_uint32), s_continue),
+        (WINF(HR, c_void_p, ctypes.c_uint32), s_feedback),
+    ]
+    d_names = ["QueryInterface", "AddRef", "Release", "GetData", "GetDataHere",
+               "QueryGetData", "GetCanonicalFormatEtc", "SetData", "EnumFormatEtc",
+               "DAdvise", "DUnadvise", "EnumDAdvise"]
+    s_names = ["QueryInterface", "AddRef", "Release", "QueryContinueDrag", "GiveFeedback"]
+    h.callbacks = [proto(fn) for proto, fn in d_protos + s_protos]   # keep alive
+    h.dvt, h.svt = _make_vtbl(d_names), _make_vtbl(s_names)
+    for i, n in enumerate(d_names):
+        setattr(h.dvt, n, ctypes.cast(h.callbacks[i], c_void_p).value)
+    for i, n in enumerate(s_names):
+        setattr(h.svt, n, ctypes.cast(h.callbacks[len(d_names) + i], c_void_p).value)
+    h.dobj, h.dsrc = _Obj(ctypes.addressof(h.dvt)), _Obj(ctypes.addressof(h.svt))
+
+    hr = ole32.OleInitialize(None)           # S_OK / S_FALSE both count; balanced below
+    if hr < 0:
+        return None
+    _LIVE_DRAG_OBJECTS.add(h)
     try:
-        shell32 = ctypes.WinDLL("shell32")
-        ole32 = ctypes.WinDLL("ole32")
-
-        class _GUID(ctypes.Structure):
-            _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
-                        ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
-        u = uuid.UUID("0000010e-0000-0000-c000-000000000046")   # IID_IDataObject
-        iid = _GUID(u.time_low, u.time_mid, u.time_hi_version,
-                    (ctypes.c_ubyte * 8)(*u.bytes[8:]))
-
-        ole32.OleInitialize.argtypes = [c_void_p]
-        ole32.OleInitialize.restype = ctypes.c_long
-        ole32.OleUninitialize.argtypes = []
-        ole32.OleUninitialize.restype = None
-        ole32.CoTaskMemFree.argtypes = [c_void_p]
-        ole32.CoTaskMemFree.restype = None
-        shell32.SHParseDisplayName.argtypes = [
-            wintypes.LPCWSTR, c_void_p, ctypes.POINTER(c_void_p),
-            wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
-        shell32.SHParseDisplayName.restype = ctypes.c_long
-        shell32.SHCreateDataObject.argtypes = [
-            c_void_p, wintypes.UINT, ctypes.POINTER(c_void_p), c_void_p,
-            ctypes.POINTER(_GUID), ctypes.POINTER(c_void_p)]
-        shell32.SHCreateDataObject.restype = ctypes.c_long
-        shell32.SHDoDragDrop.argtypes = [
-            wintypes.HWND, c_void_p, c_void_p, wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD)]
-        shell32.SHDoDragDrop.restype = ctypes.c_long
-
-        hr = ole32.OleInitialize(None)      # S_OK / S_FALSE both count, balanced below
+        user32.ReleaseCapture()              # let OLE take the mouse for the drag
+        effect = ctypes.c_uint32(0)
+        hr = ole32.DoDragDrop(ctypes.addressof(h.dobj), ctypes.addressof(h.dsrc),
+                              1, ctypes.byref(effect))               # 1 = DROPEFFECT_COPY
         if hr < 0:
             return None
-        inited = True
-
-        for p in paths:                      # one absolute PIDL per file
-            pidl = c_void_p()
-            hr = shell32.SHParseDisplayName(os.path.normpath(p), None,
-                                            ctypes.byref(pidl), 0, None)
-            if hr >= 0 and pidl.value:
-                pidls.append(pidl.value)
-        if not pidls:
-            return None
-
-        arr = (c_void_p * len(pidls))(*pidls)
-        out = c_void_p()
-        hr = shell32.SHCreateDataObject(None, len(pidls), arr, None,
-                                        ctypes.byref(iid), ctypes.byref(out))
-        if hr < 0 or not out.value:
-            return None
-        pdo = out.value
-
-        effect = wintypes.DWORD(0)
-        # pdsrc=None: the shell supplies its default drop source and builds the
-        # drag image from the data object, exactly like an Explorer drag.
-        hr = shell32.SHDoDragDrop(hwnd, pdo, None, 1, ctypes.byref(effect))   # 1 = DROPEFFECT_COPY
-        if hr < 0:
-            return None
-        if hr == 0x40101:                    # DRAGDROP_S_CANCEL
+        if hr == DRAGDROP_S_CANCEL:
             return -1
         return int(effect.value)
     finally:
+        _drop_ref()                          # our own reference; a target may still hold one
         try:
-            if pdo:                          # IUnknown::Release (vtable slot 2)
-                vt = ctypes.cast(pdo, ctypes.POINTER(c_void_p))[0]
-                rel = ctypes.WINFUNCTYPE(ctypes.c_ulong, c_void_p)(
-                    ctypes.cast(vt, ctypes.POINTER(c_void_p))[2])
-                rel(pdo)
-            if ole32 is not None:
-                for pl in pidls:
-                    ole32.CoTaskMemFree(pl)
-                if inited:
-                    ole32.OleUninitialize()
+            ole32.OleUninitialize()
         except Exception:
             pass
 
@@ -1487,21 +1664,8 @@ def _path_for(job):
                 return Path(_d)
         except (OSError, ValueError):
             pass
-    settings = load_settings()
-    category = job.get("category", "Other")
-    override = settings.get("per_category_dirs", {}).get(category)
-    base = Path(override) if override else Path(settings.get("output_dir", str(HOME)))
-    cat_dir = base if override else base / category
-    # Session D: mirrors settings._dest_for - keep the two in sync.
-    sub = job.get("subdir")
-    if sub:
-        for ch in '<>:"/\\|?*':
-            sub = sub.replace(ch, "_")
-        cat_dir = cat_dir / sub
-    name = job["filename"]
-    for ch in '<>:"/\\|?*':
-        name = name.replace(ch, "_")
-    return cat_dir / name
+    # settings._dest_for is the one canonical path builder.
+    return _dest_for(job)
 
 
 def _playlist_dir_for(job):
@@ -4606,9 +4770,9 @@ class MainWindow(QMainWindow):
                 "Continue?") != QMessageBox.Yes:
             return
         try:
-            d = _vg_state_dir()
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "boot_recovery.flag").write_text("gui", encoding="utf-8")
+            flag = _vg_boot_flag()
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text("gui", encoding="utf-8")
         except Exception:
             pass
         self._real_quit()
@@ -5716,7 +5880,7 @@ class MainWindow(QMainWindow):
         """All update entry points (Tools menu, the startup prompt's
         "now", the update badge's "Install now") land here — and all of
         them go through the supervisor (§5). The old in-process
-        updater.apply_update path staged a swap with no blacklist
+        updater download-and-swap path staged a swap with no blacklist
         check, no backup and no manifest verify, so it is gone: the
         supervised updater is blacklist-aware, backs up first and
         verifies the package before swapping. Only works in the frozen

@@ -824,7 +824,7 @@ def disk_usage_for(path=None):
 
 
 def _dest_for(job):
-    # NOTE: gui_qt._path_for mirrors this logic - keep the two in sync.
+    # NOTE: gui_qt._path_for now just calls this; it is the canonical logic.
     override = STATE.get("per_category_dirs", {}).get(job["category"])
     base = Path(override) if override else Path(STATE["output_dir"])
     # The category comes from rules, /category and the API, so it is

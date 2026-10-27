@@ -6,6 +6,7 @@ BACKEND FILES
 
 from pathlib import Path
 import glob
+import ipaddress
 import os
 import re
 import requests
@@ -36,28 +37,32 @@ app = Flask(__name__)
 # Safe: /upload is gated by a one-time nonce that can only be obtained with
 # the API token — a random web page can't forge one, so wider origins here
 # expose nothing. Every other route stays extension-origin-only.
+#
+# The extension origin is pinned to ONE extension ID. The ID is fixed by the
+# "key" field in extension/manifest.json (see the generate-key command in the
+# release notes). Set it here, or override with the VG_EXTENSION_ID env var.
+EXTENSION_ID = os.environ.get("VG_EXTENSION_ID", "").strip() or "REPLACE_WITH_EXTENSION_ID"
+_EXT_ORIGIN = "chrome-extension://" + EXTENSION_ID
+if not re.fullmatch(r"[a-p]{32}", EXTENSION_ID):
+    log("api: EXTENSION_ID is not set to a valid 32-letter extension ID; "
+        "the extension will be refused by CORS and /pair until it is set")
 CORS(app, resources={
-    r"/*": {"origins": r"chrome-extension://.*"},
+    r"/*": {"origins": [_EXT_ORIGIN]},
     r"/upload": {"origins": r".*"},
 }, supports_credentials=False)
 
 TOKEN_PROTECTED_PATHS = {
     "/download", "/batch", "/pause", "/resume", "/stop", "/delete",
-    "/probe", "/rules", "/jobs", "/stats", "/convert", "/logs",
+    "/probe", "/jobs", "/stats", "/convert", "/logs",
     "/category", "/probe-head", "/settings", "/probe-formats",
     "/upload-token", "/redownload", "/show-add-dialog",
     "/clear-failed", "/queue-status", "/dup-check", "/favicon",
     "/update-status", "/update-skip", "/ytdlp-update", "/ytdlp-rollback",
     "/reorder", "/theme", "/queue-running", "/delete-file", "/toolkit",
-    "/open-folder",
+    "/open-folder", "/diskspace",
 }
 
-# Random per-launch key. It is NO LONGER embedded in any page: /remote now
-# sits behind a login (see /remote-login). The key is only honoured, via
-# ?key=, on the three job-action routes listed in _KEY_ALLOWED_PREFIXES.
-REMOTE_KEY = secrets.token_hex(8)
-
-# Routes that may be driven with ?key= or with a /remote login cookie.
+# Routes that may be driven with a /remote login cookie.
 # Everything else needs the real X-API-Token header.
 _KEY_ALLOWED_PREFIXES = ("/pause/", "/resume/", "/stop/")
 
@@ -134,6 +139,45 @@ def _consume_upload_nonce(nonce):
 # localhost-only check and this once-per-session flag instead.
 _PAIR_GRANTED = False
 
+_LOCAL_HOSTS = ("127.0.0.1", "localhost")
+
+
+def _host_only(raw):
+    """Host header -> lowercase hostname without the port ('' if malformed)."""
+    h = (raw or "").strip().lower()
+    if h.startswith("["):                       # [::1]:5757
+        end = h.find("]")
+        return h[1:end] if end > 0 else ""
+    return h.partition(":")[0]
+
+
+@app.before_request
+def _require_local_host():
+    """DNS-rebinding guard: only answer requests addressed to 127.0.0.1 or
+    localhost. A rebinding page reaches us under ITS hostname, so the Host
+    header gives it away. With LAN access switched on the phone UI is reached
+    by IP address, so raw IP literals are also accepted then (rebinding needs
+    a hostname, never an IP literal). Single-label and .local names are
+    accepted in that mode too, for phones that use the PC name."""
+    host = _host_only(request.headers.get("Host", ""))
+    if host in _LOCAL_HOSTS:
+        return
+    if STATE.get("lan_access") and host:
+        try:
+            ipaddress.ip_address(host)
+            return
+        except ValueError:
+            pass
+        # PC names on the home network (DESKTOP-X, mypc.local) have no dots
+        # or end in .local; an attacker's rebinding domain is a public
+        # multi-label name, so it still fails here.
+        if "." not in host or host.endswith(".local"):
+            return
+    log(f"rejected request with Host header {request.headers.get('Host', '')!r} "
+        f"from {request.remote_addr} for {request.path}")
+    return jsonify({"error": "bad host"}), 403
+
+
 @app.before_request
 def _require_api_token():
     if request.method == "OPTIONS":
@@ -148,13 +192,10 @@ def _require_api_token():
         request.path.startswith(p + "/") for p in TOKEN_PROTECTED_PATHS
     ):
         return
-    # ?key= and the /remote login cookie unlock ONLY pause / resume / stop.
+    # The /remote login cookie unlocks ONLY pause / resume / stop.
     # Every other protected route (jobs, settings, delete, ...) needs the
     # real token header.
     if request.path.startswith(_KEY_ALLOWED_PREFIXES):
-        key = request.args.get("key", "")
-        if key and _safe_digest_eq(key, REMOTE_KEY):
-            return
         if request.method == "POST" and _valid_remote_session(
                 request.cookies.get(_REMOTE_COOKIE)):
             return
@@ -166,20 +207,21 @@ def _require_api_token():
 def cleanup_partial_files(job):
     try:
         dest = _dest_for(job)
-    except Exception:
+    except Exception as e:
+        log(f"cleanup_partial_files: cannot resolve destination: {e}")
         return
     part = dest.with_suffix(dest.suffix + ".part")
     if part.exists():
         try:
             part.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            log(f"cleanup_partial_files: could not delete {part.name}: {e}")
     if dest.parent.exists():
         for sibling in dest.parent.glob(glob.escape(dest.name) + ".part*"):
             try:
                 sibling.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                log(f"cleanup_partial_files: could not delete {sibling.name}: {e}")
 
 # --------------------------------------------------------------- API ------
 @app.route("/health", methods=["GET"])
@@ -198,6 +240,13 @@ def pair():
     if request.remote_addr not in ("127.0.0.1", "::1"):
         log(f"pair attempt rejected: remote_addr={request.remote_addr}")
         return jsonify({"error": "pairing only allowed from localhost"}), 403
+    # Browsers always attach Origin to a cross-origin POST, so a web page
+    # cannot pair. Only the pinned extension origin may. (No Origin header =
+    # a non-browser local process, which can read settings.json anyway.)
+    origin = request.headers.get("Origin")
+    if origin is not None and origin != _EXT_ORIGIN:
+        log(f"pair attempt rejected: Origin={origin!r}")
+        return jsonify({"error": "pairing only allowed from the Video Grabber extension"}), 403
     if _PAIR_GRANTED:
         log("pair attempt rejected: already granted this session")
         return jsonify({"error": "pairing already granted this session"}), 403
@@ -485,8 +534,8 @@ def delete_job_and_file(job_id):
         cands.append(Path(job["dest"]))
     try:
         cands.append(_dest_for(job))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"delete-file: cannot resolve destination for job {job_id}: {e}")
     uniq = []
     for c in cands:
         if c not in uniq:
@@ -519,13 +568,13 @@ def delete_job_and_file(job_id):
             _oc.append(Path(_other["dest"]))
         try:
             _oc.append(_dest_for(_other))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"delete-file: cannot resolve destination for job {_oid}: {e}")
         for _c in _oc:
             try:
                 _shared.add(Path(_c).resolve())
-            except (OSError, ValueError):
-                pass
+            except (OSError, ValueError) as e:
+                log(f"delete-file: cannot resolve {_c}: {e}")
     _kept = [t for t in targets if t in _shared]
     if _kept:
         log(f"delete-file: job {job_id} shares {[str(t) for t in _kept]} with another job; "
@@ -569,8 +618,8 @@ def open_folder():
         cands.append(Path(job["dest"]))
     try:
         cands.append(_dest_for(job))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"open-folder: cannot resolve destination for job {job_id}: {e}")
     target = None
     for c in cands:
         try:
@@ -638,8 +687,8 @@ def _toolkit_source(data):
         cands = [Path(job["dest"])] if job.get("dest") else []
         try:
             cands.append(_dest_for(job))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"toolkit: cannot resolve destination for job {jid}: {e}")
         for c in cands:
             if c.is_file():
                 return c
@@ -2012,6 +2061,276 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+"""Bundle the bgutil PO-token provider into a Video Grabber runtime\\ folder.
+
+    python bundle_pot_provider.py --runtime path\\to\\runtime
+    python bundle_pot_provider.py --runtime path\\to\\runtime --verify-only
+
+What it does (needs internet; run it on the machine that builds the release):
+
+  1. Installs the yt-dlp plugin (pure Python, no dependencies) into
+     runtime\\site-packages, where launcher.py already puts sys.path.
+  2. Downloads the provider SERVER source for the SAME version into
+     runtime\\bgutil-pot-server and runs `deno install` there, using the
+     runtime's own deno. No Node.js is needed.
+  3. Starts the server on a spare port, checks /ping reports the pinned
+     version, stops it. Exit code 0 only if that worked.
+
+Plugin and server versions must match; bump PROVIDER_VERSION for both at once
+(check PyPI for the newest bgutil-ytdlp-pot-provider). runtime\\ is not touched
+by thin app updates, so a bump ships with a full install package.
+
+--verify-only runs just step 3 against an existing folder. Run it on the
+UNPACKED release too: node_modules uses links, and a zip tool that doesn't
+preserve or follow them will break the server.
+"""
+import argparse
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import zipfile
+from pathlib import Path
+
+PROVIDER_VERSION = "2.0.1"
+REPO = "Brainicism/bgutil-ytdlp-pot-provider"
+SMOKE_PORT = 4499  # not 4416, so a running app's provider isn't disturbed
+
+
+def _deno_path(runtime: Path, override: str = None) -> str:
+    if override:
+        return override
+    for name in ("deno.exe", "deno"):
+        p = runtime / name
+        if p.is_file():
+            return str(p)
+    found = shutil.which("deno")
+    if found:
+        return found
+    sys.exit("deno not found in the runtime folder or on PATH (use --deno).")
+
+
+def install_plugin(runtime: Path, version: str, python: str) -> None:
+    target = runtime / "site-packages"
+    target.mkdir(parents=True, exist_ok=True)
+    print(f"[1/3] plugin bgutil-ytdlp-pot-provider=={version} -> {target}")
+    subprocess.run(
+        [python, "-m", "pip", "install", "--target", str(target), "--no-deps",
+         "--upgrade", "--disable-pip-version-check",
+         f"bgutil-ytdlp-pot-provider=={version}"],
+        check=True)
+    plugin_dir = target / "yt_dlp_plugins" / "extractor"
+    if not (plugin_dir / "getpot_bgutil_http.py").is_file():
+        sys.exit(f"plugin files not found under {plugin_dir}")
+
+
+def install_server(runtime: Path, version: str, deno: str) -> None:
+    dest = runtime / "bgutil-pot-server"
+    url = f"https://codeload.github.com/{REPO}/zip/refs/tags/{version}"
+    print(f"[2/3] server {version}: downloading {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "VideoGrabber-bundler"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        data = r.read()
+    with tempfile.TemporaryDirectory() as tmp:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            zf.extractall(tmp)
+        roots = [p for p in Path(tmp).iterdir() if p.is_dir()]
+        src = roots[0] / "server" if roots else None
+        if not src or not (src / "src" / "main.ts").is_file():
+            sys.exit("downloaded archive has no server/src/main.ts")
+        if dest.exists():
+            shutil.rmtree(dest)  # also removes node_modules links without following them
+        shutil.copytree(src, dest, ignore=shutil.ignore_patterns(
+            "node_modules", "Dockerfile", "README.md", "scripts", "eslint.config.mjs"))
+    print(f"      deno install (native canvas module) in {dest}")
+    subprocess.run([deno, "install", "--allow-scripts=npm:canvas", "--frozen"],
+                   cwd=str(dest), check=True,
+                   env=dict(os.environ, DENO_NO_UPDATE_CHECK="1"))
+    (dest / "bgutil-version.txt").write_text(version + "\n", encoding="utf-8")
+
+
+def smoke_test(runtime: Path, version: str, deno: str, port: int = SMOKE_PORT) -> None:
+    server = runtime / "bgutil-pot-server"
+    modules = server / "node_modules"
+    if not (server / "src" / "main.ts").is_file() or not modules.is_dir():
+        sys.exit(f"{server} is missing src\\main.ts or node_modules; run without --verify-only first.")
+    print(f"[3/3] smoke test: starting the server on port {port}")
+    cmd = [deno, "run", "--no-prompt", "--allow-env", "--allow-net", "--allow-ffi=.",
+           "--allow-read=.", "../src/main.ts", "--port", str(port)]
+    proc = subprocess.Popen(cmd, cwd=str(modules), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            env=dict(os.environ, DENO_NO_UPDATE_CHECK="1"))
+    out = []
+    try:
+        deadline = time.time() + 60
+        reply = None
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/ping", timeout=2) as r:
+                    reply = json.loads(r.read().decode())
+                    break
+            except Exception:
+                time.sleep(0.5)
+        if reply is None:
+            proc.terminate()
+            try:
+                out = proc.communicate(timeout=5)[0].decode("utf-8", "replace").splitlines()
+            except Exception:
+                pass
+            tail = "\n".join(out[-15:])
+            sys.exit(f"server did not answer /ping (exit code {proc.poll()}).\n{tail}")
+        if reply.get("version") != version:
+            sys.exit(f"server reports version {reply.get('version')!r}, expected {version!r}")
+        print(f"      ok: /ping -> {reply}")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+
+
+def folder_size_mb(p: Path) -> float:
+    total = 0
+    for root, _dirs, files in os.walk(p, followlinks=False):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total / 1e6
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--runtime", required=True, help="the runtime\\ folder beside VideoGrabber.exe")
+    ap.add_argument("--version", default=PROVIDER_VERSION)
+    ap.add_argument("--python", default=sys.executable, help="python used for pip (any 3.8+)")
+    ap.add_argument("--deno", default=None, help="deno executable (default: runtime\\deno.exe)")
+    ap.add_argument("--verify-only", action="store_true")
+    a = ap.parse_args()
+    runtime = Path(a.runtime).resolve()
+    if not runtime.is_dir():
+        sys.exit(f"runtime folder not found: {runtime}")
+    deno = _deno_path(runtime, a.deno)
+    print(f"runtime: {runtime}\ndeno:    {deno}")
+    if not a.verify_only:
+        install_plugin(runtime, a.version, a.python)
+        install_server(runtime, a.version, deno)
+    smoke_test(runtime, a.version, deno)
+    print(f"done. bgutil-pot-server is {folder_size_mb(runtime / 'bgutil-pot-server'):.0f} MB")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""Step 1 checkpoint. Run with the app running:
+    python probe_test.py <playlist_url> [single_video_url] [bad_playlist_url]
+Reads the API token from ~/Downloads/VideoGrabber/settings.json."""
+import json, sys, time
+from pathlib import Path
+import requests
+
+tok = json.loads((Path.home() / "Downloads/VideoGrabber/settings.json").read_text())["api_token"]
+H = {"X-API-Token": tok}
+
+def probe(**body):
+    t = time.time()
+    r = requests.post("http://127.0.0.1:5757/probe", json=body, headers=H, timeout=180)
+    j = r.json()
+    print(f"  HTTP {r.status_code} in {time.time()-t:.1f}s")
+    return j
+
+def show(j):
+    if "error" in j:
+        print("  error:", j.get("code"), "|", j["error"][:150]); return
+    pl = j["playlist"]
+    print("  is_playlist:", j["is_playlist"], "| playlist:", pl and (pl["id"], pl["title"], pl["total"]))
+    print("  start/limit/truncated:", j["start"], j["limit"], j["truncated"], "| items:", len(j["items"]))
+    for it in j["items"][:3] + j["items"][-2:]:
+        print("   ", it["index"], it["id"], it["available"], it["duration"], it["title"][:50])
+    idx = [i["index"] for i in j["items"]]
+    print("  indexes ascending, no repeats:", idx == sorted(set(idx)))
+
+a = sys.argv[1:]
+print("1) playlist, default page"); show(probe(url=a[0]))
+print("2) playlist, start=5 limit=3"); show(probe(url=a[0], start=5, limit=3))
+if len(a) > 1:
+    print("3) single video"); show(probe(url=a[1]))
+if len(a) > 2:
+    print("4) bad/private/deleted playlist"); show(probe(url=a[2]))
+print("5) not a URL"); show(probe(url="hello"))
+print("6) bad params"); show(probe(url=a[0], start="1"))
+"""Read-only: list jobs whose GUI path changes now that gui_qt._path_for
+calls settings._dest_for. Usage: python check_path_drift.py [jobs.json] [settings.json]"""
+import json
+import sys
+from pathlib import Path
+
+import settings
+
+
+def old_path_for(job, st):
+    """The pre-change gui_qt._path_for body, kept here for comparison only."""
+    d = job.get("dest")
+    if d:
+        try:
+            if Path(d).exists():
+                return Path(d)
+        except (OSError, ValueError):
+            pass
+    category = job.get("category", "Other")
+    override = st.get("per_category_dirs", {}).get(category)
+    base = Path(override) if override else Path(st.get("output_dir", str(settings.HOME)))
+    cat_dir = base if override else base / category
+    sub = job.get("subdir")
+    if sub:
+        for ch in '<>:"/\\|?*':
+            sub = sub.replace(ch, "_")
+        cat_dir = cat_dir / sub
+    name = job["filename"]
+    for ch in '<>:"/\\|?*':
+        name = name.replace(ch, "_")
+    return cat_dir / name
+
+
+def new_path_for(job):
+    d = job.get("dest")
+    if d:
+        try:
+            if Path(d).exists():
+                return Path(d)
+        except (OSError, ValueError):
+            pass
+    return settings._dest_for(job)
+
+
+jobs_file = Path(sys.argv[1]) if len(sys.argv) > 1 else settings.JOBS_PATH
+cfg_file = Path(sys.argv[2]) if len(sys.argv) > 2 else settings.CONFIG_PATH
+if cfg_file.exists():
+    settings.STATE.update(settings._read_settings_json(cfg_file))
+jobs = json.loads(jobs_file.read_text(encoding="utf-8"))
+changed = 0
+for jid, j in jobs.items():
+    try:
+        old, new = old_path_for(j, settings.STATE), new_path_for(j)
+    except Exception as e:
+        print(f"job {jid}: ERROR {type(e).__name__}: {e}")
+        changed += 1
+        continue
+    if old != new:
+        changed += 1
+        print(f"job {jid} [{j.get('status')}] old_exists={old.exists()} new_exists={new.exists()}")
+        print(f"   old: {old}\n   new: {new}")
+print(f"{changed} of {len(jobs)} jobs change path")
 """component_updater.py: ffmpeg and deno updates for the installed app (v5.5).
 
 Same idea as updater.bat's rename-then-replace swap, done at launch instead of
@@ -2406,8 +2725,8 @@ def maybe_open_folder(dest):
     if STATE.get("open_folder_on_complete") and dest.exists():
         try:
             os.startfile(str(dest.parent))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"open folder after download failed: {e}")
 
 
 def maybe_play_sound():
@@ -2474,8 +2793,8 @@ def maybe_convert_target(job, dest):
         if r.returncode == 0 and target_path.exists() and target_path.stat().st_size > 0:
             try:
                 dest.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                log(f"could not delete source {dest.name} after conversion: {e}")
             job["filename"] = target_path.name
             log(f"converted {dest.name} → {target_path.name}")
             return target_path
@@ -2630,8 +2949,8 @@ def maybe_convert_to_mp4(job, dest):
             if r.returncode == 0 and target.exists() and target.stat().st_size > 0:
                 try:
                     dest.unlink()
-                except OSError:
-                    pass
+                except OSError as e:
+                    log(f"could not delete source {dest.name} after conversion: {e}")
                 log(f"converted {dest.name} → {target.name}")
                 if Path(job["filename"]).suffix.lower() != ".mp4":
                     job["filename"] = target.name
@@ -2975,8 +3294,8 @@ def run_generic_segmented(job_id, probe=None):
         for p in [merge_path] + parts:
             try:
                 p.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                log(f"job {job_id}: could not delete {p.name} after failed merge: {exc}")
         job["error"] = f"merge failed: {e}"
         _try_transition(job, JobEvent.FAIL)
         log(f"job {job_id}: FAILED (merge) — {e}")
@@ -2985,8 +3304,8 @@ def run_generic_segmented(job_id, probe=None):
     for p in parts:
         try:
             p.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            log(f"job {job_id}: could not delete segment {p.name}: {e}")
     # Many CDNs misreport Content-Length — warn, don't fail.
     actual = dest.stat().st_size
     if total and actual < total - 1:
@@ -3023,8 +3342,8 @@ def run_generic(job_id):
             total, ok = _probe_ranges(job["url"], _generic_headers(job))
             if ok and total >= SEGMENT_THRESHOLD:
                 return run_generic_segmented(job_id, probe=(total, ok))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"job {job_id}: segmented probe failed, using single stream: {e}")
     return _run_generic_single(job_id)
 
 
@@ -3299,8 +3618,8 @@ def run_ytdlp(job_id):
     # Recompute now that we know the final name.
     try:
         job["category"] = category_for(job["filename"])
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"job {job_id}: category recompute failed: {e}")
     if not _try_transition(job, JobEvent.COMPLETE):
         save_jobs_snapshot()
         return
@@ -3321,8 +3640,8 @@ def run_ytdlp(job_id):
             if not _playlist_group_pending(job):
                 maybe_open_folder(d)
                 maybe_play_sound()
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"job {job_id}: post-complete steps failed: {e}")
     maybe_shutdown_if_idle()
     save_jobs_snapshot()
 
@@ -3686,8 +4005,8 @@ def _twitter_syndication_info(url, proxy=None, prefer_kbps=None):
         t = str(t).replace("0", "").replace(".", "")
         if t and t not in tokens:
             tokens.insert(0, t)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"twitter token fallback failed: {e}")
     for token in tokens:
         api = (f"https://cdn.syndication.twimg.com/tweet-result"
                f"?id={tid}&lang=en&token={token}")
@@ -3872,8 +4191,8 @@ def _remember_format_audio(url, formats):
             fi.format_id: bool(fi.acodec) and fi.acodec != "none" for fi in formats}
         while len(_FORMAT_AUDIO) > _FORMAT_AUDIO_MAX:
             _FORMAT_AUDIO.pop(next(iter(_FORMAT_AUDIO)))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"format audio cache update failed: {e}")
 
 
 def _format_has_audio(url, format_id):
@@ -4328,8 +4647,8 @@ class YtDlpEngine:
                         for pat in (stem + "*.part", stem + "*.ytdl"):
                             for f in d_dest.parent.glob(pat):
                                 f.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log(f"could not clear stale .part/.ytdl files: {exc}")
             else:
                 log(f"job {opts.get('job_id') or dest.name}: no direct twitter "
                     f"media found; using yt-dlp extractor")
@@ -4616,8 +4935,8 @@ class YtDlpEngine:
                           and m.stat().st_mtime >= started_ts - 2]
                 if _fresh:
                     return max(_fresh, key=lambda p: p.stat().st_mtime)
-            except OSError:
-                pass
+            except OSError as e:
+                log(f"could not reconcile the output file in {dest.parent}: {e}")
 
         # Playlist mode: yt-dlp already wrote one file per item using the
         # %(playlist_index)s-%(title)s template; dest.stem glob won't match
@@ -4686,8 +5005,8 @@ def _canonical_probe_url(url):
             lid = (parse_qs(u.query).get("list") or [""])[0]
             if lid and not lid.startswith("RD"):
                 return "https://www.youtube.com/playlist?list=" + lid
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"playlist url normalisation failed: {e}")
     return url
 
 
@@ -4832,7 +5151,8 @@ class StreamlinkEngine:
             if r.returncode != 0:
                 return None
             data = json.loads(r.stdout.decode("utf-8", "replace"))
-        except Exception:
+        except Exception as e:
+            log(f"streamlink probe failed: {e}")
             return None
         streams = (data or {}).get("streams") or {}
         out = []
@@ -5523,6 +5843,12 @@ def _vg_state_dir():
     return Path.home() / "AppData" / "Local" / "VideoGrabber"
 
 
+def _vg_boot_flag():
+    if _vg_state_mod is not None:
+        return _vg_state_mod.boot_flag()
+    return _vg_state_dir() / "boot_recovery.flag"
+
+
 def _vg_write_marker(name):
     if not _VG_LAUNCH_ID:
         return
@@ -5552,6 +5878,7 @@ CONFIG_PATH = HOME / "settings.json"
 # Palette-derived (single source of truth: palette.py).
 from palette import resolve_palette
 from settings import CATEGORIES, DISPLAY_VERSION, detect_type  # single source of truth: settings.py
+from settings import _dest_for
 from gui_detail import IMAGE_EXT, VIDEO_EXT, DetailPane, ThumbLoader
 # Batch 3 (moved): the procedural completion-sound maker (sound_generator.py,
 # same folder) opens from Settings > Sounds through open_sound_options. It no
@@ -6774,10 +7101,10 @@ class DownloadTable(QTableView):
         # whether Discord's stop icon goes away (urls only, like Explorer).
         if os.environ.get("VG_DRAG_NOTEXT") != "1":
             mime.setText("\n".join(u.toLocalFile() for u in mime.urls()))
-        # Preferred path on Windows: the same drag Explorer starts (a real shell
-        # data object handed to the shell's own drag loop), which is what Discord
-        # and other Electron apps accept. Set VG_DRAG_QT=1 to force the Qt drag
-        # below instead. Any failure here falls through to the Qt drag.
+        # Preferred path on Windows: a drag that carries only the native CF_HDROP
+        # file list, like Explorer's (Discord refuses drags that advertise
+        # text/uri-list, which Qt always adds). Set VG_DRAG_QT=1 to force the Qt
+        # drag below instead. Any failure here falls through to the Qt drag.
         if sys.platform == "win32" and os.environ.get("VG_DRAG_QT") != "1":
             native = None
             try:
@@ -6792,7 +7119,7 @@ class DownloadTable(QTableView):
                     _nadmin = bool(ctypes.windll.shell32.IsUserAnAdmin())
                 except Exception:
                     _nadmin = None
-                _nlog(f"file drag: native shell drag, {len(mime.urls())} file(s), "
+                _nlog(f"file drag: native CF_HDROP drag, {len(mime.urls())} file(s), "
                       f"effect={native} (1=copied, 0=refused, -1=Esc, None=fell back to Qt), "
                       f"admin={_nadmin}")
             except Exception:
@@ -6838,94 +7165,264 @@ class DownloadTable(QTableView):
         self.viewport().update()
 
 
+_LIVE_DRAG_OBJECTS = set()   # COM objects (and their callbacks) stay alive until the last Release
+
+
 def _native_file_drag(hwnd, paths):
-    """Windows only. Start the same kind of drag Explorer starts: a real shell
-    data object (CF_HDROP, Shell IDList Array, drag image) run by the shell's
-    own drag loop. Returns None when it could not start (the caller then falls
-    back to Qt's QDrag), otherwise the final drop effect: 1 = copied,
-    0 = refused by the target, -1 = cancelled with Esc.
+    """Windows only. Start a drag that carries exactly what Explorer carries
+    for a file drag: the native CF_HDROP file list and nothing else. Qt cannot
+    do this, because it only makes CF_HDROP from text/uri-list, and Discord
+    refuses any drag that advertises text/uri-list (drag test bench, test 3).
+    Built from a small hand-made IDataObject and IDropSource run through the
+    standard OLE DoDragDrop, with no shell helper calls.
+    Returns None when it could not start (the caller then falls back to Qt's
+    QDrag), otherwise the final drop effect: 1 = copied, 0 = refused by the
+    target, -1 = cancelled with Esc. hwnd is accepted for the caller's sake
+    and is not needed here.
     Copy only, on purpose: no Move, so a drop can never take the file out of
     the download folder. Runs on the GUI thread, which Qt already put in OLE."""
     if sys.platform != "win32" or not paths:
         return None
+    import struct
     import uuid
-    from ctypes import wintypes
-    c_void_p = ctypes.c_void_p
-    ole32 = None
-    pidls, pdo, inited = [], None, False
+    c_void_p, HR, WINF = ctypes.c_void_p, ctypes.c_long, ctypes.WINFUNCTYPE
+
+    def _hr(v):                      # unsigned HRESULT constant to the signed value ctypes returns
+        return v - (1 << 32) if v & 0x80000000 else v
+    E_NOINTERFACE, E_NOTIMPL, E_FAIL = _hr(0x80004002), _hr(0x80004001), _hr(0x80004005)
+    DV_E_FORMATETC, DV_E_TYMED = _hr(0x80040064), _hr(0x80040069)
+    ADVISE_NOTSUPPORTED = _hr(0x80040003)
+    DATA_S_SAMEFORMATETC = 0x40130
+    DRAGDROP_S_DROP, DRAGDROP_S_CANCEL, DRAGDROP_S_USEDEFAULTCURSORS = 0x40100, 0x40101, 0x40102
+    CF_HDROP, TYMED_HGLOBAL, DVASPECT_CONTENT = 15, 1, 1
+    IID_UNK = uuid.UUID("00000000-0000-0000-c000-000000000046").bytes_le
+    IID_DATAOBJ = uuid.UUID("0000010e-0000-0000-c000-000000000046").bytes_le
+    IID_DROPSRC = uuid.UUID("00000121-0000-0000-c000-000000000046").bytes_le
+
+    class _FORMATETC(ctypes.Structure):
+        _fields_ = [("cfFormat", ctypes.c_ushort), ("ptd", c_void_p),
+                    ("dwAspect", ctypes.c_uint32), ("lindex", ctypes.c_int32),
+                    ("tymed", ctypes.c_uint32)]
+
+    class _STGMEDIUM(ctypes.Structure):
+        _fields_ = [("tymed", ctypes.c_uint32), ("hGlobal", c_void_p),
+                    ("pUnkForRelease", c_void_p)]
+
+    class _Obj(ctypes.Structure):    # a COM object is just a pointer to its vtable
+        _fields_ = [("vtbl", c_void_p)]
+
+    def _make_vtbl(names):
+        return type("_Vtbl", (ctypes.Structure,), {"_fields_": [(n, c_void_p) for n in names]})()
+
+    FE, SM = ctypes.POINTER(_FORMATETC), ctypes.POINTER(_STGMEDIUM)
+    PPV = ctypes.POINTER(c_void_p)
+
+    ole32 = ctypes.WinDLL("ole32")
+    shell32 = ctypes.WinDLL("shell32")
+    kernel32 = ctypes.WinDLL("kernel32")
+    user32 = ctypes.WinDLL("user32")
+    ole32.OleInitialize.argtypes = [c_void_p]
+    ole32.OleInitialize.restype = HR
+    ole32.OleUninitialize.argtypes = []
+    ole32.OleUninitialize.restype = None
+    ole32.DoDragDrop.argtypes = [c_void_p, c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+    ole32.DoDragDrop.restype = HR
+    shell32.SHCreateStdEnumFmtEtc.argtypes = [ctypes.c_uint32, FE, PPV]
+    shell32.SHCreateStdEnumFmtEtc.restype = HR
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint32, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = c_void_p
+    kernel32.GlobalLock.argtypes = [c_void_p]
+    kernel32.GlobalLock.restype = c_void_p
+    kernel32.GlobalUnlock.argtypes = [c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_int
+    kernel32.GlobalFree.argtypes = [c_void_p]
+    kernel32.GlobalFree.restype = c_void_p
+    user32.ReleaseCapture.argtypes = []
+    user32.ReleaseCapture.restype = ctypes.c_int
+
+    # DROPFILES header (pFiles, pt.x, pt.y, fNC, fWide) + UTF-16 paths, double-null ended.
+    blob = struct.pack("<IiiII", 20, 0, 0, 0, 1) + b"".join(
+        os.path.normpath(q).encode("utf-16-le") + b"\x00\x00" for q in paths) + b"\x00\x00"
+
+    class _Holder:
+        pass
+    h = _Holder()
+    h.refs = 1
+
+    def _drop_ref():
+        h.refs -= 1
+        if h.refs <= 0:
+            _LIVE_DRAG_OBJECTS.discard(h)
+        return max(h.refs, 0)
+
+    # ---- IDataObject ---------------------------------------------------
+    def d_qi(this, riid, ppv):
+        try:
+            if ctypes.string_at(riid, 16) in (IID_UNK, IID_DATAOBJ):
+                ppv[0] = ctypes.addressof(h.dobj)
+                h.refs += 1
+                return 0
+            ppv[0] = None
+        except Exception:
+            pass
+        return E_NOINTERFACE
+
+    def d_addref(this):
+        h.refs += 1
+        return h.refs
+
+    def d_release(this):
+        return _drop_ref()
+
+    def _check(fe):
+        if fe.cfFormat != CF_HDROP or not (fe.dwAspect & DVASPECT_CONTENT):
+            return DV_E_FORMATETC
+        if not (fe.tymed & TYMED_HGLOBAL):
+            return DV_E_TYMED
+        return 0
+
+    def d_getdata(this, pfe, pmed):
+        try:
+            bad = _check(pfe.contents)
+            if bad:
+                return bad
+            hg = kernel32.GlobalAlloc(0x2, len(blob))      # GMEM_MOVEABLE
+            if not hg:
+                return E_FAIL
+            ptr = kernel32.GlobalLock(hg)
+            if not ptr:
+                kernel32.GlobalFree(hg)
+                return E_FAIL
+            ctypes.memmove(ptr, blob, len(blob))
+            kernel32.GlobalUnlock(hg)
+            m = pmed.contents
+            m.tymed = TYMED_HGLOBAL
+            m.hGlobal = hg
+            m.pUnkForRelease = None
+            return 0
+        except Exception:
+            return E_FAIL
+
+    def d_getdatahere(this, pfe, pmed):
+        return E_NOTIMPL
+
+    def d_query(this, pfe):
+        try:
+            return _check(pfe.contents)
+        except Exception:
+            return E_FAIL
+
+    def d_canonical(this, pin, pout):
+        try:
+            if pout:
+                pout.contents.ptd = None
+        except Exception:
+            pass
+        return DATA_S_SAMEFORMATETC
+
+    def d_setdata(this, pfe, pmed, release):
+        return E_NOTIMPL
+
+    def d_enum(this, direction, ppenum):
+        try:
+            if direction != 1:                       # DATADIR_GET only
+                return E_NOTIMPL
+            fe = _FORMATETC(CF_HDROP, None, DVASPECT_CONTENT, -1, TYMED_HGLOBAL)
+            pen = c_void_p()
+            hr = shell32.SHCreateStdEnumFmtEtc(1, ctypes.byref(fe), ctypes.byref(pen))
+            if hr >= 0:
+                ppenum[0] = pen.value
+            return hr
+        except Exception:
+            return E_FAIL
+
+    def d_dadvise(this, pfe, flags, padv, pconn):
+        return ADVISE_NOTSUPPORTED
+
+    def d_dunadvise(this, conn):
+        return ADVISE_NOTSUPPORTED
+
+    def d_enumdadvise(this, ppenum):
+        return ADVISE_NOTSUPPORTED
+
+    # ---- IDropSource ---------------------------------------------------
+    def s_qi(this, riid, ppv):
+        try:
+            if ctypes.string_at(riid, 16) in (IID_UNK, IID_DROPSRC):
+                ppv[0] = ctypes.addressof(h.dsrc)
+                return 0
+            ppv[0] = None
+        except Exception:
+            pass
+        return E_NOINTERFACE
+
+    def s_addref(this):
+        return 2
+
+    def s_release(this):
+        return 1
+
+    def s_continue(this, esc, keys):
+        if esc:
+            return DRAGDROP_S_CANCEL
+        if not (keys & 1):                           # MK_LBUTTON released: drop
+            return DRAGDROP_S_DROP
+        return 0
+
+    def s_feedback(this, effect):
+        return DRAGDROP_S_USEDEFAULTCURSORS
+
+    d_protos = [
+        (WINF(HR, c_void_p, c_void_p, PPV), d_qi),
+        (WINF(ctypes.c_ulong, c_void_p), d_addref),
+        (WINF(ctypes.c_ulong, c_void_p), d_release),
+        (WINF(HR, c_void_p, FE, SM), d_getdata),
+        (WINF(HR, c_void_p, FE, SM), d_getdatahere),
+        (WINF(HR, c_void_p, FE), d_query),
+        (WINF(HR, c_void_p, FE, FE), d_canonical),
+        (WINF(HR, c_void_p, FE, SM, ctypes.c_int), d_setdata),
+        (WINF(HR, c_void_p, ctypes.c_uint32, PPV), d_enum),
+        (WINF(HR, c_void_p, FE, ctypes.c_uint32, c_void_p, ctypes.POINTER(ctypes.c_uint32)), d_dadvise),
+        (WINF(HR, c_void_p, ctypes.c_uint32), d_dunadvise),
+        (WINF(HR, c_void_p, PPV), d_enumdadvise),
+    ]
+    s_protos = [
+        (WINF(HR, c_void_p, c_void_p, PPV), s_qi),
+        (WINF(ctypes.c_ulong, c_void_p), s_addref),
+        (WINF(ctypes.c_ulong, c_void_p), s_release),
+        (WINF(HR, c_void_p, ctypes.c_int, ctypes.c_uint32), s_continue),
+        (WINF(HR, c_void_p, ctypes.c_uint32), s_feedback),
+    ]
+    d_names = ["QueryInterface", "AddRef", "Release", "GetData", "GetDataHere",
+               "QueryGetData", "GetCanonicalFormatEtc", "SetData", "EnumFormatEtc",
+               "DAdvise", "DUnadvise", "EnumDAdvise"]
+    s_names = ["QueryInterface", "AddRef", "Release", "QueryContinueDrag", "GiveFeedback"]
+    h.callbacks = [proto(fn) for proto, fn in d_protos + s_protos]   # keep alive
+    h.dvt, h.svt = _make_vtbl(d_names), _make_vtbl(s_names)
+    for i, n in enumerate(d_names):
+        setattr(h.dvt, n, ctypes.cast(h.callbacks[i], c_void_p).value)
+    for i, n in enumerate(s_names):
+        setattr(h.svt, n, ctypes.cast(h.callbacks[len(d_names) + i], c_void_p).value)
+    h.dobj, h.dsrc = _Obj(ctypes.addressof(h.dvt)), _Obj(ctypes.addressof(h.svt))
+
+    hr = ole32.OleInitialize(None)           # S_OK / S_FALSE both count; balanced below
+    if hr < 0:
+        return None
+    _LIVE_DRAG_OBJECTS.add(h)
     try:
-        shell32 = ctypes.WinDLL("shell32")
-        ole32 = ctypes.WinDLL("ole32")
-
-        class _GUID(ctypes.Structure):
-            _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
-                        ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
-        u = uuid.UUID("0000010e-0000-0000-c000-000000000046")   # IID_IDataObject
-        iid = _GUID(u.time_low, u.time_mid, u.time_hi_version,
-                    (ctypes.c_ubyte * 8)(*u.bytes[8:]))
-
-        ole32.OleInitialize.argtypes = [c_void_p]
-        ole32.OleInitialize.restype = ctypes.c_long
-        ole32.OleUninitialize.argtypes = []
-        ole32.OleUninitialize.restype = None
-        ole32.CoTaskMemFree.argtypes = [c_void_p]
-        ole32.CoTaskMemFree.restype = None
-        shell32.SHParseDisplayName.argtypes = [
-            wintypes.LPCWSTR, c_void_p, ctypes.POINTER(c_void_p),
-            wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
-        shell32.SHParseDisplayName.restype = ctypes.c_long
-        shell32.SHCreateDataObject.argtypes = [
-            c_void_p, wintypes.UINT, ctypes.POINTER(c_void_p), c_void_p,
-            ctypes.POINTER(_GUID), ctypes.POINTER(c_void_p)]
-        shell32.SHCreateDataObject.restype = ctypes.c_long
-        shell32.SHDoDragDrop.argtypes = [
-            wintypes.HWND, c_void_p, c_void_p, wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD)]
-        shell32.SHDoDragDrop.restype = ctypes.c_long
-
-        hr = ole32.OleInitialize(None)      # S_OK / S_FALSE both count, balanced below
+        user32.ReleaseCapture()              # let OLE take the mouse for the drag
+        effect = ctypes.c_uint32(0)
+        hr = ole32.DoDragDrop(ctypes.addressof(h.dobj), ctypes.addressof(h.dsrc),
+                              1, ctypes.byref(effect))               # 1 = DROPEFFECT_COPY
         if hr < 0:
             return None
-        inited = True
-
-        for p in paths:                      # one absolute PIDL per file
-            pidl = c_void_p()
-            hr = shell32.SHParseDisplayName(os.path.normpath(p), None,
-                                            ctypes.byref(pidl), 0, None)
-            if hr >= 0 and pidl.value:
-                pidls.append(pidl.value)
-        if not pidls:
-            return None
-
-        arr = (c_void_p * len(pidls))(*pidls)
-        out = c_void_p()
-        hr = shell32.SHCreateDataObject(None, len(pidls), arr, None,
-                                        ctypes.byref(iid), ctypes.byref(out))
-        if hr < 0 or not out.value:
-            return None
-        pdo = out.value
-
-        effect = wintypes.DWORD(0)
-        # pdsrc=None: the shell supplies its default drop source and builds the
-        # drag image from the data object, exactly like an Explorer drag.
-        hr = shell32.SHDoDragDrop(hwnd, pdo, None, 1, ctypes.byref(effect))   # 1 = DROPEFFECT_COPY
-        if hr < 0:
-            return None
-        if hr == 0x40101:                    # DRAGDROP_S_CANCEL
+        if hr == DRAGDROP_S_CANCEL:
             return -1
         return int(effect.value)
     finally:
+        _drop_ref()                          # our own reference; a target may still hold one
         try:
-            if pdo:                          # IUnknown::Release (vtable slot 2)
-                vt = ctypes.cast(pdo, ctypes.POINTER(c_void_p))[0]
-                rel = ctypes.WINFUNCTYPE(ctypes.c_ulong, c_void_p)(
-                    ctypes.cast(vt, ctypes.POINTER(c_void_p))[2])
-                rel(pdo)
-            if ole32 is not None:
-                for pl in pidls:
-                    ole32.CoTaskMemFree(pl)
-                if inited:
-                    ole32.OleUninitialize()
+            ole32.OleUninitialize()
         except Exception:
             pass
 
@@ -6940,21 +7437,8 @@ def _path_for(job):
                 return Path(_d)
         except (OSError, ValueError):
             pass
-    settings = load_settings()
-    category = job.get("category", "Other")
-    override = settings.get("per_category_dirs", {}).get(category)
-    base = Path(override) if override else Path(settings.get("output_dir", str(HOME)))
-    cat_dir = base if override else base / category
-    # Session D: mirrors settings._dest_for - keep the two in sync.
-    sub = job.get("subdir")
-    if sub:
-        for ch in '<>:"/\\|?*':
-            sub = sub.replace(ch, "_")
-        cat_dir = cat_dir / sub
-    name = job["filename"]
-    for ch in '<>:"/\\|?*':
-        name = name.replace(ch, "_")
-    return cat_dir / name
+    # settings._dest_for is the one canonical path builder.
+    return _dest_for(job)
 
 
 def _playlist_dir_for(job):
@@ -10059,9 +10543,9 @@ class MainWindow(QMainWindow):
                 "Continue?") != QMessageBox.Yes:
             return
         try:
-            d = _vg_state_dir()
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "boot_recovery.flag").write_text("gui", encoding="utf-8")
+            flag = _vg_boot_flag()
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text("gui", encoding="utf-8")
         except Exception:
             pass
         self._real_quit()
@@ -11169,7 +11653,7 @@ class MainWindow(QMainWindow):
         """All update entry points (Tools menu, the startup prompt's
         "now", the update badge's "Install now") land here — and all of
         them go through the supervisor (§5). The old in-process
-        updater.apply_update path staged a swap with no blacklist
+        updater download-and-swap path staged a swap with no blacklist
         check, no backup and no manifest verify, so it is gone: the
         supervised updater is blacklist-aware, backs up first and
         verifies the package before swapping. Only works in the frozen
@@ -16702,10 +17186,10 @@ from vg_state import (DEFAULT_STATE, StateLock, load_state, mutate_state,
                       pid_alive, save_state, state_dir)
 
 STATE_DIR = state_dir()
-STATE_FILE = STATE_DIR / "recovery_state.json"
-STATE_LOCK = STATE_DIR / "recovery_state.lock"
-RECOVERY_LOG = STATE_DIR / "recovery.log"
-BOOT_FLAG = STATE_DIR / "boot_recovery.flag"
+STATE_FILE = vg_state.state_file()
+STATE_LOCK = vg_state.lock_file()
+RECOVERY_LOG = vg_state.log_file()
+BOOT_FLAG = vg_state.boot_flag()
 APP_ALIVE = STATE_DIR / "app_alive.tmp"
 STARTUP_OK = STATE_DIR / "startup_ok.tmp"
 
@@ -16995,7 +17479,7 @@ def run_updater_flow() -> None:
     a staging copy) and falls back to updater.bat on a non-zero exit.
     The updater swaps the app folder only; host files it staged are swapped by
     updater.bat AFTER the updater host has exited (fix 3)."""
-    staging = STATE_DIR / "staging"
+    staging = vg_state.staging_dir()
     staging.mkdir(parents=True, exist_ok=True)
     src = APP_DIR / "updater_ui.py"
     staged_script = staging / "updater_ui.py"
@@ -17789,10 +18273,10 @@ from vg_state import (StateLock, load_state, mutate_state, save_state,
                       sha256_file, state_dir)
 
 STATE_DIR = state_dir()
-STATE_FILE = STATE_DIR / "recovery_state.json"
-STATE_LOCK = STATE_DIR / "recovery_state.lock"
-RECOVERY_LOG = STATE_DIR / "recovery.log"
-BACKUPS_DIR = STATE_DIR / "backups"
+STATE_FILE = vg_state.state_file()
+STATE_LOCK = vg_state.lock_file()
+RECOVERY_LOG = vg_state.log_file()
+BACKUPS_DIR = vg_state.backups_dir()
 DEFAULT_STATE = vg_state.DEFAULT_STATE
 _pid_alive = vg_state.pid_alive
 
@@ -19821,7 +20305,7 @@ def disk_usage_for(path=None):
 
 
 def _dest_for(job):
-    # NOTE: gui_qt._path_for mirrors this logic - keep the two in sync.
+    # NOTE: gui_qt._path_for now just calls this; it is the canonical logic.
     override = STATE.get("per_category_dirs", {}).get(job["category"])
     base = Path(override) if override else Path(STATE["output_dir"])
     # The category comes from rules, /category and the API, so it is
@@ -22167,6 +22651,188 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+"""pytest safety net for api.py. Run: pytest -v backend/test_api.py
+
+Everything runs against a throwaway state directory; nothing touches the
+real settings.json, jobs.json or recovery_state.json.
+"""
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+# Must be set BEFORE importing api / settings: they read these at import time.
+_STATE_TMP = tempfile.mkdtemp(prefix="vg_test_state_")
+os.environ["VG_STATE_DIR"] = _STATE_TMP
+os.environ["VG_EXTENSION_ID"] = "abcdefghijklmnopabcdefghijklmnop"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import pytest
+
+import api
+import settings
+import ytdlp_update
+
+TOKEN = "test-token-0123456789abcdef"
+EXT_ORIGIN = "chrome-extension://" + os.environ["VG_EXTENSION_ID"]
+
+# Routes that are open on purpose (no X-API-Token header).
+OPEN_ROUTES = {"/health", "/ping", "/version", "/pair", "/remote",
+               "/remote-login", "/upload"}
+# Routes whose upstream (network / external tool) may legitimately fail.
+UPSTREAM_ROUTES = {"/changelog", "/favicon/<domain>", "/ytdlp-update",
+                   "/ytdlp-rollback", "/probe", "/probe-formats", "/probe-head"}
+
+
+@pytest.fixture(autouse=True)
+def isolated(monkeypatch):
+    home = Path(tempfile.mkdtemp(prefix="vg_test_home_"))
+    settings.set_paths(home)
+    monkeypatch.setitem(settings.STATE, "output_dir", str(home / "out"))
+    monkeypatch.setitem(settings.STATE, "api_token", TOKEN)
+    monkeypatch.setitem(settings.STATE, "lan_access", False)
+    monkeypatch.setattr(api, "_PAIR_GRANTED", False)
+
+    def no_network(*a, **k):
+        raise api.requests.ConnectionError("network disabled in tests")
+    monkeypatch.setattr(api.requests, "get", no_network)
+    monkeypatch.setattr(api.requests, "post", no_network)
+    # status() inspects the real installed yt-dlp; keep the test hermetic.
+    monkeypatch.setattr(ytdlp_update, "status", lambda: {})
+    api.JOBS.clear()
+    yield
+    api.JOBS.clear()
+
+
+@pytest.fixture
+def client():
+    return api.app.test_client()
+
+
+@pytest.fixture
+def auth():
+    return {"X-API-Token": TOKEN}
+
+
+def _routes():
+    out = []
+    for rule in api.app.url_map.iter_rules():
+        if rule.endpoint == "static":
+            continue
+        for method in sorted(rule.methods - {"HEAD", "OPTIONS"}):
+            out.append((rule.rule, method))
+    return sorted(out)
+
+
+def _fill(rule):
+    return re.sub(r"<[^>]+>", "nosuchjob", rule)
+
+
+# ------------------------------------------------------------ every route --
+@pytest.mark.parametrize("rule,method", _routes())
+def test_route_with_valid_token(client, auth, rule, method):
+    if rule == "/pair":
+        pytest.skip("covered by the dedicated /pair tests")
+    if rule == "/upload":
+        pytest.skip("uses a one-time nonce, covered below")
+    if rule == "/remote-login":
+        pytest.skip("uses its own password login, covered below")
+    url = _fill(rule)
+    r = client.open(url, method=method, headers=auth, json={} if method == "POST" else None)
+    assert r.status_code != 401, f"{method} {rule} rejected a valid token"
+    assert r.status_code != 403, f"{method} {rule} unexpectedly forbidden"
+    if rule in UPSTREAM_ROUTES:
+        assert r.status_code < 600
+    else:
+        assert r.status_code < 500, f"{method} {rule} -> {r.status_code}: {r.get_data(as_text=True)[:200]}"
+
+
+# --------------------------------------------------------------- auth ------
+def test_diskspace_requires_token(client, auth):
+    assert client.get("/diskspace").status_code == 401
+    assert client.get("/diskspace", headers={"X-API-Token": "wrong"}).status_code == 401
+    assert client.get("/diskspace", headers=auth).status_code == 200
+
+
+def test_rules_not_in_protected_paths():
+    assert "/rules" not in api.TOKEN_PROTECTED_PATHS
+    assert "/diskspace" in api.TOKEN_PROTECTED_PATHS
+
+
+@pytest.mark.parametrize("path", sorted(api.TOKEN_PROTECTED_PATHS))
+def test_protected_paths_reject_missing_token(client, path):
+    r = client.open(path, method="POST")
+    assert r.status_code in (401, 404, 405), (path, r.status_code)
+    if r.status_code != 401:
+        # a GET-only route answers POST with 405 before auth; check GET too
+        assert client.get(path).status_code in (401, 404, 405)
+
+
+def test_query_key_no_longer_unlocks_job_actions(client):
+    assert not hasattr(api, "REMOTE_KEY")
+    for verb in ("pause", "resume", "stop"):
+        assert client.post(f"/{verb}/1?key=anything").status_code == 401
+
+
+def test_upload_requires_nonce(client, auth):
+    assert client.post("/upload").status_code == 401
+    assert client.post("/upload", headers={"X-Upload-Nonce": "bogus"}).status_code == 401
+    r = client.post("/upload-token", headers=auth, json={})
+    assert r.status_code == 200
+
+
+def test_remote_login_wrong_password_is_refused(client):
+    r = client.post("/remote-login", json={"password": "definitely-wrong"})
+    assert r.status_code in (400, 401, 403)
+
+
+# ----------------------------------------------------------- host header ---
+@pytest.mark.parametrize("host", ["127.0.0.1:5757", "localhost:5757", "localhost", "127.0.0.1"])
+def test_local_host_allowed(client, host):
+    assert client.get("/health", headers={"Host": host}).status_code == 200
+
+
+@pytest.mark.parametrize("host", ["evil.example", "rebind.evil.com:5757", "192.168.1.5:5757", "localhost.evil.com"])
+def test_foreign_host_rejected(client, auth, host):
+    assert client.get("/health", headers={"Host": host}).status_code == 403
+    assert client.get("/diskspace", headers={**auth, "Host": host}).status_code == 403
+
+
+def test_lan_mode_accepts_ip_literal_but_not_hostnames(client, monkeypatch):
+    monkeypatch.setitem(settings.STATE, "lan_access", True)
+    assert client.get("/health", headers={"Host": "192.168.1.5:5757"}).status_code == 200
+    assert client.get("/health", headers={"Host": "rebind.evil.com"}).status_code == 403
+    assert client.get("/health", headers={"Host": "DESKTOP-ABC:5757"}).status_code == 200
+    assert client.get("/health", headers={"Host": "mypc.local:5757"}).status_code == 200
+    assert client.get("/health", headers={"Host": "localhost.evil.com"}).status_code == 403
+
+
+# ----------------------------------------------------------------- /pair ---
+def test_pair_rejects_fake_origin(client):
+    for origin in ("https://evil.example", "null",
+                   "chrome-extension://" + "z" * 32):
+        r = client.post("/pair", headers={"Origin": origin})
+        assert r.status_code == 403, origin
+        assert "token" not in r.get_json()
+
+
+def test_pair_accepts_pinned_extension_once(client):
+    r = client.post("/pair", headers={"Origin": EXT_ORIGIN})
+    assert r.status_code == 200
+    assert r.get_json()["token"] == TOKEN
+    again = client.post("/pair", headers={"Origin": EXT_ORIGIN})
+    assert again.status_code == 403
+
+
+# ---------------------------------------------------------------- misc -----
+def test_health_identity(client):
+    body = client.get("/health").get_json()
+    assert body["ok"] is True and body["app"] == "videograbber"
+
+
+def test_cors_origin_is_pinned():
+    assert api._EXT_ORIGIN == EXT_ORIGIN
 # test_harness.py - Supervisor Architecture acceptance tests (contract §9).
 #
 # Every claim in the contract maps to an assertion here. The harness runs
@@ -23050,9 +23716,10 @@ if failed:
 print("HARNESS: ALL GREEN")
 """updater.py — thin-update check, download, stage, handoff (Session 9).
 
-No UI yet: check_for_update() / apply_update() are plain functions a
-future menu item can call. Compares the latest release tag against the
-version actually installed on disk (install-version.txt, stamped by
+No UI: check_for_update() is a plain function the background scheduler
+below calls. Download, staging and the swap live in updater_ui.py, run by
+the supervisor; the in-process download path was removed. Compares the
+latest release tag against the version actually installed on disk (install-version.txt, stamped by
 updater.bat after each successful swap) numerically — v42 vs 4.0.9 —
 falling back to APP_VERSION on first install. Downloads
 VideoGrabber-app-v*.zip, stages it under %LOCALAPPDATA%\\VideoGrabber\\
@@ -23193,74 +23860,6 @@ def check_for_update(current: str = None):
             return tag, asset["browser_download_url"]
     log(f"updater: release {tag} has no app zip asset")
     return None, None
-
-
-def download_and_stage(url: str) -> Path:
-    """Download the thin zip, verify and extract it; return the pkg dir
-    (the single top-level folder inside the zip, e.g. 'video 3 grabber')."""
-    stage = _staging_root()
-    if stage.exists():
-        shutil.rmtree(stage, ignore_errors=True)
-    stage.mkdir(parents=True, exist_ok=True)
-    zip_path = stage / "update.zip"
-    log(f"updater: downloading {url}")
-    req = Request(url, headers={"User-Agent": "VideoGrabber-Updater"})
-    with urlopen(req, timeout=60) as r, open(zip_path, "wb") as f:
-        shutil.copyfileobj(r, f)
-    stage_real = stage.resolve()
-    with zipfile.ZipFile(zip_path) as zf:
-        for m in zf.infolist():
-            target = (stage / m.filename).resolve()
-            # Path.is_relative_to beats str.startswith: no string-prefix
-            # false positives (e.g. "stage2" vs "stage").
-            if not target.is_relative_to(stage_real):
-                raise RuntimeError(f"updater: unsafe path in zip: {m.filename}")
-        zf.extractall(stage)
-    zip_path.unlink(missing_ok=True)
-    for child in stage.iterdir():
-        if child.is_dir() and (child / "app").is_dir():
-            return child
-    return stage
-
-
-def apply_update() -> bool:
-    """Check, download, stage, hand off to updater.bat. Returns True if an
-    update was staged; the bat finishes the job after this process exits."""
-    if not getattr(sys, "frozen", False):
-        log("updater: source run — updates only apply to the installed exe")
-        return False
-    root = _install_root()
-    current = _installed_tag(root)
-    tag, url = check_for_update(current)
-    if not url:
-        return False
-    pkg = download_and_stage(url)
-    bat = root / "updater.bat"
-    if not bat.is_file():
-        log(f"updater: {bat} missing — can't apply update")
-        return False
-    log(f"updater: staged {tag} (current {current}); handing off to {bat}")
-    creationflags = 0
-    if sys.platform == "win32":
-        # CREATE_NO_WINDOW, not DETACHED_PROCESS: DETACHED makes every
-        # tasklist/timeout inside the bat pop its own console window and
-        # the wait loop spins hot.
-        creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    # Third arg is the tag: updater.bat stamps install-version.txt with it
-    # after the swap, so the next check compares against the NEW version
-    # instead of the APP_VERSION baked into the just-replaced source.
-    subprocess.Popen(
-        [str(bat), str(root), str(pkg), tag],
-        cwd=str(root),
-        close_fds=True,
-        creationflags=creationflags,
-    )
-    return True
-
-
-if __name__ == "__main__":
-    apply_update()
-
 
 
 # --------------------------------------------------------------------------
@@ -23410,12 +24009,17 @@ from vg_state import (StateLock, load_state, mutate_state, save_state,
                       set_update_result, sha256_file, state_dir)
 
 STATE_DIR = state_dir()
-STATE_FILE = STATE_DIR / "recovery_state.json"
-STATE_LOCK = STATE_DIR / "recovery_state.lock"
-BACKUPS_DIR = STATE_DIR / "backups"
-STAGING = STATE_DIR / "staging"
+STATE_FILE = vg_state.state_file()
+STATE_LOCK = vg_state.lock_file()
+BACKUPS_DIR = vg_state.backups_dir()
+STAGING = vg_state.staging_dir()
 DEFAULT_STATE = vg_state.DEFAULT_STATE
 _pid_alive = vg_state.pid_alive
+
+
+def log(msg: str) -> None:
+    """Append to recovery.log under the 'updater' source tag."""
+    vg_state.recovery_log(msg, source="updater")
 
 
 # -------------------------------------------------------- version logic ----
@@ -23440,12 +24044,15 @@ def pick_candidate(releases, blacklist, installed_tag):
     installed = tag_num(installed_tag)
     usable = []
     newer_blocked = False
+    downgrades = []
     for rel in releases or []:
         if rel.get("draft") or rel.get("prerelease"):
             continue
         if app_asset(rel) is None:
             continue
         n = tag_num(rel.get("tag_name"))
+        if 0 <= n < installed:
+            downgrades.append(rel.get("tag_name"))
         if n <= installed:
             continue
         if rel.get("tag_name") in (blacklist or []):
@@ -23455,6 +24062,11 @@ def pick_candidate(releases, blacklist, installed_tag):
     if usable:
         usable.sort(key=lambda r: tag_num(r.get("tag_name")), reverse=True)
         return usable[0], "update"
+    if downgrades and not newer_blocked:
+        # Explicit downgrade guard: every usable release on the list is OLDER
+        # than what is installed, so nothing is offered. Say why.
+        log(f"pick_candidate: refusing to downgrade from {installed_tag}; "
+            f"every usable release is older ({', '.join(map(str, downgrades))})")
     return None, ("blacklisted" if newer_blocked else "uptodate")
 
 
@@ -23574,17 +24186,19 @@ def sums_asset(release: dict, tag: str):
 def verify_download(release: dict, tag: str, asset_name: str,
                       zpath: Path, size: int, got: int) -> None:
     """Fix 11: the byte count must match the asset size exactly, and
-    when the release carries a SHA256SUMS asset (CI publishes one per
-    release) the zip's hash must match it. When no sums asset exists
-    (releases published before it), fall back to the size check plus
-    the manifest verification inside the package, and say so."""
+    the release must carry a SHA256SUMS asset (CI publishes one per
+    release) and the zip's hash must match it. A release without one is
+    refused: the size check plus the in-package manifest alone are not
+    enough to install an update."""
     if size and got != size:
         raise RuntimeError(
             f"download truncated or overlong: got {got} bytes, "
             f"the asset is {size}")
     sums = sums_asset(release, tag)
     if sums is None:
-        return
+        log(f"verify_download: {tag} has no SHA256SUMS-{tag}.txt asset; "
+            "refusing to install an unverifiable download")
+        raise RuntimeError("release has no SHA256SUMS")
     req = urllib.request.Request(sums["browser_download_url"],
                                  headers={"User-Agent": "VideoGrabber-Updater"})
     with urllib.request.urlopen(req, timeout=30) as r:
@@ -23669,8 +24283,8 @@ class UpdateWorker(QThread):
             try:
                 set_update_result(getattr(self, "_target_tag", None),
                                   False, str(e))
-            except Exception:
-                pass
+            except Exception as exc:
+                log(f"could not record the failed update result: {exc}")
             self.failed.emit(str(e))
 
     def _run(self):

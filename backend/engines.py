@@ -128,8 +128,8 @@ def _twitter_syndication_info(url, proxy=None, prefer_kbps=None):
         t = str(t).replace("0", "").replace(".", "")
         if t and t not in tokens:
             tokens.insert(0, t)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"twitter token fallback failed: {e}")
     for token in tokens:
         api = (f"https://cdn.syndication.twimg.com/tweet-result"
                f"?id={tid}&lang=en&token={token}")
@@ -314,8 +314,8 @@ def _remember_format_audio(url, formats):
             fi.format_id: bool(fi.acodec) and fi.acodec != "none" for fi in formats}
         while len(_FORMAT_AUDIO) > _FORMAT_AUDIO_MAX:
             _FORMAT_AUDIO.pop(next(iter(_FORMAT_AUDIO)))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"format audio cache update failed: {e}")
 
 
 def _format_has_audio(url, format_id):
@@ -770,8 +770,8 @@ class YtDlpEngine:
                         for pat in (stem + "*.part", stem + "*.ytdl"):
                             for f in d_dest.parent.glob(pat):
                                 f.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log(f"could not clear stale .part/.ytdl files: {exc}")
             else:
                 log(f"job {opts.get('job_id') or dest.name}: no direct twitter "
                     f"media found; using yt-dlp extractor")
@@ -1058,8 +1058,8 @@ class YtDlpEngine:
                           and m.stat().st_mtime >= started_ts - 2]
                 if _fresh:
                     return max(_fresh, key=lambda p: p.stat().st_mtime)
-            except OSError:
-                pass
+            except OSError as e:
+                log(f"could not reconcile the output file in {dest.parent}: {e}")
 
         # Playlist mode: yt-dlp already wrote one file per item using the
         # %(playlist_index)s-%(title)s template; dest.stem glob won't match
@@ -1128,8 +1128,8 @@ def _canonical_probe_url(url):
             lid = (parse_qs(u.query).get("list") or [""])[0]
             if lid and not lid.startswith("RD"):
                 return "https://www.youtube.com/playlist?list=" + lid
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"playlist url normalisation failed: {e}")
     return url
 
 
@@ -1274,7 +1274,8 @@ class StreamlinkEngine:
             if r.returncode != 0:
                 return None
             data = json.loads(r.stdout.decode("utf-8", "replace"))
-        except Exception:
+        except Exception as e:
+            log(f"streamlink probe failed: {e}")
             return None
         streams = (data or {}).get("streams") or {}
         out = []
