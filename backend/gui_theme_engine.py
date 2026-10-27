@@ -88,6 +88,13 @@ def _image_exts():
 
 
 IMAGE_EXTS = _image_exts()
+# The Browse dialog only lists real photo formats. The full IMAGE_EXTS list
+# (PDF, PSD, EPS, DDS, HDF, WMF ...) made the Windows file dialog run the
+# shell thumbnail handlers for those types, in this process, while you scroll
+# the folder. "All files" is still there for anything else, and drag and drop
+# accepts every type in IMAGE_EXTS.
+PICKER_EXTS = tuple(e for e in (".png", ".jpg", ".jpeg", ".jfif", ".webp", ".bmp",
+                                ".gif", ".tif", ".tiff", ".ico") if e in IMAGE_EXTS)
 THUMB_MAX = 480                        # longest side the preview ever decodes
 
 
@@ -137,8 +144,11 @@ def extract_colors(path, count=EXTRACT_COLORS):
     if Image is None:
         return _extract_colors_qt(path, count)
     with Image.open(path) as im:
-        im = im.convert("RGB")
+        # Shrink BEFORE converting: a 100 MP photo used to be decoded to a full
+        # RGB copy (hundreds of MB, seconds on the GUI thread) just to read 5 colors.
+        im.draft("RGB", EXTRACT_SIZE)       # JPEG: decode at reduced scale
         im.thumbnail(EXTRACT_SIZE)
+        im = im.convert("RGB")
         q = im.quantize(colors=count, method=Image.Quantize.MEDIANCUT)
     flat = q.getpalette() or []
     out = []
@@ -725,7 +735,7 @@ class ThemeEngineDialog(QDialog):
     def _load_image(self):
         """Browse (the drop zone was clicked)."""
         path, _ = QFileDialog.getOpenFileName(self, "Pick an image", "",
-                                              "Images (" + " ".join("*" + e for e in IMAGE_EXTS)
+                                              "Images (" + " ".join("*" + e for e in PICKER_EXTS)
                                               + ");;All files (*)")
         if path:
             self._load_image_path(path)
@@ -735,7 +745,7 @@ class ThemeEngineDialog(QDialog):
         then wait. Nothing about the theme changes until Fill chips."""
         try:
             colors = extract_colors(path)
-        except (OSError, ValueError) as e:
+        except Exception as e:      # also Pillow's DecompressionBombError and MemoryError
             QMessageBox.warning(self, "Image failed", f"Couldn't read that image:\n{e}")
             return
         if len(colors) < 2:
