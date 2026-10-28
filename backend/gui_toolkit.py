@@ -12,6 +12,7 @@ Output always lands next to the original and never overwrites it:
 Keys: Space play/pause, I set start, O set end, , and . step one frame.
 """
 import json
+from gui_fit import install_fit
 import os
 import re
 import subprocess
@@ -333,8 +334,7 @@ class ToolkitDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Media Toolkit")
         self.setAcceptDrops(True)
-        self.resize(940, 800)
-        self.setMinimumSize(780, 680)
+        install_fit(self, 940, 800, 600, 440)
 
         self._src = None
         self._info = {}

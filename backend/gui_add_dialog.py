@@ -14,6 +14,7 @@ from settings import CATEGORIES
 
 import gui_palette
 import gui_common
+from gui_fit import install_fit
 from gui_common import _bring_to_front, fmt_bytes
 
 
@@ -53,7 +54,7 @@ class AddDownloadDialog(QDialog):
         # come to the front: showEvent does that via _bring_to_front. It is
         # deliberately NOT always-on-top; a topmost dialog refuses to
         # minimize with the main window.
-        self.setMinimumWidth(560)
+        install_fit(self, 560, 420, 380, 300)
         form = QFormLayout(self)
         self.url = QLineEdit(prefill_url)
         self.url.setPlaceholderText("https://example.com/file.mp4")

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 import gui_palette
 from gui_common import _bring_to_front
 from gui_api import ProbeError
+from gui_fit import install_fit
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +130,7 @@ class PlaylistPickerDialog(QDialog):
         self.setWindowTitle("Pick playlist items")
         # Same as AddDownloadDialog: brought to the front on show, but not
         # pinned always-on-top (see _bring_to_front).
-        self.setMinimumSize(720, 560)
+        install_fit(self, 720, 560, 480, 340)
         root = QVBoxLayout(self)
 
         url_row = QHBoxLayout()

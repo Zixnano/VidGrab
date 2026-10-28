@@ -10,46 +10,33 @@ from PySide6.QtWidgets import (
 
 import gui_palette
 from gui_api import _ApiFetchWorker
+from gui_fit import fade_veil, install_fit
 from gui_settings_dialog import _COMPONENT_WORKERS
 
 
-def _fade_widget(widget, enabled, duration=150):
-    """Fade `widget` in over `duration` ms, OutCubic (Session 12.1). No-op
-    when animations are disabled; the graphics effect is removed on finish
-    so rendering and hit-testing return to normal."""
+def _fade_widget(widget, enabled, duration=170):
+    """Soft fade-in of a widget (the table viewport when rows change). Uses a
+    painted veil, not a graphics effect: an effect on a scroll-area viewport
+    could be replaced mid-animation by the next fade."""
+    fade_veil(widget, enabled, gui_palette.PANEL, duration)
+
+
+def _fade_dialog(dialog, enabled, duration=140):
+    """Opacity fade for dialogs. Runs for every dialog (it used to run only for
+    the first one of the session); no-op when animations are off."""
     if not enabled:
         return
-    effect = QGraphicsOpacityEffect(widget)
-    widget.setGraphicsEffect(effect)
-    anim = QPropertyAnimation(effect, b"opacity", widget)
-    anim.setDuration(duration)
-    anim.setStartValue(0.0)
-    anim.setEndValue(1.0)
-    anim.setEasingCurve(QEasingCurve.OutCubic)
-    anim.finished.connect(lambda: widget.setGraphicsEffect(None))
-    anim.start(QAbstractAnimation.DeleteWhenStopped)
-
-
-_DIALOG_FADE_DONE = False
-
-
-def _fade_dialog(dialog, enabled, duration=120):
-    """Opacity fade for dialogs (Session 12.3). The dialog's own event loop
-    (exec) keeps the animation running; no-op when animations are off.
-    Dialogs are built fresh on every open, so a per-instance flag would never
-    skip anything: only the first dialog of the session fades, the rest
-    appear instantly."""
-    global _DIALOG_FADE_DONE
-    if not enabled or _DIALOG_FADE_DONE:
-        return
-    _DIALOG_FADE_DONE = True
-    dialog.setWindowOpacity(0.0)
-    anim = QPropertyAnimation(dialog, b"windowOpacity", dialog)
-    anim.setDuration(duration)
-    anim.setStartValue(0.0)
-    anim.setEndValue(1.0)
-    anim.setEasingCurve(QEasingCurve.OutCubic)
-    anim.start(QAbstractAnimation.DeleteWhenStopped)
+    try:
+        dialog.setWindowOpacity(0.0)
+        anim = QPropertyAnimation(dialog, b"windowOpacity", dialog)
+        anim.setDuration(duration)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.finished.connect(lambda d=dialog: d.setWindowOpacity(1.0))
+        anim.start(QAbstractAnimation.DeleteWhenStopped)
+    except RuntimeError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +98,7 @@ class WhatsNewDialog(QDialog):
     def __init__(self, parent, api):
         super().__init__(parent)
         self.setWindowTitle("What's New")
-        self.resize(560, 520)
+        install_fit(self, 560, 520, 360, 280)
         lay = QVBoxLayout(self)
         self.status = QLabel("Loading release notes\u2026")
         lay.addWidget(self.status)
@@ -160,7 +147,7 @@ class PairDialog(QDialog):
     def __init__(self, parent, token):
         super().__init__(parent)
         self.setWindowTitle("Pair Extension")
-        self.resize(480, 360)
+        install_fit(self, 480, 360, 340, 260)
         lay = QVBoxLayout(self)
         intro = QLabel(
             "<h3 style='margin-bottom:2px;'>Pair the browser extension</h3>"
@@ -319,7 +306,7 @@ class HelpDialog(QDialog):
     def __init__(self, parent, pair_fn=None, whats_new_fn=None):
         super().__init__(parent)
         self.setWindowTitle("Help")
-        self.resize(780, 540)
+        install_fit(self, 780, 540, 520, 320)
         root = QVBoxLayout(self)
         body = QHBoxLayout()
         self.nav = QListWidget()
@@ -364,7 +351,7 @@ class UpdateDialog(QDialog):
         self.choice = "later"
         self.setWindowTitle("Video Grabber update")
         self.setModal(True)
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(320)
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
         title = QLabel(f"Video Grabber {tag} is available")

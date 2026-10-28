@@ -53,6 +53,7 @@ from gui_add_dialog import AddDownloadDialog
 from gui_playlist_picker import PlaylistPickerDialog
 from gui_settings_dialog import _COMPONENT_WORKERS, BandwidthProfilesDialog, SettingsDialog
 from gui_dialogs import _fade_dialog, _fade_widget, HelpDialog, PairDialog, UpdateDialog, WhatsNewDialog
+from gui_fit import apply_app_qss, install_fit
 
 
 # --- Supervisor Architecture (contract v3): sentinel markers + state ----
@@ -163,12 +164,15 @@ def reapply_theme():
     _sync_palette(st)
     app = QApplication.instance()
     if app is not None:
-        app.setStyleSheet(build_qss(st))
+        apply_app_qss(app, build_qss(st))
         f = getattr(app, "_vg_dark_filter", None)
         if f is not None:
             f.refresh()              # theme may have flipped light <-> dark
     w = globals().get("_window")
     if w is not None:
+        w._tray_active = None            # tray icons were rebuilt for the new colors
+        if getattr(w, "_flash_timer", None) is not None:
+            w._flash_timer.stop()        # a pending flash must not undo the new accent
         w.table.viewport().update()
         w.table.horizontalHeader().viewport().update()
         w.select_category(w.current_filter)
@@ -317,6 +321,10 @@ class MainWindow(QMainWindow):
         self.model = DownloadModel(self)
         self.current_filter = "All"
         self.all_items = []
+        self._last_full_refresh = 0.0     # monotonic time of the last full table rebuild
+        self._conn_key = None             # last (text, color) shown in the status label
+        self._tray_active = None          # last tray icon state set
+        self._flash_timer = None          # error accent flash (see _apply_reactive_color)
         self._quitting = False
         self._tray = None
         self._tray_hint_shown = False
@@ -356,8 +364,10 @@ class MainWindow(QMainWindow):
         self._anim_timer.start()
         self._sort_ascending = True
         self.setWindowTitle(f"Video Grabber v{DISPLAY_VERSION}")
-        self.resize(1200, 760)
-        self.setMinimumSize(720, 480)
+        # Fit the screen it opens on; the minimum is small on purpose (the
+        # sidebar scrolls and the table has its own scrollbars), so the window
+        # can always be shrunk until every control is reachable.
+        install_fit(self, 1200, 760, 560, 360)
         self._build_ui()
         self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
         self._show_dialog_signal.connect(self._on_show_dialog, Qt.QueuedConnection)
@@ -690,7 +700,10 @@ class MainWindow(QMainWindow):
         for w in (self._refresh_worker, self._logs_worker, self._diskspace_worker,
                   self._queue_worker, *list(self._pref_workers), *list(_COMPONENT_WORKERS)):
             if w is not None:
-                w.wait(2000)
+                try:
+                    w.wait(2000)
+                except RuntimeError:
+                    pass          # finished and already deleted (deleteLater)
         if self._tray:
             self._tray.hide()
         event.accept()
@@ -1561,12 +1574,46 @@ class MainWindow(QMainWindow):
     def _refresh_worker_done(self):
         self._refresh_worker = None
 
+    def _set_conn_status(self, text, color):
+        """Connection label. setStyleSheet re-polishes the widget even for the
+        same text, and this runs every refresh tick, so only change on a
+        real change."""
+        key = (text, color)
+        if self._conn_key == key:
+            return
+        self._conn_key = key
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}; padding-left: 10px;")
+
     def _on_refresh_failed(self):
-        self.status_label.setText("● Backend offline")
-        self.status_label.setStyleSheet(f"color: {gui_palette.DANGER}; padding-left: 10px;")
+        self._set_conn_status("● Backend offline", gui_palette.DANGER)
+        if self.timer.interval() != 2000:
+            self.timer.setInterval(2000)      # no point hammering an offline backend
+
+    def _pace_refresh(self, items):
+        """Fast ticks while something is moving, slow ticks when idle. New jobs
+        trigger an immediate refresh themselves (see _on_new_job)."""
+        now = time.time()
+        busy = any(j.get("status") in ("downloading", "queued")
+                   or j.get("phase") == "converting"
+                   or (j.get("retry_after") or 0) > now for j in items)
+        iv = 500 if busy else 1500
+        if self.timer.interval() != iv:
+            self.timer.setInterval(iv)
 
     def _on_refreshed(self, payload):
         items, settings = payload
+        self._set_conn_status("● Connected", gui_palette.SUCCESS)
+        self._pace_refresh(items)
+        # Nothing changed since the last tick (the common case while idle):
+        # skip the filter, sort, selection round trip and detail refresh.
+        # A full pass still runs at least every 5 s because some things on
+        # screen depend on the clock (hide-old-errors cutoff).
+        _t = time.monotonic()
+        if (self._last_full_refresh and _t - self._last_full_refresh < 5.0
+                and items == self.all_items and settings == self._gui_settings):
+            return
+        self._last_full_refresh = _t
         self.all_items = items
         self.sidebar.set_counts(_sidebar_counts(items, settings.get("hide_old_errors_hours", 24)))
         self._gui_settings = settings
@@ -1575,13 +1622,12 @@ class MainWindow(QMainWindow):
         # within ~1s; nothing is cached from startup.
         self._gui_settings = settings
         self.animations_enabled = bool(settings.get("animations_enabled", True))
+        self.sidebar.animate = self.animations_enabled
         self.detail_pane.set_play_prefs(bool(settings.get("inline_play_muted", False)),
                                         settings.get("thumb_click_mode", "inline"))
         delegate = self.table.itemDelegate()
         if delegate is not None:
             delegate.animations_enabled = self.animations_enabled
-        self.status_label.setText("● Connected")
-        self.status_label.setStyleSheet(f"color: {gui_palette.SUCCESS}; padding-left: 10px;")
         for j in self.all_items:
             jid = j.get("id")
             if j.get("status") == "done" and jid not in self._done_seen:
@@ -1599,7 +1645,9 @@ class MainWindow(QMainWindow):
         # Tray icon reflects download activity (cached icon swap, ~1/sec).
         if getattr(self, "_tray", None):
             active = any(j.get("status") == "downloading" for j in self.all_items)
-            self._tray.setIcon(_make_tray_icon(active))
+            if active != self._tray_active:
+                self._tray_active = active
+                self._tray.setIcon(_make_tray_icon(active))
         # Snapshot the selection before the model reset wipes it, then restore.
         selected_ids, current_id = self._selection_snapshot()
         self.apply_filter(self.search.text())
@@ -1613,19 +1661,34 @@ class MainWindow(QMainWindow):
 
     def _apply_reactive_color(self, status):
         """Batch 4 reactivity: while a job is in the error state, flash
-        the theme accent red, then restore the saved theme after 3 s."""
+        the accent red, then put it back after 3 s.
+
+        This used to rebuild and re-apply the whole application stylesheet
+        (a full re-polish of every widget) on each new error, and again 3 s
+        later through reapply_theme(). Several errors in a row meant several
+        full restyles while the table was repainting, which froze the window
+        and clobbered a live Theme Engine preview. The flash now only swaps the
+        painted accent (table progress, sidebar highlight) and repaints; a new
+        error inside the 3 s just extends it."""
         if status != "error":
             return
-        from gui_style import build_qss
-        app = QApplication.instance()
-        if app is not None:
-            app.setStyleSheet(build_qss(load_settings(), override_tokens={
-                "accent": "#ef5350", "accent_dim": "#b71c1c"}))
-        QTimer.singleShot(3000, self._reset_reactive_color)
+        gui_palette.ACCENT = "#ef5350"
+        try:
+            self.table.viewport().update()
+            self.sidebar.update()
+        except RuntimeError:
+            return
+        if self._flash_timer is None:
+            self._flash_timer = QTimer(self)
+            self._flash_timer.setSingleShot(True)
+            self._flash_timer.timeout.connect(self._reset_reactive_color)
+        self._flash_timer.start(3000)
 
     def _reset_reactive_color(self):
         try:
-            reapply_theme()
+            gui_palette.ACCENT = gui_palette._PAL["accent"]
+            self.table.viewport().update()
+            self.sidebar.update()
         except RuntimeError:
             pass  # window closed before the reset fired
 
@@ -1691,6 +1754,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_new_job(self, job):
+        QTimer.singleShot(150, self.refresh)    # idle ticks are slower; show it now
         # Silent auto-queue (skip_add_dialog) gives no other feedback when the
         # window is minimized or in the background: one tray toast, at most
         # one per 3 seconds.
@@ -2424,7 +2488,7 @@ def launch_gui(new_job_hook=None, home_dir=None, show_dialog_hook=None):
     _app = QApplication.instance() or QApplication(sys.argv)
     from gui_style import build_qss
     _sync_palette(load_settings())
-    _app.setStyleSheet(build_qss(load_settings()))
+    apply_app_qss(_app, build_qss(load_settings()))
     _app.setApplicationName("Video Grabber")
     _apply_app_icon(_app)
     _app.setFont(QFont("Segoe UI", 10))

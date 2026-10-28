@@ -214,17 +214,52 @@ def _derive(p):
     return p
 
 
+_HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+# Tokens that hold something other than a #hex color (kept as given when sane).
+_NON_COLOR_TOKENS = {"radius", "radius_sm", "radius_chip", "radius_pill", "pad_scale",
+                     "border_w", "font_scale", "font_weight", "border_soft",
+                     "font", "font_mono"}
+
+
+def _is_hex(v):
+    return isinstance(v, str) and bool(_HEX_RE.match(v.strip()))
+
+
+def _clean_overrides(raw, base):
+    """Per-token overrides that are safe to use: a color token must be a
+    #rgb / #rrggbb string. A theme file or settings.json edited by hand (or an
+    import with 'red', 'rgb(1,2,3)', a number, null) used to reach the QSS
+    builder and the contrast math as-is and could break the whole stylesheet or
+    raise. Bad entries are dropped, so the preset value stays."""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        if not isinstance(k, str) or v is None or v == "":
+            continue
+        if k in _NON_COLOR_TOKENS:
+            if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+                out[k] = v
+            continue
+        if k in base or k in DERIVED:
+            if _is_hex(v):
+                out[k] = v.strip()
+    return out
+
+
 def resolve_palette(settings_state=None):
     """Preset + accent + per-token overrides -> concrete token dict."""
-    state = settings_state or {}
+    state = settings_state if isinstance(settings_state, dict) else {}
     name = state.get("theme_preset", "amoled_black")
-    base = THEME_PRESETS.get(name, THEME_PRESETS["amoled_black"])
+    base = THEME_PRESETS.get(name, THEME_PRESETS["amoled_black"]) if isinstance(name, str) \
+        else THEME_PRESETS["amoled_black"]
     pal = dict(base)
     accent = state.get("accent")
-    if accent and accent.lower() != base["accent"].lower():
+    if _is_hex(accent) and accent.strip().lower() != base["accent"].lower():
+        accent = accent.strip()
         pal["accent"] = accent
         pal["accent_dim"] = mix(accent, pal["bg_base"], 0.35)
-    overrides = {k: v for k, v in (state.get("theme_tokens") or {}).items() if v}
+    overrides = _clean_overrides(state.get("theme_tokens"), base)
     for k, v in overrides.items():
         if k in pal:
             pal[k] = v

@@ -30,7 +30,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from gui_theme_page import ThemePage, _theme_from_dict
+from gui_fit import install_fit
+from gui_theme_page import ThemePage, _load_theme_file
 from palette import PRESET_NAMES, THEME_PRESETS, contrast, luminance, resolve_palette
 
 try:
@@ -59,7 +60,7 @@ AA_RULES = {
     "accent": (3.0, ("bg_base",)),
 }
 MIN_TEXT_CONTRAST = 4.5                # WCAG AA for normal text
-LIVE_DEBOUNCE_MS = 75
+LIVE_DEBOUNCE_MS = 120      # each live update restyles the whole app; fewer is smoother
 DEFAULT_NAME = "My Theme"
 MAX_NAME_LEN = 60
 SMART_MIN_SAT = 0.35                   # best accent candidate below this is "not a real accent"
@@ -504,7 +505,7 @@ class ThemeEngineDialog(QDialog):
     def __init__(self, base_settings=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Theme Engine")
-        self.setMinimumWidth(520)
+        install_fit(self, 540, 640, 380, 320)
         base = dict(base_settings or {})          # copy: load_settings() is read-only
         self._base = base
         preset = base.get("theme_preset")
@@ -727,7 +728,14 @@ class ThemeEngineDialog(QDialog):
         dlg.setOption(QColorDialog.DontUseNativeDialog, True)   # keeps the eye dropper
         dlg.currentColorChanged.connect(lambda c, k=key: self._set_chip(k, c.name()))
         dlg.rejected.connect(lambda k=key, o=original: self._set_chip(k, o))
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        if self._picker is not None:
+            try:
+                self._picker.close()    # one picker at a time
+            except RuntimeError:
+                pass
         self._picker = dlg          # keep a reference while the picker is open
+        dlg.destroyed.connect(lambda *_: setattr(self, "_picker", None))
         dlg.open()
 
     # ---- image ----
@@ -856,14 +864,10 @@ class ThemeEngineDialog(QDialog):
         except OSError:
             paths = []
         for p in paths:
-            try:
-                if not p.is_file() or p.stat().st_size > MAX_THEME_BYTES:
-                    continue
-                raw = json.loads(p.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            loaded = _load_theme_file(p)
+            if loaded is None:
                 continue
-            if _theme_from_dict(raw) is None:
-                continue
+            raw, _entry = loaded
             self.load_combo.addItem(self._display_name(raw, p), str(p))
             self.load_combo.setItemData(self.load_combo.count() - 1, p.name, Qt.ToolTipRole)
         idx = self.load_combo.findData(keep) if keep else -1
@@ -880,12 +884,8 @@ class ThemeEngineDialog(QDialog):
         path = self.load_combo.currentData()
         if not path:
             return
-        try:
-            raw = json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            QMessageBox.warning(self, "Load failed", str(e))
-            return
-        entry = _theme_from_dict(raw)
+        loaded = _load_theme_file(Path(path))
+        raw, entry = loaded if loaded else (None, None)
         if entry is None:
             QMessageBox.warning(self, "Load failed", "That file is not a valid theme.")
             return

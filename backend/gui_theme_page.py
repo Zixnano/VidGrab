@@ -328,6 +328,36 @@ class PresetTile(QAbstractButton):
 _NUM_TOKENS = {"pad_scale": (0.6, 1.5), "border_w": (0, 6), "font_scale": (0.7, 1.3)}
 
 
+_FILE_CACHE = {}      # path -> ((mtime_ns, size), (raw, entry) or None)
+
+
+def _load_theme_file(p):
+    """(raw json, normalized entry) for a theme file, or None when it is
+    missing, too big, unreadable or not a theme. Parsed once per file version:
+    opening Settings or the Theme Engine used to re-read and re-resolve every
+    theme file (up to 200) on the UI thread each time."""
+    try:
+        st = p.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        _FILE_CACHE.pop(str(p), None)
+        return None
+    hit = _FILE_CACHE.get(str(p))
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    res = None
+    if st.st_size <= 256 * 1024:
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            entry = _theme_from_dict(raw)
+            if entry is not None:
+                res = (raw, entry)
+        except (OSError, ValueError):
+            res = None
+    _FILE_CACHE[str(p)] = (key, res)
+    return res
+
+
 def _theme_from_dict(d):
     """Normalize a theme file's JSON into a dict the page can preview and
     apply, or None when it holds nothing usable. Accepts the Export format
@@ -985,15 +1015,11 @@ class ThemePage(QWidget):
         except OSError:
             files = []
         for p in files:
-            try:
-                if p.stat().st_size > 256 * 1024:
-                    continue
-                raw = json.loads(p.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            loaded = _load_theme_file(p)
+            if loaded is None:
                 continue
-            e = _theme_from_dict(raw)
-            if e is None:
-                continue
+            raw, e = loaded
+            e = dict(e)          # the cache keeps the original; this copy gets name/path
             nm = raw.get("name") if isinstance(raw.get("name"), str) and raw["name"].strip() else p.stem
             e["name"], e["path"] = nm.strip(), str(p)
             self._file_entries.append(e)

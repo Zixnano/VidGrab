@@ -235,7 +235,7 @@ class ShellFrame(QWidget):
         # Freely resizable: the case stretches with the window, the inner screen
         # takes all the extra room, and the controls column scales down on
         # short windows (see paintEvent) instead of forcing a big minimum.
-        self.setMinimumSize(760, 520)
+        self.setMinimumSize(560, 400)
         self.backlight = bool(backlight)
         self.overlay = _Backlight(self)
         self.overlay.dim = not self.backlight

@@ -196,6 +196,15 @@ class ApiClient:
         # show them; swallowing here made those handlers dead code.
         self._req("POST", "/settings", json={key: value})
 
+    def save_settings(self, values):
+        """Save several settings in ONE request. /settings already accepts any
+        number of keys and merges dict values key by key, so this is the same
+        result as calling save_setting per key, with one round trip and one
+        settings.json write instead of dozens (the Settings dialog used to
+        freeze the window for a moment on Save)."""
+        if values:
+            self._req("POST", "/settings", json=dict(values), timeout=15)
+
     def set_queue_running(self, running):
         # queue_running is ignored by /settings on purpose; this route is
         # the only writer.
@@ -214,6 +223,11 @@ class _ApiFetchWorker(QThread):
     def __init__(self, fn, parent=None):
         super().__init__(parent)
         self._fn = fn
+        # Workers are parented to the window so they cannot be collected while
+        # running, but nothing ever deleted them afterwards: the refresh loop
+        # alone leaked about two QThread objects a second for as long as the
+        # app stayed open. Delete each one when it finishes.
+        self.finished.connect(self.deleteLater)
 
     def run(self):
         try:

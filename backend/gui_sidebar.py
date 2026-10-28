@@ -2,10 +2,11 @@
 
 import time
 
-from PySide6.QtCore import QByteArray, QSize, Qt, Signal
+from PySide6.QtCore import QByteArray, QEasingCurve, QSize, Qt, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QBoxLayout, QFrame, QHBoxLayout, QLabel, QSizePolicy, QToolButton, QVBoxLayout
+from PySide6.QtWidgets import (QBoxLayout, QFrame, QHBoxLayout, QLabel, QScrollArea, QSizePolicy,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from settings import CATEGORIES
 
@@ -172,7 +173,28 @@ class Sidebar(QFrame):
         self.setFixedWidth(self.WIDTH_FULL)
         self._collapsed = False
         self._counts = {}
-        layout = QVBoxLayout(self)
+        self.animate = False          # MainWindow sets this from the animations setting
+        self._width_anim = None
+        # Everything sits in a scroll area (no visible scrollbar, wheel scrolls)
+        # so a short window can shrink: the sidebar used to force the whole
+        # main window to be at least ~650 px tall.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._scroll = QScrollArea()
+        self._scroll.setObjectName("SidebarScroll")
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet(
+            "QScrollArea#SidebarScroll, QScrollArea#SidebarScroll > QWidget > QWidget#SidebarBody"
+            " { background: transparent; border: none; }")
+        body = QWidget()
+        body.setObjectName("SidebarBody")
+        self._scroll.setWidget(body)
+        outer.addWidget(self._scroll)
+        layout = QVBoxLayout(body)
         layout.setContentsMargins(14, 16, 14, 14)
         layout.setSpacing(4)
         self._layout = layout
@@ -279,7 +301,7 @@ class Sidebar(QFrame):
         flag = bool(flag)
         changed = flag != self._collapsed
         self._collapsed = flag
-        self.setFixedWidth(self.WIDTH_COLLAPSED if flag else self.WIDTH_FULL)
+        self._set_width(self.WIDTH_COLLAPSED if flag else self.WIDTH_FULL)
         side = 6 if flag else 14
         self._layout.setContentsMargins(side, 16, side, 14)
         self._brand.setVisible(not flag)
@@ -294,6 +316,25 @@ class Sidebar(QFrame):
             self._refresh_btn(name)
         if changed and user:
             self.collapsed_changed.emit(flag)
+
+    def _set_width(self, target):
+        """Slide to the new width (160 ms, OutCubic) when animations are on and
+        the sidebar is on screen; otherwise jump."""
+        if self._width_anim is not None:
+            self._width_anim.stop()
+            self._width_anim = None
+        if not (self.animate and self.isVisible()) or self.width() == target:
+            self.setFixedWidth(target)
+            return
+        a = QVariantAnimation(self)
+        a.setDuration(160)
+        a.setEasingCurve(QEasingCurve.OutCubic)
+        a.setStartValue(self.width())
+        a.setEndValue(target)
+        a.valueChanged.connect(lambda v: self.setFixedWidth(int(v)))
+        a.finished.connect(lambda t=target: self.setFixedWidth(t))
+        self._width_anim = a
+        a.start()
 
     def set_counts(self, counts):
         """Show a count next to each entry that has any rows."""

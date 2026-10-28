@@ -26,6 +26,7 @@ import gui_common
 from gui_palette import _sync_palette
 from gui_common import load_settings
 from gui_api import _ApiFetchWorker
+from gui_fit import apply_app_qss, fade_in_widget, install_fit
 
 
 def reapply_theme():
@@ -83,6 +84,7 @@ class _SettingsNav(QWidget):
     def _on_row(self, row):
         if row >= 0:
             self.stack.setCurrentIndex(row)
+            fade_in_widget(self.stack.currentWidget(), True, 120)
 
     def build_index(self):
         """Collect each page's visible text so search matches setting names,
@@ -116,8 +118,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.api = api
         self.setWindowTitle("Settings")
-        self.setMinimumSize(780, 520)
-        self.resize(860, 620)
+        install_fit(self, 860, 620, 560, 380)
         s = load_settings()
         layout = QVBoxLayout(self)
         tabs = _SettingsNav()
@@ -655,7 +656,11 @@ class SettingsDialog(QDialog):
 
     def _run_update_job(self, fn, on_done=None):
         prev = getattr(self, "_update_worker", None)
-        if prev is not None and prev.isRunning():
+        try:
+            running = prev is not None and prev.isRunning()
+        except RuntimeError:      # finished and deleted
+            running = False
+        if running:
             return      # one request at a time: a second click can't replace a running worker
         self._set_update_busy(True)
         w = _ApiFetchWorker(fn, self)
@@ -939,7 +944,7 @@ class SettingsDialog(QDialog):
             from gui_style import build_qss
             app = QApplication.instance()
             if app is not None:
-                app.setStyleSheet(build_qss(st))
+                apply_app_qss(app, build_qss(st))
             self._font_preview_on = (fam != self._saved_app_font)
         except Exception:
             pass
@@ -1004,9 +1009,8 @@ class SettingsDialog(QDialog):
             old = (load_settings().get("theme_tokens") or {})
             # the server merges dicts key by key: "" clears a color that was dropped
             send = {k: toks.get(k, "") for k in set(old) | set(toks) if k != "accent"}
-            self.api.save_setting("theme_preset", preset)
-            self.api.save_setting("accent", accent)
-            self.api.save_setting("theme_tokens", send)
+            self.api.save_settings({"theme_preset": preset, "accent": accent,
+                                    "theme_tokens": send})
         try:
             pg._preset, pg._accent, pg._ov = preset, accent, toks
             for k, tile in pg._tiles.items():
@@ -1023,7 +1027,7 @@ class SettingsDialog(QDialog):
         if app is None:
             return
         _sync_palette(state)                   # gui_qt's painted colors follow the live theme
-        app.setStyleSheet(build_qss(state))
+        apply_app_qss(app, build_qss(state))
 
     def _save(self):
         try:
@@ -1039,6 +1043,11 @@ class SettingsDialog(QDialog):
             raise ValueError("Proxy must look like http://host:port, https://host:port, "
                              "socks4://host:port, socks5://host:port or socks5h://host:port")
         if self.api:
+            batch = {}
+
+            def put(key, value):
+                batch[key] = value
+
             for key, widget in [
                 ("force_on_top", self.force_on_top),
                 ("close_to_tray", self.close_to_tray),
@@ -1051,64 +1060,62 @@ class SettingsDialog(QDialog):
                 ("open_folder_on_complete", self.open_folder_on_complete),
                 ("play_sound_on_complete", self.play_sound_on_complete),
             ]:
-                self.api.save_setting(key, widget.isChecked())
-            self.api.save_setting("max_concurrent", int(self.max_concurrent.value()))
-            self.api.save_setting("speed_limit_kbps",
+                put(key, widget.isChecked())
+            put("max_concurrent", int(self.max_concurrent.value()))
+            put("speed_limit_kbps",
                                   int(self.speed_limit_kbps.value()))
-            self.api.save_setting("connection_timeout",
+            put("connection_timeout",
                                   int(self.connection_timeout.value()))
-            self.api.save_setting("max_retries", int(self.max_retries.value()))
-            self.api.save_setting("min_speed_kbps",
+            put("max_retries", int(self.max_retries.value()))
+            put("min_speed_kbps",
                                   int(self.min_speed_kbps.value()))
-            self.api.save_setting("ytdlp_sleep_interval", int(self.yt_delay_min.value()))
-            self.api.save_setting("ytdlp_max_sleep_interval", int(self.yt_delay_max.value()))
-            self.api.save_setting("ytdlp_bot_cooldown_minutes", int(self.yt_cooldown.value()))
-            self.api.save_setting("proxy_url", proxy)
-            self.api.save_setting("proxy_scope", self.proxy_scope.currentData() or "youtube")
-            self.api.save_setting("min_free_space_mb", int(self.min_free_space_mb.value()))
-            self.api.save_setting("ytdlp_use_archive", self.ytdlp_use_archive.isChecked())
-            self.api.save_setting("hide_old_errors_hours", int(self.hide_old_errors_hours.value()))
-            self.api.save_setting("notify_queue_done", self.notify_queue_done.isChecked())
-            self.api.save_setting("auto_update_check", self.auto_update_check.isChecked())
-            self.api.save_setting("update_check_hours", int(self.update_check_hours.value()))
-            self.api.save_setting("ytdlp_auto_update", self.ytdlp_auto_update.isChecked())
-            self.api.save_setting("output_dir", self.output_dir.text().strip())
-            self.api.save_setting("per_category_dirs",
+            put("ytdlp_sleep_interval", int(self.yt_delay_min.value()))
+            put("ytdlp_max_sleep_interval", int(self.yt_delay_max.value()))
+            put("ytdlp_bot_cooldown_minutes", int(self.yt_cooldown.value()))
+            put("proxy_url", proxy)
+            put("proxy_scope", self.proxy_scope.currentData() or "youtube")
+            put("min_free_space_mb", int(self.min_free_space_mb.value()))
+            put("ytdlp_use_archive", self.ytdlp_use_archive.isChecked())
+            put("hide_old_errors_hours", int(self.hide_old_errors_hours.value()))
+            put("notify_queue_done", self.notify_queue_done.isChecked())
+            put("auto_update_check", self.auto_update_check.isChecked())
+            put("update_check_hours", int(self.update_check_hours.value()))
+            put("ytdlp_auto_update", self.ytdlp_auto_update.isChecked())
+            put("output_dir", self.output_dir.text().strip())
+            put("per_category_dirs",
                                   {cat: e.text().strip()
                                    for cat, e in self.percat_edits.items()})
             # Send every known extension explicitly so unchecked boxes
             # reliably re-enable a type (server merges dicts key-by-key).
-            self.api.save_setting("file_types_overrides",
+            put("file_types_overrides",
                                   {ext: cb.isChecked()    # v5.5: checked = capture
                                    for ext, cb in self.ft_checks.items()})
             # --- v5.5 ---
-            self.api.save_setting("completion_sound", self.sound_preset.currentData() or "chime")
-            self.api.save_setting("completion_sound_path", self.sound_path.text().strip())
-            self.api.save_setting("blanc_mode", self.blanc_mode.isChecked())
-            self.api.save_setting("inline_play_muted", self.inline_play_muted.isChecked())
-            self.api.save_setting("thumb_click_mode", self.thumb_click_mode.currentData() or "inline")
-            self.api.save_setting("text_scale", int(self.text_scale.value() or 100))
-            self.api.save_setting("app_font", self.app_font.currentData() or "")
+            put("completion_sound", self.sound_preset.currentData() or "chime")
+            put("completion_sound_path", self.sound_path.text().strip())
+            put("blanc_mode", self.blanc_mode.isChecked())
+            put("inline_play_muted", self.inline_play_muted.isChecked())
+            put("thumb_click_mode", self.thumb_click_mode.currentData() or "inline")
+            put("text_scale", int(self.text_scale.value() or 100))
+            put("app_font", self.app_font.currentData() or "")
             # --- v4 (Session 6) ---
             tv = self.theme_page.values()
-            self.api.save_setting("accent", tv["accent"])
-            self.api.save_setting("theme_preset", tv["theme_preset"])
-            self.api.save_setting("theme_tokens", tv["theme_tokens"])
-            self.api.save_setting("shell_enabled", tv["shell_enabled"])
-            self.api.save_setting("shell_color", tv["shell_color"])
-            self.api.save_setting("shell_backlight", tv["shell_backlight"])
-            self.api.save_setting("shell_colors", tv["shell_colors"])
-            self.api.save_setting("frame_cream", tv["frame_cream"])
-            self.api.save_setting("theme_detail_mode", tv.get("theme_detail_mode", "simple"))
-            # rebuild the stylesheet and repaint so the theme lands live
-            reapply_theme()
-            self.api.save_setting("animations_enabled",
+            put("accent", tv["accent"])
+            put("theme_preset", tv["theme_preset"])
+            put("theme_tokens", tv["theme_tokens"])
+            put("shell_enabled", tv["shell_enabled"])
+            put("shell_color", tv["shell_color"])
+            put("shell_backlight", tv["shell_backlight"])
+            put("shell_colors", tv["shell_colors"])
+            put("frame_cream", tv["frame_cream"])
+            put("theme_detail_mode", tv.get("theme_detail_mode", "simple"))
+            put("animations_enabled",
                                   self.animations_enabled.isChecked())
-            self.api.save_setting("prefer_source_quality",
+            put("prefer_source_quality",
                                   self.prefer_source_quality.isChecked())
             langs = [x.strip() for x in
                      self.subtitle_languages.text().split(",") if x.strip()]
-            self.api.save_setting("subtitle_languages", langs or ["en"])
+            put("subtitle_languages", langs or ["en"])
             rules, engines = [], {}
             for row in range(self.rules_table.rowCount()):
                 dom = self.rules_table.item(row, 0)
@@ -1122,15 +1129,19 @@ class SettingsDialog(QDialog):
                 rules.append({"domain": dom, "category": cat})
                 if eng != "auto":
                     engines[dom] = eng
-            self.api.save_setting("rules", rules)
-            self.api.save_setting("per_site_engine", engines)
-            self.api.save_setting(
+            put("rules", rules)
+            put("per_site_engine", engines)
+            put(
                 "engines_disabled",
                 [n for n, cb in self.engine_checks.items() if not cb.isChecked()])
-            self.api.save_setting(
+            put(
                 "preferred_engines",
                 [self.engine_priority.item(i).text()
                  for i in range(self.engine_priority.count())])
+            # ONE request for every setting (was ~60 blocking calls on the UI
+            # thread), then the theme is applied once, from the saved file.
+            self.api.save_settings(batch)
+            reapply_theme()
         self.accept()
 
 
