@@ -17,13 +17,13 @@
   }
   async function load() {
     try {
-      const { theme, apiToken } = await chrome.storage.local.get(["theme", "apiToken"]);
-      apply(theme);
+      const { theme, apiToken, themeOverride } = await chrome.storage.local.get(["theme", "apiToken", "themeOverride"]);
+      apply(themeOverride || theme);
       if (!apiToken) return;
       const r = await fetch(BASE + "/theme", { headers: { "X-API-Token": apiToken } });
       if (!r.ok) return;
       const fresh = await r.json();
-      apply(fresh);
+      if (!themeOverride) apply(fresh);   // a theme picked in Tools > Theme stays until cleared
       await chrome.storage.local.set({ theme: fresh });
     } catch (e) { /* app not running: keep what we painted */ }
   }

@@ -21,10 +21,17 @@
 (() => {
   const ACK_MS = 1500;   // isolated side must ack within this or we replay natively
   const LRU_CAP = 50;
+  const HOLD_MS = 5 * 60 * 1000;   // sweep: after an ack, drop a hand-off that never reports done or replay
   const GESTURE_MS = 15000;  // how long a click / key press keeps the hook willing
 
   let armed = false;
-  let secret = null;     // adopted from the first vg-armed message (nuisance barrier only)
+  // TODO(v4.5.1): a page script that posts a valid vg-armed first still wins the secret (no out-of-band channel between worlds).
+  // B7 (v4.5.1): adopted from the first vg-armed message ONLY. The message
+  // handler below returns before touching `secret` for every other type, so a
+  // page script cannot plant one with a vg-blob-* message; tests/mainhook.test.js
+  // pins that. A page script that posts a valid vg-armed first still wins:
+  // this is a nuisance barrier, not a security boundary (see content.js).
+  let secret = null;
   let debug = false;
 
   // ---- real user input tracking -----------------------------------------
@@ -225,7 +232,15 @@
     if (secret === null || src !== secret || typeof id !== "string") return;
     if (type === "vg-blob-ack") {
       const p = PENDING.get(id);
-      if (p) clearTimeout(p.timer);           // isolated side has it; stop the watchdog
+      if (p) {
+        clearTimeout(p.timer);                // isolated side has it; stop the watchdog
+        // Sweep (v4.5.1): but do not pin the Blob forever if it never says done/replay.
+        p.timer = setTimeout(() => { PENDING.delete(id); }, HOLD_MS);
+      } else {
+        // The watchdog already replayed this click natively, so an upload now would
+        // be a second copy. Tell the isolated side to skip it.
+        try { window.postMessage({ type: "vg-blob-cancel", source: secret, id }, "*"); } catch (e) {}
+      }
     } else if (type === "vg-blob-done") {
       const p = PENDING.get(id);
       if (p) { clearTimeout(p.timer); PENDING.delete(id); }
@@ -233,4 +248,154 @@
       replay(id);
     }
   }, false);
+})();
+// Sweep (v4.5.1): a rejected storage read used to abort this whole async block at
+// the first await, leaving Save and Test dead. Reads now fall back to {} (and
+// blobHookEnabled undefined means ON, matching content.js).
+async function safeGet(keys) {
+  try { return (await chrome.storage.local.get(keys)) || {}; } catch (e) { return {}; }
+}
+(async () => {
+  const tokenInput = document.getElementById("token");
+  const statusEl = document.getElementById("status");
+  const interceptCheckbox = document.getElementById("interceptDownloads");
+  const gestureCheckbox = document.getElementById("interceptNeedsGesture");
+  const ignoreInput = document.getElementById("interceptIgnore");
+
+  // B9 (v4.5.1): the change listener is registered BEFORE the first await so no
+  // change can slip past it. If vgSettings changes while the initial read is
+  // still in flight, that read holds an older snapshot: changedSinceLoad makes
+  // the initial reads below skip their checkbox updates and their migration write.
+  let changedSinceLoad = false;
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes[VG_SETTINGS_KEY]) {
+      changedSinceLoad = true;
+      const nv = vgNormalize(changes[VG_SETTINGS_KEY].newValue);
+      interceptCheckbox.checked = !!nv.interceptDownloads;
+      gestureCheckbox.checked = nv.interceptNeedsGesture;
+      if (document.activeElement !== ignoreInput) ignoreInput.value = nv.interceptIgnore;
+    }
+  });
+
+  const { apiToken } = await safeGet("apiToken");
+  if (apiToken) tokenInput.value = apiToken;
+  // Batch 3: the switch lives in vgSettings (vgsettings.js) — the same value
+  // the popup's Downloads toggle edits, and the one background.js reads.
+  // The old standalone "interceptDownloads" key is only a migration
+  // fallback: if vgSettings has never carried the switch, adopt the legacy
+  // value once (mirrors the migration in background.js).
+  {
+    const stored = await safeGet([VG_SETTINGS_KEY, "interceptDownloads"]);
+    const rawVg = stored[VG_SETTINGS_KEY];
+    if (changedSinceLoad) {
+      // B9: a newer value already reached the checkbox through the listener.
+    } else if (!(rawVg && typeof rawVg.interceptDownloads === "boolean")
+        && typeof stored.interceptDownloads === "boolean") {
+      const adopted = vgNormalize({ ...(rawVg || {}), interceptDownloads: stored.interceptDownloads });
+      try { await chrome.storage.local.set({ [VG_SETTINGS_KEY]: adopted }); } catch (e) {}
+      interceptCheckbox.checked = adopted.interceptDownloads;
+    } else {
+      interceptCheckbox.checked = !!vgNormalize(rawVg).interceptDownloads;
+    }
+  }
+  interceptCheckbox.addEventListener("change", async () => {
+    const cur = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    await chrome.storage.local.set({
+      [VG_SETTINGS_KEY]: { ...cur, interceptDownloads: interceptCheckbox.checked },
+    });
+  });
+  // v4.4: the click-required switch and the ignore list live in vgSettings too.
+  {
+    const cur = vgNormalize((await safeGet(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    if (!changedSinceLoad) {   // B9: never paint a stale snapshot over a newer value
+      gestureCheckbox.checked = cur.interceptNeedsGesture;
+      ignoreInput.value = cur.interceptIgnore;
+    }
+  }
+  async function saveVg(patch) {
+    // Write path: a failed read must throw, not fall back to defaults and overwrite every setting.
+    const cur = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    await chrome.storage.local.set({ [VG_SETTINGS_KEY]: vgNormalize({ ...cur, ...patch }) });
+  }
+  gestureCheckbox.addEventListener("change", () => saveVg({ interceptNeedsGesture: gestureCheckbox.checked }));
+  ignoreInput.addEventListener("change", () => saveVg({ interceptIgnore: ignoreInput.value }));
+  // Keeping this page honest when the popup toggle flips a switch meanwhile is
+  // the onChanged listener registered at the top of this file (B9).
+
+  const blobHookCheckbox = document.getElementById("blobHookEnabled");
+  const { blobHookEnabled } = await safeGet("blobHookEnabled");
+  blobHookCheckbox.checked = blobHookEnabled !== false;
+  blobHookCheckbox.addEventListener("change", async () => {
+    await chrome.storage.local.set({ blobHookEnabled: blobHookCheckbox.checked });
+  });
+
+  document.getElementById("test").addEventListener("click", async () => {
+    statusEl.textContent = "Contacting app…";
+    statusEl.className = "";
+    try {
+      const ping = await fetch("http://127.0.0.1:5757/ping");
+      if (ping.status === 404) {
+        statusEl.textContent = "App reachable but outdated — update Video Grabber, then retry.";
+        statusEl.className = "bad";
+        return;
+      }
+      if (!ping.ok) throw new Error("no response");
+      const state = await ping.json().catch(() => ({}));
+      if (state.paired) {
+        if (!tokenInput.value.trim()) {
+          statusEl.textContent = "App is paired, but this extension has no token — copy it from the app's Tools menu.";
+          statusEl.className = "bad";
+          return;
+        }
+        statusEl.textContent = "App reachable ✓ — already paired this session.";
+        statusEl.className = "ok";
+        return;
+      }
+      const res = await fetch("http://127.0.0.1:5757/pair", { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.token) {
+          await chrome.storage.local.set({ apiToken: data.token });
+          tokenInput.value = data.token;
+          statusEl.textContent = "Paired ✓";
+          statusEl.className = "ok";
+          return;
+        }
+      }
+      statusEl.textContent = "App reachable but pairing refused — restart the app to re-pair.";
+      statusEl.className = "bad";
+    } catch (e) {
+      statusEl.textContent = "App unreachable — is Video Grabber running?";
+      statusEl.className = "bad";
+    }
+  });
+
+  // v5: show the connection state as soon as the page opens (read-only:
+  // /ping never pairs, so this can't use up the once-per-session pairing).
+  try {
+    const ping = await fetch("http://127.0.0.1:5757/ping");
+    if (ping.ok) {
+      const state = await ping.json().catch(() => ({}));
+      const paired = state.paired || !!tokenInput.value.trim();
+      statusEl.textContent = paired
+        ? "App running" + (state.version ? ` (v${state.version})` : "") + (tokenInput.value.trim() ? " ✓" : " but this extension has no token. Press Test connection.")
+        : "App running, not paired yet. Press Test connection.";
+      statusEl.className = paired && tokenInput.value.trim() ? "ok" : "bad";
+    }
+  } catch (e) {
+    statusEl.textContent = "App not running. Launch Video Grabber, then press Test connection.";
+    statusEl.className = "bad";
+  }
+
+  document.getElementById("save").addEventListener("click", async () => {
+    const value = tokenInput.value.trim();
+    if (!value) {
+      statusEl.textContent = "Paste a token first.";
+      statusEl.className = "bad";
+      return;
+    }
+    await chrome.storage.local.set({ apiToken: value });
+    statusEl.textContent = "Saved ✓ — try downloading something.";
+    statusEl.className = "ok";
+  });
 })();

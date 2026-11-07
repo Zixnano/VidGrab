@@ -345,9 +345,16 @@ function renderMedia() {
 // filter and the size labels have real numbers. Extension pages are exempt
 // from CORS thanks to host_permissions.
 const _sizeProbed = new Set();
+// Sweep (v4.5.1): a probe that failed used to stay in _sizeProbed forever, so the
+// size stayed unknown. Failures are now retried, at most 3 times, 15 s apart.
+const _sizeFail = new Map();   // url -> {n, at}
+const SIZE_RETRY_MS = 15000, SIZE_MAX_TRIES = 3;
 async function probeUnknownSizes(items) {
-  const todo = items.filter((i) => !i.size && !_sizeProbed.has(i.url)
-                                   && /^https?:/i.test(i.url)).slice(0, 25);
+  const todo = items.filter((i) => {
+    if (i.size || _sizeProbed.has(i.url) || !/^https?:/i.test(i.url)) return false;
+    const f = _sizeFail.get(i.url);
+    return !f || (f.n < SIZE_MAX_TRIES && Date.now() - f.at >= SIZE_RETRY_MS);
+  }).slice(0, 25);
   if (!todo.length) return;
   todo.forEach((i) => _sizeProbed.add(i.url));
   let changed = false;
@@ -359,7 +366,13 @@ async function probeUnknownSizes(items) {
         const r = await fetch(it.url, { method: "HEAD", signal: AbortSignal.timeout(6000) });
         const n = parseInt(r.headers.get("content-length") || "0", 10) || 0;
         if (n) { it.size = n; changed = true; }
-      } catch (e) { /* leave size unknown */ }
+        if (!r.ok && (r.status >= 500 || r.status === 429)) throw new Error("HTTP " + r.status);   // transient: retry later
+      } catch (e) {
+        // leave size unknown, but allow another try later
+        _sizeProbed.delete(it.url);
+        const f = _sizeFail.get(it.url) || { n: 0, at: 0 };
+        _sizeFail.set(it.url, { n: f.n + 1, at: Date.now() });
+      }
     }
   };
   await Promise.all([worker(), worker(), worker(), worker()]);
@@ -551,6 +564,7 @@ async function loadCurrent() {
 // away, toast, and close the popup. Runs once per popup open, and never twice
 // for the same URL in the same tab (the second open shows the normal list).
 async function maybeAutoDownload(tab) {
+  if (document.documentElement.classList.contains("side")) return;   // a side panel never auto-sends
   try {
     if (tabMode !== "current" || !/^https?:/i.test(tab.url || "")) return;
     const vis = visibleItems();
@@ -862,6 +876,9 @@ async function setupSettings() {
     $(id).addEventListener("change", async () => {
       const el = $(id);
       const value = kind === "bool" ? el.checked : kind === "num" ? Number(el.value) : el.value;
+      // Sweep: start from what is stored now, not from the copy read when the popup
+      // opened, or a change made meanwhile in Tools or Options would be overwritten.
+      try { cfg = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]); } catch (e) { /* keep the last copy */ }
       cfg = vgNormalize({ ...cfg, [key]: value });
       try { await chrome.storage.local.set({ [VG_SETTINGS_KEY]: cfg }); }
       catch (e) { showToast("Couldn't save the setting", true); }

@@ -1,20 +1,44 @@
+// Sweep (v4.5.1): a rejected storage read used to abort this whole async block at
+// the first await, leaving Save and Test dead. Reads now fall back to {} (and
+// blobHookEnabled undefined means ON, matching content.js).
+async function safeGet(keys) {
+  try { return (await chrome.storage.local.get(keys)) || {}; } catch (e) { return {}; }
+}
 (async () => {
   const tokenInput = document.getElementById("token");
   const statusEl = document.getElementById("status");
-
-  const { apiToken } = await chrome.storage.local.get("apiToken");
-  if (apiToken) tokenInput.value = apiToken;
-
   const interceptCheckbox = document.getElementById("interceptDownloads");
+  const gestureCheckbox = document.getElementById("interceptNeedsGesture");
+  const ignoreInput = document.getElementById("interceptIgnore");
+
+  // B9 (v4.5.1): the change listener is registered BEFORE the first await so no
+  // change can slip past it. If vgSettings changes while the initial read is
+  // still in flight, that read holds an older snapshot: changedSinceLoad makes
+  // the initial reads below skip their checkbox updates and their migration write.
+  let changedSinceLoad = false;
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes[VG_SETTINGS_KEY]) {
+      changedSinceLoad = true;
+      const nv = vgNormalize(changes[VG_SETTINGS_KEY].newValue);
+      interceptCheckbox.checked = !!nv.interceptDownloads;
+      gestureCheckbox.checked = nv.interceptNeedsGesture;
+      if (document.activeElement !== ignoreInput) ignoreInput.value = nv.interceptIgnore;
+    }
+  });
+
+  const { apiToken } = await safeGet("apiToken");
+  if (apiToken) tokenInput.value = apiToken;
   // Batch 3: the switch lives in vgSettings (vgsettings.js) — the same value
   // the popup's Downloads toggle edits, and the one background.js reads.
   // The old standalone "interceptDownloads" key is only a migration
   // fallback: if vgSettings has never carried the switch, adopt the legacy
   // value once (mirrors the migration in background.js).
   {
-    const stored = await chrome.storage.local.get([VG_SETTINGS_KEY, "interceptDownloads"]);
+    const stored = await safeGet([VG_SETTINGS_KEY, "interceptDownloads"]);
     const rawVg = stored[VG_SETTINGS_KEY];
-    if (!(rawVg && typeof rawVg.interceptDownloads === "boolean")
+    if (changedSinceLoad) {
+      // B9: a newer value already reached the checkbox through the listener.
+    } else if (!(rawVg && typeof rawVg.interceptDownloads === "boolean")
         && typeof stored.interceptDownloads === "boolean") {
       const adopted = vgNormalize({ ...(rawVg || {}), interceptDownloads: stored.interceptDownloads });
       try { await chrome.storage.local.set({ [VG_SETTINGS_KEY]: adopted }); } catch (e) {}
@@ -30,31 +54,25 @@
     });
   });
   // v4.4: the click-required switch and the ignore list live in vgSettings too.
-  const gestureCheckbox = document.getElementById("interceptNeedsGesture");
-  const ignoreInput = document.getElementById("interceptIgnore");
   {
-    const cur = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
-    gestureCheckbox.checked = cur.interceptNeedsGesture;
-    ignoreInput.value = cur.interceptIgnore;
+    const cur = vgNormalize((await safeGet(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    if (!changedSinceLoad) {   // B9: never paint a stale snapshot over a newer value
+      gestureCheckbox.checked = cur.interceptNeedsGesture;
+      ignoreInput.value = cur.interceptIgnore;
+    }
   }
   async function saveVg(patch) {
+    // Write path: a failed read must throw, not fall back to defaults and overwrite every setting.
     const cur = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
     await chrome.storage.local.set({ [VG_SETTINGS_KEY]: vgNormalize({ ...cur, ...patch }) });
   }
   gestureCheckbox.addEventListener("change", () => saveVg({ interceptNeedsGesture: gestureCheckbox.checked }));
   ignoreInput.addEventListener("change", () => saveVg({ interceptIgnore: ignoreInput.value }));
-  // Keep this page honest if the popup toggle flips the switch meanwhile.
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && changes[VG_SETTINGS_KEY]) {
-      const nv = vgNormalize(changes[VG_SETTINGS_KEY].newValue);
-      interceptCheckbox.checked = !!nv.interceptDownloads;
-      gestureCheckbox.checked = nv.interceptNeedsGesture;
-      if (document.activeElement !== ignoreInput) ignoreInput.value = nv.interceptIgnore;
-    }
-  });
+  // Keeping this page honest when the popup toggle flips a switch meanwhile is
+  // the onChanged listener registered at the top of this file (B9).
 
   const blobHookCheckbox = document.getElementById("blobHookEnabled");
-  const { blobHookEnabled } = await chrome.storage.local.get("blobHookEnabled");
+  const { blobHookEnabled } = await safeGet("blobHookEnabled");
   blobHookCheckbox.checked = blobHookEnabled !== false;
   blobHookCheckbox.addEventListener("change", async () => {
     await chrome.storage.local.set({ blobHookEnabled: blobHookCheckbox.checked });

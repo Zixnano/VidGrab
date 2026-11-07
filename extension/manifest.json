@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Universal Video Grabber",
-  "version": "4.4.0",
+  "version": "4.5.2",
   "minimum_chrome_version": "111",
   "description": "Detects video streams (mp4/HLS/DASH) on any page and sends them to the local Video Grabber app for full-speed download via yt-dlp. Includes a blob/MediaRecorder fallback for in-page-only streams.",
   "permissions": [
@@ -15,7 +15,8 @@
     "downloads",
     "notifications",
     "contextMenus",
-    "favicon"
+    "favicon",
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -54,6 +55,15 @@
     },
     "toggle-intercept": {
       "description": "Turn Video Grabber's download interception on or off (no default key, set one in the shortcuts page)"
+    },
+    "send-all-page": {
+      "description": "Send every media file detected on this page to Video Grabber (no default key)"
+    },
+    "toggle-pill": {
+      "description": "Show or hide the pill over videos (no default key)"
+    },
+    "start-queue": {
+      "description": "Start the Video Grabber queue (no default key)"
     }
   },
   "content_scripts": [
@@ -62,7 +72,9 @@
         "<all_urls>"
       ],
       "js": [
+        "vglog.js",
         "vgsettings.js",
+        "vgcore.js",
         "content.js"
       ],
       "run_at": "document_idle",

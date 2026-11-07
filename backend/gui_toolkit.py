@@ -108,6 +108,26 @@ def _theme_colors():
     return d
 
 
+# v4.5.2: crash reporter is optional; the toolkit must work without it.
+try:
+    import crash_dump as _crash
+except Exception:
+    _crash = None
+
+
+def _crumb(event, **data):
+    if _crash is not None:
+        try:
+            _crash.crumb(event, **data)
+        except Exception:
+            pass
+
+
+# Probe threads that outlived their dialog. Qt aborts the whole process if a
+# running QThread is destroyed, so these are kept alive here until they finish.
+_ORPHAN_PROBES = []
+
+
 # ------------------------------------------------------------ ffprobe thread
 class _ProbeThread(QThread):
     done = Signal(int, dict)
@@ -116,6 +136,18 @@ class _ProbeThread(QThread):
     def __init__(self, token, path, parent=None):
         super().__init__(parent)
         self._token, self._path = token, str(path)
+        self._proc = None
+        self._cancelled = False
+
+    def cancel(self):
+        """Stop ffprobe now so the thread can end. Safe from the GUI thread."""
+        self._cancelled = True
+        p = self._proc
+        if p is not None and p.poll() is None:
+            try:
+                p.kill()
+            except OSError:
+                pass
 
     def run(self):
         try:
@@ -124,9 +156,17 @@ class _ProbeThread(QThread):
                    "height,r_frame_rate,avg_frame_rate,duration:stream_disposition=attached_pic",
                    "-of", "json", self._path]
             kw = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                               timeout=45, **kw)
-            data = json.loads(r.stdout or "{}")
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                          text=True, errors="replace", **kw)
+            try:
+                out, _err = self._proc.communicate(timeout=45)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.communicate()
+                raise
+            if self._cancelled:
+                return
+            data = json.loads(out or "{}")
             fmt = data.get("format") or {}
             streams = data.get("streams") or []
             vid = next((s for s in streams if s.get("codec_type") == "video"
@@ -648,6 +688,7 @@ class ToolkitDialog(QDialog):
         self._stop_playback()
         self._clear_result()
         self._src, self._info, self._mode = path, {}, "source"
+        _crumb("toolkit_load", file=path.name)
         self._token += 1
         self._set_loaded(False)
         self.src_label.setText(f"Source: {path.name}")
@@ -698,6 +739,7 @@ class ToolkitDialog(QDialog):
     def _on_probe_failed(self, token, msg):
         if token != self._token:
             return
+        _crumb("toolkit_probe_failed", msg=str(msg)[:200])
         self.info_label.setText("")
         self.status.setText(f"Couldn't read this file: {msg}")
 
@@ -1182,4 +1224,12 @@ class ToolkitDialog(QDialog):
             self._player.stop()
             self._player.setSource(QUrl())    # release the file handle (Windows)
         for t in list(self._probes):
-            t.wait(2000)
+            t.cancel()                      # kill ffprobe so the thread ends now
+            if not t.wait(3000):
+                # Still running (ffprobe ignored the kill). Detach it from this
+                # dialog and keep a Python reference: destroying a running
+                # QThread aborts the process (the v4.5.2 crash fix).
+                self._probes.remove(t)
+                t.setParent(None)
+                _ORPHAN_PROBES.append(t)
+                t.finished.connect(lambda th=t: _ORPHAN_PROBES.remove(th) if th in _ORPHAN_PROBES else None)

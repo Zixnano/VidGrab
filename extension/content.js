@@ -97,9 +97,11 @@
   const LIVE = [];            // {video, overlay} for every pill we created
   let cfg = vgNormalize();    // v4.3: extension settings (popup cog), see vgsettings.js
   let lastQuality = {};       // host -> {res: "1920x1080"}
+  let hostQuality = {};       // Batch 2: host -> preferred max height (set in the panel, shared with the app send path)
 
   try {
-    chrome.storage.local.get(["disabledSites", "lastQuality", "pillPrefs", VG_SETTINGS_KEY]).then((st) => {
+    chrome.storage.local.get(["disabledSites", "lastQuality", "pillPrefs", "vgHostQuality", VG_SETTINGS_KEY]).then((st) => {
+      hostQuality = st.vgHostQuality || {};
       siteDisabled = Array.isArray(st.disabledSites) && st.disabledSites.includes(SITE);
       lastQuality = st.lastQuality || {};
       pillPrefs = st.pillPrefs || {};
@@ -112,6 +114,7 @@
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== "local") return;
       if (changes.lastQuality) lastQuality = changes.lastQuality.newValue || {};
+      if (changes.vgHostQuality) hostQuality = changes.vgHostQuality.newValue || {};
       if (changes[VG_SETTINGS_KEY]) {
         // v4.3: popup settings changed; apply live.
         const prev = cfg;
@@ -337,6 +340,25 @@
   // Put the format matching this site's last pick first and star it.
   function orderFormats(formats) {
     const want = lastQuality[SITE] && lastQuality[SITE].res;
+    // Batch 2: a per-site limit set in the panel wins over the global default,
+    // and over a remembered pick (it is the more deliberate choice). Among the
+    // formats at the chosen height the one with the higher frame rate leads.
+    const siteCap = (window.VGCORE && VGCORE.qualityFor(hostQuality, SITE, 0)) || 0;
+    if (siteCap > 0) {
+      let bestIdx = -1, bestH = 0, bestFps = 0;
+      formats.forEach((f, idx) => {
+        const mm = /(\d+)\s*x\s*(\d+)/.exec(f.resolution || "");
+        if (!mm) return;
+        const h = Math.min(+mm[1], +mm[2]), fps = +f.fps || 0;
+        if (h <= siteCap && (h > bestH || (h === bestH && fps > bestFps))) { bestH = h; bestFps = fps; bestIdx = idx; }
+      });
+      if (bestIdx >= 0) {
+        const list = formats.slice();
+        const [hit] = list.splice(bestIdx, 1);
+        list.unshift(hit);
+        return { list, starred: hit };
+      }
+    }
     if (!want) {
       // v4.3: no remembered pick for this site, so use the Settings default
       // format (highest resolution not above it) and star it.
@@ -451,9 +473,18 @@
         return (x.hostname.replace(/^www\./, "") + x.pathname).toLowerCase();
       } catch (e) { return ""; }
     };
+    // Sweep (v4.5.1): norm() drops the query, so ?v=1 and ?v=2 on one path look
+    // the same. Prefer an exact match including the query; a path-only match is
+    // used only when it is unique. Two tabs with the same address (or the same
+    // path and no exact match) are ambiguous and fall through to null below.
     const here = norm(location.href);
-    const byPath = (tabs || []).find((t) => norm(t.url) === here);
-    if (byPath) return byPath.items || [];
+    const full = (u) => { try { const x = new URL(u); return x.hostname.replace(/^www\./, "").toLowerCase() + x.pathname.toLowerCase() + x.search; } catch (e) { return ""; } };
+    const exact = (tabs || []).filter((t) => full(t.url) === full(location.href));
+    if (exact.length === 1) return exact[0].items || [];
+    if (exact.length > 1) return null;
+    const byPath = (tabs || []).filter((t) => norm(t.url) === here);
+    if (byPath.length === 1) return byPath[0].items || [];
+    if (byPath.length > 1) return null;
     let origin = "";
     try { origin = location.origin; } catch (e) {}
     const sameOrigin = (tabs || []).filter((t) => {
@@ -765,6 +796,15 @@
     return err.length > 40 ? err.slice(0, 39) + "…" : err;
   }
 
+  // Sweep (v4.5.1): getDisplayMedia failures used to all read "Capture cancelled".
+  function captureErrorLabel(e) {
+    const name = (e && e.name) || "", msg = String((e && e.message) || "");
+    if (name === "NotAllowedError") return /by system|policy|disallowed/i.test(msg) ? "Capture blocked: permission denied" : "Capture cancelled";
+    if (name === "NotFoundError") return "No capture source found";
+    if (name === "AbortError" || name === "NotReadableError") return "Capture failed, try again";
+    return "Capture failed";
+  }
+
   function setLabel(overlay, text, color) {
     overlay.label.textContent = text;
     if (color) overlay.icon.style.color = color;
@@ -805,7 +845,9 @@
     // "none" is yt-dlp's explicit audio-only marker. An unknown vcodec with
     // a WxH resolution (silent Twitter MP4s) is video, not audio.
     const kind = (f.vcodec === "none" || (!f.vcodec && !/\d+x\d+/.test(res))) ? "audio only" : "";
-    return [res, ext, kind, size].filter(Boolean).join(" · ");
+    // Batch 2: frame rate, e.g. "60 fps" (nothing for audio or when unknown).
+    const fps = (!kind && window.VGCORE) ? VGCORE.fpsLabel(f) : "";
+    return [res, fps, ext, kind, size].filter(Boolean).join(" · ");
   }
 
   // Probe results cached per URL so reopening the menu doesn't re-hit the app.
@@ -821,13 +863,17 @@
     const data = url && FORMAT_RESULTS.get(url);
     const formats = data && data.formats;
     if (!formats || !formats.length) return "";
-    let best = 0;
+    let best = 0, bestFps = 0;
     for (const f of formats) {
       const m = /(\d+)\s*x\s*(\d+)/.exec(f.resolution || "");
       // Short side: a 1080x1920 portrait clip is still "1080p".
-      if (m) best = Math.max(best, Math.min(+m[1], +m[2]));
+      if (m) {
+        const hgt = Math.min(+m[1], +m[2]), fps = +f.fps || 0;
+        if (hgt > best || (hgt === best && fps > bestFps)) { best = hgt; bestFps = fps; }
+      }
     }
-    if (best) return best + "p";
+    // Batch 2: "1080p60" when the best format runs at 50 fps or more.
+    if (best) return best + "p" + (bestFps >= 50 ? Math.round(bestFps) : "");
     const audio = formats.find((f) => f.ext);
     return audio ? String(audio.ext).toUpperCase() : "";
   }
@@ -857,6 +903,7 @@
   function addMenuItem(menu, text, opts = {}, onClick) {
     const el = document.createElement("div");
     el.textContent = text;
+    if (!opts.header) { el.setAttribute("role", "menuitem"); el.tabIndex = 0; el.addEventListener("keydown", (e) => { if ((e.key === "Enter" || e.key === " ") && onClick) { e.preventDefault(); e.stopPropagation(); onClick(); } }); }
     el.style.cssText = "padding:6px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;";
     if (opts.dim) el.style.color = TH.text_muted;
     if (opts.header) {
@@ -933,15 +980,37 @@
     return clean(document.title, 80) || "video";
   }
 
-  // onResult(ok), when given, reports the outcome to a caller that has a
+  // B8 (v4.5.1): why a page-URL send failed, so a caller with a fallback can
+  // tell "try something else" (network) from "that tweet can't be had"
+  // (not_found, private, no_url). "other" covers anything unrecognised and,
+  // like the permanent reasons, never triggers a fallback.
+  function pageSendFailReason(resp) {
+    const err = resp && resp.error ? String(resp.error) : "";
+    if (!err) return "network";   // no reply at all
+    if (/\b5\d\d\b|isn't running|failed to fetch|network|econnrefused|time ?out|timed out|load failed|service unavailable|too many requests|\b429\b/i.test(err)) return "network";
+    if (/private|protected|log ?in|sign in|authenticat|age[- ]restrict|forbidden|\b403\b/i.test(err)) return "private";
+    if (/not found|no video|could(n't| not) be found|\b404\b|\b410\b|does not exist|deleted|unavailable|unsupported url/i.test(err)) return "not_found";
+    return "other";
+  }
+
+  // onResult(ok, reason), when given, reports the outcome to a caller that has a
   // fallback (one-click on X tries the permalink first, then the sniffed
-  // file). Labels are set here exactly as before either way.
+  // file). reason is set on failure: "no_url", "network", "private",
+  // "not_found" or "other". Labels are set here exactly as before either way.
   async function handleSendPageUrl(video, overlay, closeMenu, download_playlist = false, onResult = null) {
     if (closeMenu) closeMenu();
     const pu = pageUrlFor(video);
     if (!pu) {
-      setLabel(overlay, "Couldn't find tweet link", TH.error);
-      if (onResult) onResult(false);
+      // B5 (v4.5.1): pageUrlFor() already refuses to hand back a feed URL (it
+      // returns "" when no tweet permalink surrounds the video), so nothing
+      // that reads "Home / X" can reach the app from here. What was missing is
+      // the explanation: on a feed-like page say what to do. A blanket block on
+      // /home etc. would also stop a feed video's own tweet permalink from being
+      // sent, which is the point of pageUrlFor(), so the guard keys on the
+      // missing permalink instead.
+      const feedLike = /(^|\.)(x|twitter)\.com$/i.test(location.hostname) && /^\/(home|explore|search|notifications|messages)\b/i.test(location.pathname);
+      setLabel(overlay, feedLike ? "Open a tweet first" : "Couldn't find tweet link", TH.error);
+      if (onResult) onResult(false, "no_url");
       return;
     }
     setLabel(overlay, "Sending…");
@@ -959,7 +1028,7 @@
           const vgLE = (chrome.runtime.lastError && chrome.runtime.lastError.message) || vgErr;
           if (vgLE) {
             setLabel(overlay, failLabel(null, vgLE), TH.error);
-            if (onResult) onResult(false);
+            if (onResult) onResult(false, "network");
             return;
           }
           if (resp && resp.ok) {
@@ -968,7 +1037,7 @@
             if (onResult) onResult(true);
           } else {
             setLabel(overlay, failLabel(resp), TH.error);
-            if (onResult) onResult(false);
+            if (onResult) onResult(false, pageSendFailReason(resp));
           }
         }
       );
@@ -978,7 +1047,7 @@
       // The callback never fires and lastError never arrives, so
       // without this the click looks like it did nothing at all.
       setLabel(overlay, failLabel(null, String(e && e.message ? e.message : e)), TH.error);
-      if (onResult) onResult(false);
+      if (onResult) onResult(false, "network");
     }
   }
 
@@ -1037,9 +1106,12 @@
     } catch (e) {}
   }
 
-  function recBaseName(mode) {
+  function recBaseName(mode, startTitle) {
     // R.7: <title> <mode> <quality> YYYYMMDD HHMMSS (sanitized).
-    const title = (document.title || "recording").replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+    // B6 (v4.5.1): startTitle is document.title as it was when the recording
+    // began. Reading document.title here, at stop time, picked up the next page
+    // after an SPA navigation (X: "Home / X").
+    const title = (startTitle || document.title || "recording").replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
     const d = new Date();
     const pad = (n) => String(n).padStart(2, "0");
     const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())} ` +
@@ -1125,7 +1197,7 @@
           selfBrowserSurface: "include",
         });
       } catch (e) {
-        setLabel(overlay, "Capture cancelled", TH.error);
+        setLabel(overlay, captureErrorLabel(e), TH.error);
         return;
       }
     } else if (mode === "screen") {
@@ -1135,7 +1207,7 @@
           audio: true,
         });
       } catch (e) {
-        setLabel(overlay, "Capture cancelled", TH.error);
+        setLabel(overlay, captureErrorLabel(e), TH.error);
         return;
       }
     }
@@ -1157,18 +1229,35 @@
         return;
       }
     }
-    const state = { recorder, stream, mode: usedMode };
+    const state = { recorder, stream, mode: usedMode, title: document.title };   // B6: title captured at start
     recorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) chunks.push(e.data);
     };
     recorder.onstop = () => {
       clearInterval(state.tick);
+      if (state.navCleanup) state.navCleanup();   // M6: drop the pagehide / visibilitychange listeners
       if (state.onFullscreen) document.removeEventListener("fullscreenchange", state.onFullscreen);
       if (state.indicator) state.indicator.remove();
       stream.getTracks().forEach((t) => t.stop());
       const blob = new Blob(chunks, { type: mime || "video/webm" });
-      const guessName = recBaseName(usedMode);
+      const guessName = recBaseName(usedMode, state.title);
+      if (blob.size === 0) {   // nothing was captured: don't upload or save an empty file
+        setLabel(overlay, "Nothing was recorded", TH.error);
+        recNotify("Video Grabber", "Recording stopped but nothing was captured.");
+        RECORDERS.delete(video);
+        return;
+      }
       recNotify("Video Grabber", `Recording saved — ${usedMode} (${recQuality}).`);
+      // M6.3 (v4.5.1): the page is going away or hidden, so the app may never answer
+      // before it dies. Save with the browser first and skip the upload (an upload
+      // that succeeds on a still-visible hidden tab would only make a second copy).
+      if (document.visibilityState === "hidden") {
+        console.debug("[VG] recording stopped on a hidden page: saving with the browser, upload skipped");
+        saveBlob(blob, guessName);
+        setLabel(overlay, "Saved ✓ (browser) - Record again", TH.accent);
+        RECORDERS.delete(video);
+        return;
+      }
       vgSend({ type: "GET_UPLOAD_NONCE" }, async (nresp) => {
         if (chrome.runtime.lastError || !nresp || !nresp.ok || !nresp.nonce) {
           saveBlob(blob, guessName);
@@ -1187,8 +1276,11 @@
           if (res.ok) {
             setLabel(overlay, "Sent to app ✓ — Record again", TH.accent);
           } else {
+            // The app refused the upload (too large, nonce expired...). The
+            // recording used to be dropped here. Keep it: save it in the browser.
             const data = await res.json().catch(() => ({}));
-            setLabel(overlay, (data.error || "Upload rejected").slice(0, 40), TH.error);
+            saveBlob(blob, guessName);
+            setLabel(overlay, ((data.error || "Upload rejected") + " — saved in browser").slice(0, 48), TH.warning || TH.accent);
           }
         } catch (e) {
           saveBlob(blob, guessName);
@@ -1197,8 +1289,36 @@
         RECORDERS.delete(video);
       });
     };
-    recorder.start(1000);
+    // Batch 2 lifecycle: stop cleanly (and keep what was captured) when the
+    // recorder errors, the video ends, the captured track is lost (tab capture
+    // stopped), or memory use gets large (chunks are held in memory).
+    const stopSafely = (why) => { try { if (recorder.state !== "inactive") { console.debug("[VG] recording stopped:", why); recorder.stop(); } } catch (e) {} };
+    let recBytes = 0;
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) { chunks.push(e.data); recBytes += e.data.size; if (recBytes > 1.5 * 1024 * 1024 * 1024) { recNotify("Video Grabber", "Recording stopped at 1.5 GB to protect the browser's memory."); stopSafely("memory cap"); } }
+    };
+    recorder.onerror = () => stopSafely("recorder error");
+    try { video.addEventListener("ended", () => stopSafely("video ended"), { once: true }); } catch (e) {}
+    try { stream.getTracks().forEach((t) => t.addEventListener("ended", () => stopSafely("track ended"), { once: true })); } catch (e) {}
+    // v4.5.2: recorder.start() can throw (InvalidStateError). Stop the tracks
+    // so the page's camera/tab capture is released, then report it.
+    try {
+      recorder.start(1000);
+    } catch (e) {
+      try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      recNotify("Video Grabber", "Couldn't start the recording: " + (e && e.message ? e.message : e));
+      return;
+    }
     RECORDERS.set(video, state);
+    // M6.2 (v4.5.1): navigating away used to destroy the recorder and lose the take.
+    // pagehide always stops it (the page is going away, onstop then saves). A hidden
+    // tab stops it only with Settings > autoSaveRecordingOnNavigate, because a tab
+    // switch also hides the page.
+    const onPageHide = () => stopSafely("page hidden");
+    const onVisibility = () => { if (document.hidden === true && cfg.autoSaveRecordingOnNavigate) stopSafely("tab hidden"); };
+    window.addEventListener("pagehide", onPageHide);
+    document.addEventListener("visibilitychange", onVisibility);
+    state.navCleanup = () => { window.removeEventListener("pagehide", onPageHide); document.removeEventListener("visibilitychange", onVisibility); state.navCleanup = null; };
     makeRecIndicator(state, overlay);
     recNotify("Video Grabber", `Recording started — ${usedMode} (${recQuality}).`);
     setLabel(overlay, "● Recording — see indicator", TH.error);
@@ -1217,13 +1337,14 @@
 
   function addRecordItems(menu, video, overlay, closeMenu) {
     // R.1/R.3: quality row (cycles) + the four capture modes.
-    addMenuItem(menu, `Quality: ${recQuality} (click to cycle)`, { dim: true }, () => {
+    // B4 (v4.5.1): keep the row itself. menu.firstChild is the stream-info
+    // header, not this row, so writing there showed the quality in the wrong
+    // place and left this row stale until the menu was reopened.
+    const qRow = addMenuItem(menu, `Quality: ${recQuality} (click to cycle)`, { dim: true }, () => {
       const order = ["Low", "Medium", "High", "Source"];
       recQuality = order[(order.indexOf(recQuality) + 1) % order.length];
-      // Re-render the menu so the row shows the new quality.
-      menu.querySelectorAll("div").forEach(() => {});
-      const hdr = menu.firstChild;
-      if (hdr) hdr.textContent = `Quality: ${recQuality} (click to cycle)`;
+      // Re-render the row so it shows the new quality at once.
+      qRow.textContent = `Quality: ${recQuality} (click to cycle)`;
     });
     for (const m of REC_MODES) {
       addMenuItem(menu, m.label, {}, () => {
@@ -1239,6 +1360,13 @@
     HANDLED.add(video);
 
     const overlay = makeOverlay(video);
+    try {   // Batch 1 accessibility: name the controls, announce the menu, let Escape close it
+      overlay.btn.setAttribute("aria-label", "Download this video with Video Grabber");
+      overlay.menuBtn.setAttribute("aria-label", "Download options");
+      overlay.menuBtn.setAttribute("aria-haspopup", "menu");
+      overlay.menu.setAttribute("role", "menu");
+      overlay.wrap.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
+    } catch (e) { /* cosmetic */ }
     // When this pill's video element appeared. The sniffed-list filter
     // below uses it: only media first seen around this time can be
     // this tweet's stream.
@@ -1318,6 +1446,23 @@
         setLabel(overlay, "Couldn't find tweet link", TH.error);
         return;
       }
+      // E2 (v4.5.2): a blob: currentSrc (X and most MSE players) is not a URL the
+      // app can fetch, and a probed format_id belongs to the page URL, not to
+      // that blob. Resolve the sniffed stream the same way the mode picker does,
+      // or refuse with a clear message. Never send a blob to the app.
+      const curSrc = (!directUrl && video.currentSrc) || "";
+      if (!force_page_url && /^blob:/i.test(curSrc)) {
+        if (format_id) {
+          if (!pu) { setLabel(overlay, "Can't match that quality here. Try One-Click.", TH.error); setTimeout(() => restoreLabel(overlay), 4000); return; }
+          return sendChoice({ format_id, target_format, bypass_dialog, download_playlist, pick_playlist, force_page_url: true });
+        }
+        setLabel(overlay, "Finding the stream…");
+        querySniffedVideos((best) => {
+          if (!best || !best.url) { setLabel(overlay, "No stream found. Try One-Click or Record.", TH.error); setTimeout(() => restoreLabel(overlay), 4000); return; }
+          sendChoice({ target_format, bypass_dialog, download_playlist, pick_playlist, url: best.url });
+        }, null);
+        return;
+      }
       setLabel(overlay, "Sending…");
       let base = tweetNameFor(video);
       // Strip an extension the page title already carries so we never
@@ -1329,6 +1474,31 @@
       try {
         ext = (new URL(directUrl || video.currentSrc).pathname.match(/(\.[A-Za-z0-9]{1,5})$/) || [""])[0];
       } catch (e) {}
+      // Batch 2: smart one-click. A direct URL sent without the dialog goes
+      // through SEND_SMART: a proper file name, the site's preferred HLS
+      // variant, a duplicate check, and a browser save when the app is off.
+      // Anything with an explicit format, playlist or page-URL request keeps
+      // the original path untouched.
+      const smartUrl = directUrl || video.currentSrc || "";
+      if (cfg.smartOneClick && bypass_dialog && !format_id && !download_playlist && !force_page_url && !pick_playlist
+          && /^https?:/i.test(smartUrl) && smartUrl !== (pu || location.href)) {
+        const runSmart = (force) => vgSend({ type: "SEND_SMART", url: smartUrl, pageUrl: pu || location.href, title: document.title,
+            filename: ext ? base + ext : undefined, target_format, force: !!force }, (resp, vgErr) => {
+          if (vgErr || !resp) { setLabel(overlay, failLabel(null, vgErr || "No reply"), TH.error); return; }
+          if (resp.ok) {
+            setLabel(overlay, resp.standalone ? "Saved by browser ✓" : (resp.duplicate_of ? "Already in your list" : "Sent" + (resp.note ? " " + resp.note : "") + " ✓"), TH.accent);
+            setTimeout(() => restoreLabel(overlay), 2500);
+          } else if (resp.duplicate && cfg.confirmDuplicates) {
+            setLabel(overlay, "Sent before. Click again to resend", TH.warning || TH.accent);
+            overlay.__vgResend = () => { overlay.__vgResend = null; setLabel(overlay, "Sending…"); runSmart(true); };
+            setTimeout(() => { overlay.__vgResend = null; restoreLabel(overlay); }, 5000);
+          } else if (resp.duplicate) { runSmart(true); }
+          else if (resp.code === "hls_unsafe") { setLabel(overlay, String(resp.error || "Can't merge this stream").slice(0, 48), TH.error); setTimeout(() => restoreLabel(overlay), 4000); }
+          else setLabel(overlay, failLabel(resp), TH.error);
+        });
+        runSmart(false);
+        return;
+      }
       const payload = {
         // Normal picks open the app's confirmation dialog (IDM-style);
         // bypass_dialog queues directly.
@@ -1392,6 +1562,13 @@
     function addQueueItem(menu) {
       addDivider(menu);
       addMenuItem(menu, "Start Queue", {}, () => { closeMenu(); startQueue(); });
+      addMenuItem(menu, "Send all media on this page", {}, () => {
+        closeMenu(); setLabel(overlay, "Sending all…");
+        vgSend({ type: "SEND_ALL_TAB" }, (r, e) => {
+          setLabel(overlay, r && r.ok ? "Sent " + r.sent + " ✓" : String((r && r.error) || e || "Nothing to send").slice(0, 40), r && r.ok ? TH.accent : TH.error);
+          setTimeout(() => restoreLabel(overlay), 2500);
+        }, 120000);
+      });
     }
 
     function toggleMenu() {
@@ -1442,7 +1619,12 @@
           // "Download file" at the very top of the menu. Otherwise the
           // placeholder is removed and the menu falls back to its current
           // behavior (Send page URL, formats, recording).
-          if (blob || !video.currentSrc) {
+          // X/Twitter feed: the sniffer list is tab-wide, so the newest stream
+          // can belong to a different tweet's video, or be its audio-only
+          // playlist. A tweet permalink is the only reliable handle there, so
+          // no sniffed "Download file" item is offered. The format rows below
+          // and the one-click path both use this tweet's own permalink.
+          if ((blob || !video.currentSrc) && !/(^|\.)(x|twitter)\.com$/i.test(location.hostname)) {
             const sniffPh = addMenuItem(menu, "Looking for sniffed stream…",
               { dim: true, header: true });
             querySniffedVideos((best) => {
@@ -1665,8 +1847,11 @@
         // resolves the complete video+audio set. A raw sniffed file can be
         // a video-only variant, so it is the fallback here.
         if (/(^|\.)(x|twitter)\.com$/i.test(location.hostname)) {
-          handleSendPageUrl(video, overlay, null, false, (ok) => {
-            if (!ok) sendSniffedOneClick();
+          // B8: only a transport failure falls back to the sniffed file. A missing
+          // or private tweet would fail the same way for the file, and a second
+          // send after a failed one only creates a confusing duplicate.
+          handleSendPageUrl(video, overlay, null, false, (ok, reason) => {
+            if (!ok && reason === "network") sendSniffedOneClick();
           });
           return;
         }
@@ -1722,6 +1907,7 @@
           setTimeout(() => { if (video.isConnected) refresh(); }, 1500);
           return;
         }
+        if (overlay.__vgResend) { overlay.__vgResend(); return; }   // "Sent before. Click again to resend"
         if (!fromMenuArrow && cfg.oneClickMode) { oneClickSend(); return; }
         toggleMenu();
       } catch (err) {
@@ -2147,9 +2333,13 @@
     const url = microUrlFor(el);   // re-read now: srcset may have changed since hover
     if (!url) { microToastShow("No image URL found", true); return; }
     try {
+      // Batch 2: image pill goes through the smart path (good file name, archive
+      // entry, browser save when the app is off). force:true keeps the old
+      // behaviour of never refusing a repeat image.
+      const smart = cfg.smartOneClick && /^https?:/i.test(url);
       vgSend(
-        { type: "RELAY_DOWNLOAD", url, pageUrl: location.href,
-          filename: microFilenameFor(url), skipList: true },
+        smart ? { type: "SEND_SMART", url, pageUrl: location.href, filename: microFilenameFor(url), title: document.title, force: true }
+              : { type: "RELAY_DOWNLOAD", url, pageUrl: location.href, filename: microFilenameFor(url), skipList: true },
         (resp, vgErr) => {
           const vgLE = (chrome.runtime.lastError && chrome.runtime.lastError.message) || vgErr;
           if (vgLE) {
@@ -2157,7 +2347,7 @@
             return;
           }
           if (resp && resp.ok) {
-            microToastShow(resp.duplicate_of ? "Image already in your list" : "Image sent to queue!");
+            microToastShow(resp.standalone ? "Image saved by the browser" : (resp.duplicate_of ? "Image already in your list" : "Image sent to queue!"));
           } else {
             microToastShow(failLabel(resp), true);
           }
@@ -2312,6 +2502,7 @@
     if (!HOOK_HOSTS.includes(location.hostname.toLowerCase())) return;
 
     const BLOB_DEBUG = false;
+    const CANCELLED = new Set();   // ids the page already replayed natively (vg-blob-cancel): never upload these
     const bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
     const SECRET = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -2365,8 +2556,9 @@
       return n || "download";
     }
 
-    async function uploadBlob(blob, filename) {
+    async function uploadBlob(blob, filename, id) {
       const st = await queryState();
+      if (CANCELLED.has(id)) return false;
       if (!hookEnabled || !st || !st.alive || !st.paired || !st.intercept) {
         dbg("not ready", st);
         return false;
@@ -2382,6 +2574,7 @@
           } catch (e) { resolve(null); }
         });
         if (!nresp || !nresp.ok || !nresp.nonce) { dbg("no nonce", nresp); return { fail: true }; }
+        if (CANCELLED.has(id)) return { fail: true };
         const form = new FormData();
         form.append("file", blob, cleanName(filename));
         const r = await fetch("http://127.0.0.1:5757/upload", {
@@ -2421,6 +2614,11 @@
         if (!d || typeof d !== "object") return;
         type = d.type; src = d.source; id = d.id; blob = d.blob; filename = d.filename;
       } catch (err) { return; }
+      if (type === "vg-blob-cancel" && src === SECRET && typeof id === "string") {
+        CANCELLED.add(id);
+        if (CANCELLED.size > 100) CANCELLED.delete(CANCELLED.values().next().value);
+        return;
+      }
       if (type !== "vg-blob-download" || src !== SECRET) return;
       if (typeof id !== "string" || !(blob instanceof Blob)) return;
 
@@ -2428,7 +2626,7 @@
       post({ type: "vg-blob-ack", id });
       let ok = false;
       try {
-        ok = await uploadBlob(blob, typeof filename === "string" ? filename : "");
+        ok = await uploadBlob(blob, typeof filename === "string" ? filename : "", id);
       } catch (err) {
         dbg("upload failed", err);
         ok = false;
@@ -2436,7 +2634,7 @@
       if (ok) {
         post({ type: "vg-blob-done", id });
         recNotify("Video Grabber", ok.category ? `Sent to ${ok.category} ✓` : "Sent to app ✓");
-      } else {
+      } else if (!CANCELLED.has(id)) {
         post({ type: "vg-blob-replay", id });
       }
     });

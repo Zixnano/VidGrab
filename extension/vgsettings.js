@@ -31,7 +31,17 @@ const VG_DEFAULTS = {
   // subdomains) and file extensions (".exe"), separated by spaces, commas or
   // new lines.
   interceptIgnore: "",
+  // Batch 2 (schema 2). All additive: an older saved object simply picks up
+  // these defaults, and an unknown key from a newer one is dropped.
+  smartOneClick: true,      // one click on a pill/row: pick the name, quality and variant automatically
+  standaloneFallback: true, // app offline + plain direct file: let the browser save it
+  notifyDiscovery: false,   // desktop notification when a new video/stream shows up on a page
+  density: "comfortable",   // popup and side panel row density: comfortable | compact
+  libraryHideSegments: true,// hide .ts/.m4s fragments in the sniffed library
+  confirmDuplicates: true,  // ask before re-sending something already in the archive
+  autoSaveRecordingOnNavigate: true, // v4.5.1: stop and save a running recording when the page is hidden or left
 };
+const VG_SCHEMA = 2;
 function vgNormalize(raw) {
   const r = (raw && typeof raw === "object") ? raw : {};
   const d = VG_DEFAULTS;
@@ -57,5 +67,12 @@ function vgNormalize(raw) {
     oneClickMode: bool("oneClickMode"),
     interceptNeedsGesture: bool("interceptNeedsGesture"),
     interceptIgnore: str("interceptIgnore", 2000),
+    smartOneClick: bool("smartOneClick"),
+    standaloneFallback: bool("standaloneFallback"),
+    notifyDiscovery: bool("notifyDiscovery"),
+    density: pick("density", ["comfortable", "compact"]),
+    libraryHideSegments: bool("libraryHideSegments"),
+    confirmDuplicates: bool("confirmDuplicates"),
+    autoSaveRecordingOnNavigate: bool("autoSaveRecordingOnNavigate"),
   };
 }

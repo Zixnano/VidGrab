@@ -8,6 +8,13 @@
 
 const BACKEND_BASE = "http://127.0.0.1:5757";
 
+// Batch 1: shared modules. Loaded first so every later line can log and use the
+// pure helpers. vglog.js = ring-buffer logger, vgchrome.js = API reliability +
+// capability detection, vgcore.js = pure helpers (names, inspector, schedules).
+importScripts("vglog.js", "vgchrome.js", "vgcore.js");
+VGLOG.setContext("sw");
+VGLOG.hydrate();
+
 // --- CIRCUIT BREAKER: Prevent browser lockups if the desktop app is dead ---
 const originalFetch = self.fetch.bind(self);
 self.fetch = function (input, init) {
@@ -22,8 +29,12 @@ self.fetch = function (input, init) {
   // the old flat 2 s limit aborted them while the app was still working, and
   // the click then looked dead.
   const quick = /\/(health|ping)(\?|$)/.test(urlStr);
+  // /probe-formats runs yt-dlp's extractor, which routinely takes 20 to 40 s
+  // on a cold start; the flat 20 s cap reported those as "timeout" even though
+  // the app was fine. It now gets 75 s, everything else keeps 20 s.
+  const slow = /\/(probe-formats|probe|probe-head)(\?|$)/.test(urlStr);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), quick ? 2000 : 20000);
+  const timeoutId = setTimeout(() => controller.abort(), quick ? 2000 : (slow ? 75000 : 20000));
   const opts = { ...(init || {}) };
   if (init && init.signal) {
     if (init.signal.aborted) controller.abort();
@@ -39,9 +50,14 @@ self.fetch = function (input, init) {
 // read lands it holds the defaults, so nothing is dropped on a cold wake.
 importScripts("vgsettings.js");
 let VGCFG = vgNormalize({});
+// B10 (v4.5.1): vgcfgSynced flips once the first read has landed (or failed, in
+// which case the defaults are the truth). Until then snifferAllows() is
+// deliberately permissive: a request dropped on a cold wake is lost for good,
+// while one let through too early only adds a list entry the user can ignore.
+let vgcfgSynced = false;
 const vgcfgReady = chrome.storage.local.get(VG_SETTINGS_KEY).then(
-  (st) => { VGCFG = vgNormalize(st[VG_SETTINGS_KEY]); },
-  () => {}
+  (st) => { VGCFG = vgNormalize(st[VG_SETTINGS_KEY]); vgcfgSynced = true; },
+  () => { vgcfgSynced = true; }
 );
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes[VG_SETTINGS_KEY]) {
@@ -62,6 +78,7 @@ try {
 } catch (e) { /* tracking unavailable: sniffer stays on all tabs */ }
 
 function snifferAllows(tabId) {
+  if (!vgcfgSynced) return true;   // B10: permissive until the settings read has landed (see vgcfgSynced)
   if (VGCFG.snifferMode !== "active") return true;
   if (!ACTIVE_TABS.size) return true;
   for (const id of ACTIVE_TABS.values()) if (id === tabId) return true;
@@ -198,7 +215,7 @@ function tabHasManifest(tabId) {
 // True when this manifest should NOT be listed (a variant of a known master,
 // or a second variant in a folder that already has one). Also drops variants
 // that a newly arriving master supersedes.
-function manifestSuperseded(m, url) {
+function manifestSuperseded(m, url, tabId) {
   const info = manifestInfo(url);
   if (!info) return false;
   const others = [];
@@ -213,8 +230,16 @@ function manifestSuperseded(m, url) {
     }
     return false;
   }
-  for (const [k, , oi] of others) {
-    if (oi.isVariant && oi.dir.startsWith(info.dir)) m.delete(k);       // master wins
+  for (const [k, it, oi] of others) {
+    if (oi.isVariant && oi.dir.startsWith(info.dir)) {
+      // B1 (v4.5.1): deliberate choice. The variant is dropped silently from the
+      // list, but anything that reacted to it (a discovery notification, a
+      // watchlist match) must be able to undo that, so a "removed" event fires.
+      // bg-features.js clears the variant's notification on it.
+      VGLOG.debug("sniff", "superseded variant removed", { url: it.url });
+      m.delete(k);                                                       // master wins
+      if (typeof VGBG !== "undefined") VGBG.emit("removed", { tabId, item: it, reason: "superseded" });
+    }
   }
   return false;
 }
@@ -240,7 +265,7 @@ function addItem(tabId, item) {
       }
     }
   }
-  if (!m.has(key) && manifestSuperseded(m, item.url)) return;
+  if (!m.has(key) && manifestSuperseded(m, item.url, tabId)) return;
   if (m.has(key)) {
     // Don't overwrite real data with empty data: keep the existing size /
     // content-type when the new entry lacks them.
@@ -255,7 +280,9 @@ function addItem(tabId, item) {
     item.timestamp = Date.now();
     item.originalUrl = item.url;
   }
+  const isNew = !m.has(key);
   m.set(key, item);
+  if (isNew && typeof VGBG !== "undefined") VGBG.emit("item", { tabId, item });
   // Cap the per-tab list: Map keeps insertion order, so the oldest go first.
   while (m.size > MAX_ITEMS_PER_TAB) m.delete(m.keys().next().value);
   setBadge(tabId, String(m.size));
@@ -342,6 +369,9 @@ function clearTabVideos(tabId) {
 
 chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId === 0) {
+    // B3 (v4.5.1): sites open about:blank in the top frame (popups, print
+    // views, pre-render) without leaving the page; that must not wipe the list.
+    if (/^about:blank/i.test(details.url)) return;
     tabNavIdentity.set(details.tabId, navIdentity(details.url));
     clearTabVideos(details.tabId);
   }
@@ -367,6 +397,8 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  // v4.5.2: drop any window entry that named this tab, so ACTIVE_TABS never holds a closed id.
+  for (const [wid, active] of ACTIVE_TABS) if (active === tabId) ACTIVE_TABS.delete(wid);
   videoMap.delete(tabId);
   clearRecentFor(tabId);
   tabNavIdentity.delete(tabId);
@@ -394,10 +426,24 @@ function sameHost(a, b) {
 // Cookies for an item: always the item's own URL first. The page's cookies
 // are only a fallback when the item lives on the page's own host, so session
 // cookies never travel to a third-party CDN.
+// v4.5.4: a file on a sub-domain of the page's site (page pawchive.pw, file
+// n2.pawchive.pw) is the same site, so the page's cookies belong with it. The
+// old exact-hostname test sent no cookies there, and such files returned 403.
+// Only the same host or a parent/child host matches; unrelated sites never do.
+function sameSiteFamily(fileUrl, pageUrl) {
+  try {
+    const f = new URL(fileUrl).hostname.toLowerCase();
+    const p = new URL(pageUrl).hostname.toLowerCase();
+    return f === p || f.endsWith("." + p) || p.endsWith("." + f);
+  } catch (e) {
+    return false;
+  }
+}
+
 async function cookieHeaderForItem(url, pageUrl) {
   const own = await cookieHeaderFor(url).catch(() => "");
   if (own) return own;
-  if (pageUrl && sameHost(url, pageUrl)) {
+  if (pageUrl && sameSiteFamily(url, pageUrl)) {
     return await cookieHeaderFor(pageUrl).catch(() => "");
   }
   return "";
@@ -451,13 +497,28 @@ async function getApiToken() {
 }
 
 async function authedFetch(path, options = {}) {
-  const token = await getApiToken();
-  const headers = { ...(options.headers || {}), "X-API-Token": token };
-  const res = await fetch(`${BACKEND_BASE}${path}`, { ...options, headers });
+  let token = await getApiToken();
+  const go = (t) => fetch(`${BACKEND_BASE}${path}`, { ...options, headers: { ...(options.headers || {}), "X-API-Token": t } });
+  let res = await go(token);
   if (res.status === 401) {
-    return { res, unpaired: true };
+    // The app issues a new token after a reinstall or a reset, which left the
+    // stored one stale until the user pasted a fresh one by hand. Try one
+    // silent re-pair. The old token is only replaced when /pair answers with a
+    // different one, so a refused /pair changes nothing.
+    try {
+      const pr = await fetch(`${BACKEND_BASE}/pair`, { method: "POST" });
+      if (pr.ok) {
+        const d = await pr.json().catch(() => ({}));
+        if (d.token && d.token !== token) {
+          token = d.token;
+          await chrome.storage.local.set({ apiToken: token });
+          VGLOG.info("pair", "token was stale, re-paired automatically");
+          res = await go(token);
+        }
+      }
+    } catch (e) { VGLOG.debug("pair", "re-pair attempt failed", e); }
   }
-  return { res, unpaired: false };
+  return { res, unpaired: res.status === 401 };
 }
 
 let _pairInFlight = null; // module-level guard: concurrent wakes share one pair attempt
@@ -575,7 +636,7 @@ async function showAddDialogFor(msg) {
       return { ok: false, error: "Not paired yet." };
     }
     const data = await res.json().catch(() => ({}));
-    if (res.ok) noteFavicon(msg.pageUrl || msg.url);
+    if (res.ok) { noteFavicon(msg.pageUrl || msg.url); VGBG.emit("sent", { items: [{ url: msg.url, filename: msg.filename, format_id: msg.format_id }], pageUrl: msg.pageUrl, job_ids: data.job_id ? [data.job_id] : [], viaDialog: true }); }
     return { ok: res.ok, job_id: data.job_id, auto_queued: data.auto_queued,
              duplicate_of: data.duplicate_of || null, error: data.error };
   } catch (e) {
@@ -584,22 +645,37 @@ async function showAddDialogFor(msg) {
 }
 
 // ---- v5: right-click "Download with Video Grabber"
-function ensureContextMenus() {
-  try {
-    chrome.contextMenus.removeAll(() => {
-      chrome.contextMenus.create({
-        id: "vg-link", title: "Download with Video Grabber",
-        contexts: ["link", "video", "audio", "image"],
+// Menus used to be created only in onInstalled, so a disable/enable cycle or a
+// profile restore could leave the browser without them until the next update.
+// Now created on install, on browser start and on every worker start, with one
+// build in flight at a time so overlapping calls can't hit "duplicate id".
+let _menusBuilding = null;
+function buildContextMenus() {
+  if (_menusBuilding) return _menusBuilding;
+  _menusBuilding = new Promise((resolve) => {
+    try {
+      chrome.contextMenus.removeAll(() => {
+        void chrome.runtime.lastError;
+        const defs = (self.VG_MENU_DEFS || []);
+        for (const d of defs) {
+          chrome.contextMenus.create(d, () => { void chrome.runtime.lastError; });
+        }
+        resolve(true);
       });
-      chrome.contextMenus.create({
-        id: "vg-page", title: "Send this page to Video Grabber",
-        contexts: ["page"],
-      });
-    });
-  } catch (e) {}
+    } catch (e) { VGLOG.warn("menus", "build failed", e); resolve(false); }
+  }).finally(() => { _menusBuilding = null; });
+  return _menusBuilding;
 }
-chrome.runtime.onInstalled.addListener(ensureContextMenus);
+self.VG_MENU_DEFS = [
+  { id: "vg-link", title: "Download with Video Grabber", contexts: ["link", "video", "audio", "image"] },
+  { id: "vg-page", title: "Send this page to Video Grabber", contexts: ["page"] },
+];
+chrome.runtime.onInstalled.addListener(() => buildContextMenus());
+chrome.runtime.onStartup.addListener(() => buildContextMenus());
+
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  // Menu ids added by bg-features.js are handled there.
+  if (info.menuItemId !== "vg-link" && info.menuItemId !== "vg-page") return;
   markGesture();   // v4.4: a menu click is user input
   // v4.2: right-clicking an image skips the DOM and the Add dialog: srcUrl
   // goes straight to the queue. Links, video and audio keep the old path.
@@ -674,6 +750,8 @@ function pickLargestItem(items) {
 }
 
 chrome.commands.onCommand.addListener(async (command, tab) => {
+  // Commands added by bg-features.js are handled there.
+  if (command !== "download-media" && command !== "open-add-dialog" && command !== "toggle-intercept") return;
   markGesture();   // v4.4: a shortcut is user input
   try {
     if (command === "toggle-intercept") {   // v4.4: works on any tab, even a non-http one
@@ -733,7 +811,7 @@ async function sendToBackend({ url, pageUrl, filename, format_id, target_format,
       return { ok: false, error: "Not paired yet — open the extension's Options page and paste in the pairing token from the desktop app." };
     }
     const data = await res.json().catch(() => ({}));
-    if (res.ok) noteFavicon(pageUrl || url);
+    if (res.ok) { noteFavicon(pageUrl || url); VGBG.emit("sent", { items: [{ url, filename, format_id }], pageUrl, job_ids: data.job_id ? [data.job_id] : [] }); }
     return { ok: res.ok, job_id: data.job_id,
              duplicate_of: data.duplicate_of || null, error: data.error };
   } catch (e) {
@@ -952,6 +1030,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
   }
   burstTimes.push(now);
   RECENT_INTERCEPT.set(item.url, now);
+  // B2 (v4.5.1): the sweep below only drops entries older than the dedup window,
+  // so a burst of fresh entries could grow the map. Map order is insertion
+  // order, so the first key is the oldest: evict it first.
+  if (RECENT_INTERCEPT.size > 200) RECENT_INTERCEPT.delete(RECENT_INTERCEPT.keys().next().value);
   if (RECENT_INTERCEPT.size > 200) {
     for (const [u, ts] of RECENT_INTERCEPT) {
       if (now - ts >= INTERCEPT_DEDUP_MS) RECENT_INTERCEPT.delete(u);
@@ -1006,6 +1088,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
   console.debug(`[VG] intercept: browser lag ${browserLag}ms, handoff ${Date.now() - t0}ms, ok=${handedOff} cancelled=${cancelled}`);
   if (handedOff) {
     noteFavicon(item.referrer || item.url);
+    VGBG.emit("sent", { items: [{ url: item.url, filename }], pageUrl: item.referrer || "", job_ids: [], viaIntercept: true });
     // v4.4: tidy the browser's downloads list. Only when the cancel worked;
     // a finished download's entry (cancel failed) stays, it is a real file.
     if (cancelled) { try { await chrome.downloads.erase({ id: item.id }); } catch (e) {} }
@@ -1032,282 +1115,440 @@ function mapReadyOrTimeout() {
   ]);
 }
 
-function vgHandleMessage(msg, sender, sendResponse) {
-  if (msg.type === "RELAY_DOWNLOAD") {
-    // From content.js overlay OR popup.js
-    const tabId = sender.tab ? sender.tab.id : msg.tabId;
-    // A bookkeeping failure here must never block the download itself.
-    try {
-      if (!msg.skipList) addItem(tabId, { url: msg.url, source: "overlay", contentType: null });
-    } catch (e) { console.warn("[VG] addItem failed (ignored):", e); }
-    sendToBackend({
-      url: msg.url,
-      pageUrl: msg.pageUrl || msg.url,
-      filename: msg.filename,
-      format_id: msg.format_id,
-      target_format: msg.target_format,
-      download_playlist: msg.download_playlist || false,
-    }).then(sendResponse).catch((e) => sendResponse({ ok: false, error: String(e) }));
-    return true; // async
-  }
+// ============================================================================
+// Message dispatcher (Batch 1). One registry, one listener. A handler is
+//   (msg, sender, respond) => true | void
+// and returns true when it will call respond() later. Feature files
+// (bg-features.js) add their own handlers through VGBG.on(), so this file
+// keeps the sniffer, the app client and the interceptor, and nothing else.
+// Unknown message types are ignored (not answered): other listeners in the
+// extension may own them.
+// ============================================================================
+const HANDLERS = Object.create(null);
+function on(type, fn) {
+  if (HANDLERS[type]) VGLOG.warn("dispatch", "handler replaced: " + type);
+  HANDLERS[type] = fn;
+}
 
-  if (msg.type === "RELAY_BATCH") {
-    // items: [{url, filename}], from the popup's "Grab all media on this page"
-    // and media-checklist send buttons. VERIFIED LIVE (popup.js x2 senders) —
-    // audit F2 was wrong about this one; retained.
-    const items = msg.items || [];
-    // Playlist support: a top-level flag applies to items without their own.
-    if (msg.download_playlist) {
-      for (const it of items) {
-        if (it.download_playlist === undefined) it.download_playlist = true;
-      }
+on("RELAY_DOWNLOAD", (msg, sender, respond) => {
+  // From content.js overlay OR popup.js / side panel
+  const tabId = sender.tab ? sender.tab.id : msg.tabId;
+  // v4.5.2: the app can't fetch blob:/data: URLs; refuse them instead of queueing a dead job.
+  if (/^(blob|data):/i.test(String(msg.url || ""))) {
+    respond({ ok: false, error: "That video is only in the page (blob:). Pick the stream from the list or use Record.", code: "blob" });
+    return true;
+  }
+  // A bookkeeping failure here must never block the download itself.
+  try {
+    if (!msg.skipList) addItem(tabId, { url: msg.url, source: "overlay", contentType: null });
+  } catch (e) { VGLOG.warn("relay", "addItem failed (ignored)", e); }
+  sendToBackend({
+    url: msg.url,
+    pageUrl: msg.pageUrl || msg.url,
+    filename: msg.filename,
+    format_id: msg.format_id,
+    target_format: msg.target_format,
+    download_playlist: msg.download_playlist || false,
+  }).then(respond).catch((e) => respond({ ok: false, error: String(e) }));
+  return true;
+});
+
+on("RELAY_BATCH", (msg, sender, respond) => {
+  // items: [{url, filename}], from the popup's "Grab all media on this page"
+  // and media-checklist send buttons. VERIFIED LIVE (popup.js x2 senders).
+  const items = msg.items || [];
+  // Playlist support: a top-level flag applies to items without their own.
+  if (msg.download_playlist) {
+    for (const it of items) {
+      if (it.download_playlist === undefined) it.download_playlist = true;
     }
-    (async () => {
-      const alive = await checkBackend();
-      if (!alive) {
-        sendResponse({ ok: false, error: "Video Grabber app isn't running." });
-        return;
-      }
-      // Page cookies go in the top-level field only when every item is on the
-      // page's own host. Otherwise the top-level cookie is empty and each
-      // item carries cookies fetched for its own URL, so nothing reaches a
-      // third-party host.
-      const allSameHost = items.every((it) => it && it.url && sameHost(it.url, msg.pageUrl));
-      let cookie = "";
-      let sendItems = items;
-      if (allSameHost) {
-        cookie = await cookieHeaderFor(msg.pageUrl).catch(() => "");
-      } else {
-        sendItems = await Promise.all(items.map(async (it) => ({
-          ...it,
-          cookie: it && it.url ? await cookieHeaderFor(it.url).catch(() => "") : "",
-        })));
-      }
-      try {
-        const { res, unpaired } = await authedFetch("/batch", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            items: sendItems,
-            referer: msg.pageUrl,
-            page_url: msg.pageUrl,
-            cookie,
-            user_agent: navigator.userAgent,
-            download_playlist: msg.download_playlist || false,
-          }),
-        });
-        if (unpaired) {
-          sendResponse({ ok: false, error: "Not paired yet — open the extension's Options page and paste in the pairing token from the desktop app." });
-          return;
-        }
-        const data = await res.json().catch(() => ({}));
-        if (res.ok) noteFavicon(msg.pageUrl);
-        sendResponse({ ok: res.ok, job_ids: data.job_ids, error: data.error });
-      } catch (e) {
-        sendResponse({ ok: false, error: String(e) });
-      }
-    })();
-    return true; // async
   }
-
-  if (msg.type === "GET_VIDEOS") {
-    // Waits for the session-storage hydration (see videoMapReady).
-    mapReadyOrTimeout().then(() => {
-      const m = videoMap.get(msg.tabId);
-      sendResponse({ videos: m ? Array.from(m.values()) : [] });
-    });
-    return true; // async
-  }
-
-  if (msg.type === "CLEAR_VIDEOS") {
-    mapReadyOrTimeout().then(() => {
-      videoMap.delete(msg.tabId);
-      setBadge(msg.tabId, "");
-      persistVideoMap(true);
-      sendResponse({ ok: true });
-    });
-    return true; // async
-  }
-
-  if (msg.type === "GET_ALL_VIDEOS") {
-    // Every tab with detected media: [{id, url, title, items}]. Tabs that
-    // have been closed since detection are skipped.
-    (async () => {
-      await mapReadyOrTimeout();
-      const out = [];
-      for (const [tabId, m] of videoMap) {
-        if (!m.size) continue;
-        try {
-          const tab = await chrome.tabs.get(tabId);
-          out.push({ id: tabId, url: tab.url, title: tab.title,
-                     items: Array.from(m.values()) });
-        } catch (e) { /* tab closed */ }
-      }
-      sendResponse({ tabs: out });
-    })();
-    return true; // async
-  }
-
-  if (msg.type === "PROBE_FORMATS") {
-    // Format-picker probe from the hover pill. Content scripts can't read
-    // chrome.storage.local, so the token gets attached here.
-    (async () => {
-      const alive = await checkBackend();
-      if (!alive) {
-        sendResponse({ ok: false, error: "Video Grabber app isn't running." });
-        return;
-      }
-      // Forward the site's own cookies (url's origin first, page as
-      // fallback only when the url is on the page's own host), plus
-      // referer and UA, so restricted tweets probe the same way they download.
-      const cookie = await cookieHeaderForItem(msg.url, msg.pageUrl);
-      try {
-        const { res, unpaired } = await authedFetch("/probe-formats", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            url: msg.url,
-            referer: msg.pageUrl || msg.url,
-            cookie: cookie,
-            user_agent: navigator.userAgent,
-          }),
-        });
-        const data = await res.json().catch(() => ({}));
-        sendResponse({ ok: res.ok && !unpaired, formats: data.formats || [],
-                       error: unpaired ? "not paired" : data.error });
-      } catch (e) {
-        sendResponse({ ok: false, formats: [], error: String(e) });
-      }
-    })();
-    return true; // async
-  }
-
-  if (msg.type === "SHOW_ADD_DIALOG") {
-    // Pill -> pre-download confirmation dialog in the desktop app.
-    showAddDialogFor(msg).then(sendResponse)
-      .catch((e) => sendResponse({ ok: false, error: String(e) }));
-    return true; // async
-  }
-
-  if (msg.type === "VG_GESTURE") {
-    // v4.4: content.js saw a trusted click / key press / right-click. Feeds the
-    // download interceptor's gate (see markGesture).
-    markGesture();
-    sendResponse({ ok: true });
-    return false;
-  }
-
-  if (msg.type === "VG_STATE") {
-    // Armed-state query for the blob-download hook (content.js). "intercept"
-    // is the mirrored interceptDownloads flag; awaiting interceptReady keeps
-    // a cold service-worker wake from reporting false before the read lands.
-    (async () => {
-      try {
-        const [alive, token] = await Promise.all([checkBackendCached(), getApiToken(), interceptReady]);
-        sendResponse({ alive: !!alive, paired: !!token, intercept: !!interceptDownloads });
-      } catch (e) {
-        sendResponse({ alive: false, paired: false, intercept: false });
-      }
-    })();
-    return true; // async
-  }
-
-  if (msg.type === "GET_UPLOAD_NONCE") {
-    // One-time nonce for a direct content-script -> backend upload. The
-    // recording itself no longer crosses chrome.runtime.sendMessage (32MB
-    // cap truncated long takes and produced corrupt files); only this
-    // tiny nonce does.
-    (async () => {
-      try {
-        const { res, unpaired } = await authedFetch("/upload-token", { method: "POST" });
-        if (unpaired) {
-          sendResponse({ ok: false, error: "not paired" });
-          return;
-        }
-        const data = await res.json();
-        sendResponse({ ok: res.ok, nonce: data.nonce, error: data.error });
-      } catch (e) {
-        sendResponse({ ok: false, error: String(e) });
-      }
-    })();
-    return true; // async
-  }
-
-  if (msg.type === "START_QUEUE") {
-    // v4.3: pill menu "Start Queue". The app's /queue-running route is the one
-    // deliberate writer of queue_running; token and fetch live here.
-    (async () => {
-      const alive = await checkBackend();
-      if (!alive) {
-        sendResponse({ ok: false, error: "Video Grabber app isn't running." });
-        return;
-      }
-      try {
-        const { res, unpaired } = await authedFetch("/queue-running", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ running: true }),
-        });
-        if (unpaired) {
-          sendResponse({ ok: false, error: "Not paired yet." });
-          return;
-        }
-        const data = await res.json().catch(() => ({}));
-        sendResponse({ ok: res.ok && data.ok !== false, queue_running: data.queue_running,
-                       error: data.error });
-      } catch (e) {
-        sendResponse({ ok: false, error: String(e) });
-      }
-    })();
-    return true; // async
-  }
-
-  if (msg.type === "SHOW_NOTIFICATION") {
-    // v4.0.2 Q1: recorder notifications via chrome.notifications — content
-    // scripts can't call it directly, so recNotify() routes through here.
-    // The "notifications" permission is declared in manifest.json.
-    if (!VGCFG.notifyRecording) {   // v4.3: Settings > Notifications
-      sendResponse({ ok: true, muted: true });
-      return false;
+  (async () => {
+    const alive = await checkBackend();
+    if (!alive) {
+      respond({ ok: false, error: "Video Grabber app isn't running." });
+      return;
+    }
+    // Page cookies go in the top-level field only when every item is on the
+    // page's own host. Otherwise the top-level cookie is empty and each
+    // item carries cookies fetched for its own URL, so nothing reaches a
+    // third-party host.
+    const allSameHost = items.every((it) => it && it.url && sameHost(it.url, msg.pageUrl));
+    let cookie = "";
+    let sendItems = items;
+    if (allSameHost) {
+      cookie = await cookieHeaderFor(msg.pageUrl).catch(() => "");
+    } else {
+      sendItems = await Promise.all(items.map(async (it) => ({
+        ...it,
+        cookie: it && it.url ? await cookieHeaderFor(it.url).catch(() => "") : "",
+      })));
     }
     try {
-      chrome.notifications.create("", {
-        type: "basic",
-        iconUrl: chrome.runtime.getURL("icons/icon128.png"),
-        title: String(msg.title || "Video Grabber"),
-        message: String(msg.message || ""),
+      const { res, unpaired } = await authedFetch("/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items: sendItems,
+          referer: msg.pageUrl,
+          page_url: msg.pageUrl,
+          cookie,
+          user_agent: navigator.userAgent,
+          download_playlist: msg.download_playlist || false,
+        }),
       });
-    } catch (e) {}
-    sendResponse({ ok: true });
-    return false;
+      if (unpaired) {
+        respond({ ok: false, error: "Not paired yet — open the extension's Options page and paste in the pairing token from the desktop app." });
+        return;
+      }
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        noteFavicon(msg.pageUrl);
+        VGBG.emit("sent", { items: sendItems, pageUrl: msg.pageUrl, job_ids: data.job_ids });
+      }
+      respond({ ok: res.ok, job_ids: data.job_ids, error: data.error });
+    } catch (e) {
+      respond({ ok: false, error: String(e) });
+    }
+  })();
+  return true;
+});
+
+on("GET_VIDEOS", (msg, sender, respond) => {
+  // Waits for the session-storage hydration (see videoMapReady).
+  mapReadyOrTimeout().then(() => {
+    const m = videoMap.get(msg.tabId);
+    respond({ videos: m ? Array.from(m.values()) : [] });
+  });
+  return true;
+});
+
+on("CLEAR_VIDEOS", (msg, sender, respond) => {
+  mapReadyOrTimeout().then(() => {
+    videoMap.delete(msg.tabId);
+    setBadge(msg.tabId, "");
+    persistVideoMap(true);
+    respond({ ok: true });
+  });
+  return true;
+});
+
+on("GET_ALL_VIDEOS", (msg, sender, respond) => {
+  // Every tab with detected media: [{id, url, title, items}]. Tabs that
+  // have been closed since detection are skipped.
+  (async () => {
+    await mapReadyOrTimeout();
+    const out = [];
+    for (const [tabId, m] of videoMap) {
+      if (!m.size) continue;
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        out.push({ id: tabId, url: tab.url, title: tab.title,
+                   items: Array.from(m.values()) });
+      } catch (e) { /* tab closed */ }
+    }
+    respond({ tabs: out });
+  })();
+  return true;
+});
+
+on("PROBE_FORMATS", (msg, sender, respond) => {
+  // Format-picker probe from the hover pill. Content scripts can't read
+  // chrome.storage.local, so the token gets attached here.
+  (async () => {
+    const alive = await checkBackend();
+    if (!alive) {
+      respond({ ok: false, error: "Video Grabber app isn't running." });
+      return;
+    }
+    // Forward the site's own cookies (url's origin first, page as
+    // fallback only when the url is on the page's own host), plus
+    // referer and UA, so restricted tweets probe the same way they download.
+    const cookie = await cookieHeaderForItem(msg.url, msg.pageUrl);
+    try {
+      const { res, unpaired } = await authedFetch("/probe-formats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: msg.url,
+          referer: msg.pageUrl || msg.url,
+          cookie: cookie,
+          user_agent: navigator.userAgent,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      respond({ ok: res.ok && !unpaired, formats: data.formats || [],
+                error: unpaired ? "not paired" : data.error });
+    } catch (e) {
+      respond({ ok: false, formats: [], error: String(e) });
+    }
+  })();
+  return true;
+});
+
+on("SHOW_ADD_DIALOG", (msg, sender, respond) => {
+  // Pill -> pre-download confirmation dialog in the desktop app.
+  showAddDialogFor(msg).then(respond)
+    .catch((e) => respond({ ok: false, error: String(e) }));
+  return true;
+});
+
+on("VG_GESTURE", (msg, sender, respond) => {
+  // v4.4: content.js saw a trusted click / key press / right-click. Feeds the
+  // download interceptor's gate (see markGesture).
+  markGesture();
+  respond({ ok: true });
+});
+
+on("VG_STATE", (msg, sender, respond) => {
+  // Armed-state query for the blob-download hook (content.js). "intercept"
+  // is the mirrored interceptDownloads flag; awaiting interceptReady keeps
+  // a cold service-worker wake from reporting false before the read lands.
+  (async () => {
+    try {
+      // v4.5.2: bounded. A stalled chrome.storage read used to leave this reply
+      // unsent until the page's 25 s timeout fired.
+      const deadline = new Promise((r) => setTimeout(() => r(null), 5000));
+      const got = await Promise.race([
+        Promise.all([checkBackendCached(), getApiToken(), interceptReady]),
+        deadline,
+      ]);
+      if (!got) { respond({ alive: false, paired: false, intercept: !!interceptDownloads, timedOut: true }); return; }
+      const [alive, token] = got;
+      respond({ alive: !!alive, paired: !!token, intercept: !!interceptDownloads });
+    } catch (e) {
+      respond({ alive: false, paired: false, intercept: false });
+    }
+  })();
+  return true;
+});
+
+on("GET_UPLOAD_NONCE", (msg, sender, respond) => {
+  // One-time nonce for a direct content-script -> backend upload. The
+  // recording itself no longer crosses chrome.runtime.sendMessage (32MB
+  // cap truncated long takes and produced corrupt files); only this
+  // tiny nonce does.
+  (async () => {
+    try {
+      const { res, unpaired } = await authedFetch("/upload-token", { method: "POST" });
+      if (unpaired) {
+        respond({ ok: false, error: "not paired" });
+        return;
+      }
+      const data = await res.json();
+      respond({ ok: res.ok, nonce: data.nonce, error: data.error });
+    } catch (e) {
+      respond({ ok: false, error: String(e) });
+    }
+  })();
+  return true;
+});
+
+on("START_QUEUE", (msg, sender, respond) => {
+  // v4.3: pill menu "Start Queue". The app's /queue-running route is the one
+  // deliberate writer of queue_running; token and fetch live here.
+  (async () => {
+    respond(await setQueueRunning(true));
+  })();
+  return true;
+});
+
+on("SHOW_NOTIFICATION", (msg, sender, respond) => {
+  // v4.0.2 Q1: recorder notifications via chrome.notifications — content
+  // scripts can't call it directly, so recNotify() routes through here.
+  // The "notifications" permission is declared in manifest.json.
+  if (!VGCFG.notifyRecording) {   // v4.3: Settings > Notifications
+    respond({ ok: true, muted: true });
+    return;
+  }
+  try {
+    chrome.notifications.create("", {
+      type: "basic",
+      iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+      title: String(msg.title || "Video Grabber"),
+      message: String(msg.message || ""),
+    });
+  } catch (e) { VGLOG.debug("notify", "create failed", e); }
+  respond({ ok: true });
+});
+
+// ---- Batch 1: queue switch used by START_QUEUE and the Batch 2 queue view.
+async function setQueueRunning(running) {
+  const alive = await checkBackend();
+  if (!alive) return { ok: false, error: "Video Grabber app isn't running." };
+  try {
+    const { res, unpaired } = await authedFetch("/queue-running", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ running: !!running }),
+    });
+    if (unpaired) return { ok: false, error: "Not paired yet." };
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok && data.ok !== false, queue_running: data.queue_running, error: data.error };
+  } catch (e) {
+    return { ok: false, error: String(e) };
   }
 }
 
+// ---- Batch 1: desktop application detection + capability detection ---------
+// /health is open and carries an identity payload, so a different service on
+// port 5757 is not mistaken for the app. Route support is probed once per
+// app version (an OPTIONS-free check: a 404 means the route is missing, any
+// other status, including 401, means it exists) and cached for the session.
+const DESKTOP_ROUTES = ["/jobs", "/queue-status", "/queue-running", "/probe-formats", "/probe-head",
+  "/redownload/x", "/clear-failed", "/reorder/x", "/dup-check", "/open-folder", "/diskspace", "/stats"];
+let _desktopCache = null;   // {at, info}
+async function desktopInfo(force) {
+  if (!force && _desktopCache && Date.now() - _desktopCache.at < 60000) return _desktopCache.info;
+  const info = { ok: true, alive: false, identity: false, version: "", paired: false, routes: {}, caps: {} };
+  try {
+    const res = await fetch(`${BACKEND_BASE}/health`, { method: "GET" });
+    if (res.ok) {
+      const j = await res.json().catch(() => ({}));
+      info.alive = true;
+      info.identity = j.app === "videograbber";
+      info.version = String(j.version || "");
+    }
+  } catch (e) { /* app not running */ }
+  info.paired = !!(await getApiToken());
+  if (info.alive && info.identity) {
+    const cacheKey = "vgRoutes:" + info.version;
+    let routes = null;
+    try { routes = (await chrome.storage.session.get(cacheKey))[cacheKey]; } catch (e) {}
+    let cacheable = true;
+    if (!routes) {
+      routes = {};
+      // OPTIONS only: the server answers it for a route that exists and 404s
+      // for one that doesn't, and it never runs the route itself, so probing
+      // /clear-failed or /queue-running cannot change anything.
+      await Promise.all(DESKTOP_ROUTES.map(async (r) => {
+        try {
+          const res = await fetch(`${BACKEND_BASE}${r}`, { method: "OPTIONS" });
+          routes[r] = res.status !== 404;
+        } catch (e) { routes[r] = false; }
+      }));
+      // Sweep (v4.5.1): never cache an all-404 answer (app still starting) or a
+      // probe made against an app that reported no version: both stay stale.
+      cacheable = !!info.version && Object.values(routes).some(Boolean);
+      if (cacheable) { try { await chrome.storage.session.set({ [cacheKey]: routes }); } catch (e) {} }
+    }
+    info.routes = routes;
+    info.caps = {
+      jobs: !!routes["/jobs"], queue: !!routes["/queue-status"] && !!routes["/queue-running"],
+      formats: !!routes["/probe-formats"], head: !!routes["/probe-head"], retry: !!routes["/redownload/x"],
+      clearFailed: !!routes["/clear-failed"], reorder: !!routes["/reorder/x"], dupCheck: !!routes["/dup-check"],
+      openFolder: !!routes["/open-folder"],
+    };
+  }
+  _desktopCache = { at: Date.now(), info };
+  return info;
+}
+on("VG_DESKTOP_INFO", (msg, sender, respond) => {
+  desktopInfo(!!msg.force).then(respond).catch((e) => respond({ ok: false, alive: false, error: String(e) }));
+  return true;
+});
+
+// ---- Batch 1: standalone operation -----------------------------------------
+// With the app off, a plain direct file can still be saved by the browser.
+// Playlists, blob URLs and anything the app must merge are refused with a
+// clear reason instead of saving a useless file.
+async function standaloneDownload(msg) {
+  const url = String(msg.url || "");
+  if (!/^https?:/i.test(url)) return { ok: false, error: "Only http(s) links can be saved without the app." };
+  if (/\.(m3u8|mpd)(\?|#|$)/i.test(url)) return { ok: false, error: "Streams need the desktop app to merge them. Start the app and retry." };
+  if (!chrome.downloads || !chrome.downloads.download) return { ok: false, error: "This browser can't save downloads from an extension." };
+  const filename = VGCORE.sanitizeName(msg.filename || "") || undefined;
+  try {
+    markGesture();
+    const id = await chrome.downloads.download({ url, filename, conflictAction: "uniquify", saveAs: false });
+    VGLOG.info("standalone", "browser download started", { id, host: VGCORE.hostOf(url) });
+    return { ok: true, downloadId: id, standalone: true };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+on("VG_STANDALONE_DOWNLOAD", (msg, sender, respond) => {
+  standaloneDownload(msg).then(respond);
+  return true;
+});
+
+// ---- Batch 1: diagnostics --------------------------------------------------
+on("VG_DIAG", (msg, sender, respond) => {
+  (async () => {
+    await VGLOG.hydrate();
+    let storeBytes = null;
+    try { storeBytes = await chrome.storage.local.getBytesInUse(null); } catch (e) {}
+    respond({
+      ok: true,
+      version: chrome.runtime.getManifest().version,
+      caps: VGCHROME.caps(true),
+      desktop: await desktopInfo(false).catch(() => null),
+      tabsTracked: videoMap.size,
+      itemsTracked: Array.from(videoMap.values()).reduce((n, m) => n + m.size, 0),
+      interceptDownloads: !!interceptDownloads,
+      storageBytes: storeBytes,
+      log: VGLOG.dump(msg.level ? { level: msg.level } : undefined),
+    });
+  })();
+  return true;
+});
+on("VG_DIAG_CLEAR", (msg, sender, respond) => { VGLOG.clear(); respond({ ok: true }); });
+on("VG_PING", (msg, sender, respond) => { respond({ ok: true, t: Date.now() }); });
+
+
+// ---- single guarded listener ------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, rawSendResponse) => {
   if (!msg || typeof msg !== "object") return false;
-  if (msg.type !== "VG_GESTURE") {
-    console.debug("[VG] onMessage", msg.type, "from", sender && sender.tab ? "tab " + sender.tab.id : "extension page");
+  const handler = HANDLERS[msg.type];
+  if (!handler) return false;
+  if (msg.type !== "VG_GESTURE" && msg.type !== "VG_PING") {
+    VGLOG.debug("dispatch", msg.type, { from: sender && sender.tab ? "tab " + sender.tab.id : "extension page" });
   }
   // Single, guarded responder: one reply at most, and a closed port (the tab
   // navigated away) is logged instead of throwing.
   let responded = false;
-  const sendResponse = (payload) => {
+  const respond = (payload) => {
     if (responded) return;
     responded = true;
     try {
       rawSendResponse(payload);
     } catch (e) {
-      console.warn("[VG] sendResponse failed for", msg.type, e);
+      VGLOG.warn("dispatch", "sendResponse failed for " + msg.type, e);
     }
     if (chrome.runtime.lastError) {
-      console.warn("[VG] lastError after reply to", msg.type, chrome.runtime.lastError.message);
+      VGLOG.warn("dispatch", "lastError after reply to " + msg.type + ": " + chrome.runtime.lastError.message);
     }
   };
   try {
-    return vgHandleMessage(msg, sender, sendResponse) === true;
+    const r = handler(msg, sender, respond);
+    // A handler that returned a promise is treated as async and answered with
+    // its value; a throw or rejection becomes a normal error reply.
+    if (r && typeof r.then === "function") {
+      r.then((v) => respond(v === undefined ? { ok: true } : v),
+             (e) => { VGLOG.error("dispatch", msg.type + " rejected", e); respond({ ok: false, error: "Background error: " + String(e && e.message ? e.message : e) }); });
+      return true;
+    }
+    return r === true;
   } catch (e) {
-    console.error("[VG] handler for", msg.type, "threw:", e);
-    sendResponse({ ok: false, error: "Background error: " + String(e && e.message ? e.message : e) });
+    VGLOG.error("dispatch", msg.type + " threw", e);
+    respond({ ok: false, error: "Background error: " + String(e && e.message ? e.message : e) });
     return false;
   }
 });
+
+// ---- public surface for feature files ---------------------------------------
+const _listeners = Object.create(null);
+const VGBG = {
+  on, handlers: HANDLERS,
+  emit(evt, payload) { for (const fn of _listeners[evt] || []) { try { fn(payload); } catch (e) { VGLOG.error("emit", evt, e); } } },
+  listen(evt, fn) { (_listeners[evt] = _listeners[evt] || []).push(fn); },
+  get cfg() { return VGCFG; },
+  videoMap, videoMapReady, mapReadyOrTimeout, addItem, setBadge,
+  checkBackend, authedFetch, getApiToken, sendToBackend, showAddDialogFor, cookieHeaderForItem,
+  cookieHeaderFor, sameHost, setQueueRunning, desktopInfo, standaloneDownload, noteFavicon,
+  commandNotify, markGesture, pickLargestItem, hostOf,
+};
+self.VGBG = VGBG;
+try { importScripts("bg-features.js"); } catch (e) { VGLOG.error("boot", "bg-features.js failed to load", e); }
+try { importScripts("bg-library.js"); } catch (e) { VGLOG.error("boot", "bg-library.js failed to load", e); }
+VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().version);

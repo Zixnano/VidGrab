@@ -1,5 +1,5 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <style>
@@ -169,6 +169,7 @@
   #toast.show { opacity: 1; }
   #toast.err { border-color: var(--err); color: var(--err); }
 </style>
+<link rel="stylesheet" href="panel.css">
 </head>
 <body>
   <div class="hdr"><img src="icons/icon48.png" alt=""><div><b>Video Grabber</b><small>BROWSER EXTENSION</small></div><button id="btnCog" class="cog" title="Settings" aria-label="Settings"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><circle cx="9" cy="7" r="2.2" fill="currentColor" stroke="none"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="15" cy="12" r="2.2" fill="currentColor" stroke="none"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="7" cy="17" r="2.2" fill="currentColor" stroke="none"/></svg></button></div>
@@ -177,9 +178,9 @@
   <div id="recent" style="display:none;"><h2>Recent downloads</h2><div id="recentList"></div></div>
   <div id="siteRow"><span id="siteName"></span><button id="siteToggle">Hide pill on this site</button></div>
 
-  <div class="tabs">
-    <button id="tabCurrent" class="tab active">Current Page</button>
-    <button id="tabOther" class="tab">Other Pages</button>
+  <div class="tabs" role="tablist" aria-label="Pages">
+    <button id="tabCurrent" class="tab active" role="tab" aria-selected="true">Current Page</button>
+    <button id="tabOther" class="tab" role="tab" aria-selected="false">Other Pages</button>
   </div>
   <div id="otherTabs" style="display:none;"></div>
   <div id="searchInputWrap"><input id="searchInput" type="text" placeholder="Filter by name or URL…"/></div>
@@ -195,8 +196,8 @@
     <label><input type="checkbox" value="other"/> other</label>
     <label class="tiny"><input type="checkbox" id="hideTiny" checked/> Hide files under 100 KB</label>
   </div>
-  <div id="mediaList"><div class="empty">Scanning this tab…</div></div>
-  <div id="mediaStatus"></div>
+  <div id="mediaList" role="list" aria-label="Detected media"><div class="empty">Scanning this tab…</div></div>
+  <div id="mediaStatus" aria-live="polite"></div>
 
   <!-- v4.3: Download and Grab all stay on the bar; the rest live in the overflow menu. -->
   <div class="toolbar">
@@ -316,8 +317,13 @@
 
   <div id="toast" role="status" aria-live="polite"></div>
 
+  <script src="vglog.js"></script>
+  <script src="vgchrome.js"></script>
+  <script src="vgcore.js"></script>
   <script src="theme.js"></script>
   <script src="vgsettings.js"></script>
+  <script src="popupshim.js"></script>
   <script src="popup.js"></script>
+  <script src="panel.js"></script>
 </body>
 </html>
