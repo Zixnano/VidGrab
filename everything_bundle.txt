@@ -1721,6 +1721,317 @@ def update(name):
     except Exception as e:
         log(f"components: {name} update failed: {e}")
         return {"ok": False, "message": f"{name} update failed: {e}"}
+"""crash_dump.py: crash reports for Video Grabber.
+
+Drop-in module. Call install(log_dir, version, role) as early as possible at
+startup, before the Qt app is created. Call crumb(...) on user actions.
+
+What it captures, all under <log_dir>/crash-dumps/:
+  crash-<stamp>.txt        Python exception on any thread (traceback, last
+                           user actions, tail of launcher.log)
+  abnormal-<stamp>.txt     the previous run never exited cleanly. Python did
+                           not raise, so this is a native crash (access
+                           violation, abort), a force kill, or power loss.
+  crash-qt-<stamp>.txt     Qt reported a Critical or Fatal message
+  native-faults.log        faulthandler output for native crashes
+  breadcrumbs are included in every report, not stored on their own.
+
+Privacy: breadcrumbs keep file names only, never full paths. Reports can
+still contain URLs that a traceback prints, so review before sharing.
+"""
+
+import atexit
+import collections
+import faulthandler
+import os
+import platform
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+
+_DIR = None
+_VERSION = "unknown"
+_ROLE = "app"
+_LOG_TAIL_FILE = None
+_CRUMBS = collections.deque(maxlen=200)
+_CRUMB_LOCK = threading.Lock()
+_FAULT_FH = None
+_QT_HANDLER = None
+_MARKER = None
+_PREVIOUS = None          # report written for an abnormal exit of the last run
+_INSTALLED = False
+
+
+_SEQ = 0
+
+
+def _stamp():
+    """Unique per report: time to the second, pid, and a counter."""
+    global _SEQ
+    _SEQ += 1
+    return time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}-{_SEQ:03d}"
+
+
+def crumb(event, **data):
+    """Record a user action. Cheap; safe to call from any thread."""
+    parts = []
+    for k, v in data.items():
+        if isinstance(v, str) and ("/" in v or "\\" in v):
+            v = os.path.basename(v.replace("\\", "/"))
+        parts.append(f"{k}={v!r}")
+    line = time.strftime("%H:%M:%S") + " " + event + (" " + " ".join(parts) if parts else "")
+    with _CRUMB_LOCK:
+        _CRUMBS.append(line)
+
+
+def _launcher_tail(lines=80):
+    try:
+        if _LOG_TAIL_FILE and Path(_LOG_TAIL_FILE).is_file():
+            text = Path(_LOG_TAIL_FILE).read_text(encoding="utf-8", errors="replace")
+            return "\n".join(text.splitlines()[-lines:])
+    except Exception:
+        pass
+    return ""
+
+
+def _report(kind, body):
+    with _CRUMB_LOCK:
+        crumbs = list(_CRUMBS)
+    out = [
+        "Video Grabber crash report",
+        f"kind: {kind}",
+        f"time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"version: {_VERSION}",
+        f"process: {_ROLE} (pid {os.getpid()})",
+        f"python: {sys.version.split()[0]}",
+        f"os: {platform.platform()}",
+        "",
+        "--- details ---",
+        body.rstrip(),
+        "",
+        f"--- last {len(crumbs)} user actions (oldest first) ---",
+    ]
+    out += crumbs or ["(none recorded)"]
+    tail = _launcher_tail()
+    if tail:
+        out += ["", "--- launcher.log (tail) ---", tail]
+    return "\n".join(out) + "\n"
+
+
+def _write(name, text):
+    """Write a report into crash-dumps/. Never raises: a reporter that
+    crashes would hide the crash it was meant to record."""
+    global _PREVIOUS
+    if _DIR is None:
+        return None
+    try:
+        p = _DIR / name
+        p.write_text(text, encoding="utf-8", errors="replace")
+        _PREVIOUS = p
+        return p
+    except Exception:
+        return None
+
+
+def _excepthook(exc_type, exc, tb):
+    body = "".join(traceback.format_exception(exc_type, exc, tb))
+    _write(f"crash-{_stamp()}.txt", _report("unhandled exception", body))
+    try:
+        sys.__excepthook__(exc_type, exc, tb)
+    except Exception:
+        pass
+
+
+def _thread_hook(args):
+    if args.exc_type is SystemExit:
+        return
+    name = args.thread.name if args.thread else "?"
+    body = f"thread: {name}\n" + "".join(
+        traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    _write(f"crash-{_stamp()}.txt", _report("unhandled exception in thread", body))
+    try:
+        threading.__excepthook__(args)
+    except Exception:
+        pass
+
+
+def _read_native_faults(max_lines=60):
+    try:
+        p = _DIR / "native-faults.log"
+        if p.is_file() and p.stat().st_size:
+            return "\n".join(p.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:])
+    except Exception:
+        pass
+    return ""
+
+
+def _check_previous_run():
+    """A marker left behind means the last process never reached atexit."""
+    global _PREVIOUS
+    if not _MARKER.exists():
+        return
+    try:
+        old = _MARKER.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        old = "(unreadable marker)"
+    faults = _read_native_faults()
+    body = (
+        "The previous run did not exit cleanly and Python raised no error.\n"
+        "Breadcrumbs from that run are not available: they live in memory.\n"
+        "Likely causes: a native crash (for example a Qt or codec access\n"
+        "violation), a force kill from Task Manager, or power loss.\n"
+        f"Previous run marker: {old}\n\n"
+        "--- native-faults.log (tail) ---\n"
+        + (faults or "(empty: no native fault was recorded)")
+    )
+    _write(f"abnormal-{_stamp()}.txt", _report("abnormal exit of previous run", body))
+
+
+def _qt_message(mode, context, message):
+    name = str(mode)
+    try:
+        if "Critical" in name or "Fatal" in name:
+            crumb("qt-critical", msg=str(message)[:300])
+            _write(f"crash-qt-{_stamp()}.txt", _report("Qt critical message", str(message)))
+        elif "Warning" in name:
+            crumb("qt-warning", msg=str(message)[:200])
+        # Qt's default stderr output is replaced by this handler, so forward it.
+        if sys.stderr is not None:
+            print(message, file=sys.stderr)
+    except Exception:
+        pass
+
+
+def install_qt_handler():
+    """Call after PySide6 is importable (it can be called before QApplication)."""
+    global _QT_HANDLER
+    try:
+        from PySide6.QtCore import qInstallMessageHandler
+    except Exception:
+        return False
+    _QT_HANDLER = _qt_message          # keep a reference so it is not collected
+    qInstallMessageHandler(_QT_HANDLER)
+    return True
+
+
+def install(log_dir, version="unknown", role="app", launcher_log=None):
+    """Set up reporting. Safe to call twice; the second call does nothing."""
+    global _DIR, _VERSION, _ROLE, _LOG_TAIL_FILE, _FAULT_FH, _MARKER, _INSTALLED
+    if _INSTALLED:
+        return
+    _INSTALLED = True
+    _VERSION, _ROLE = version, role
+    _LOG_TAIL_FILE = str(launcher_log) if launcher_log else None
+    _DIR = Path(log_dir) / "crash-dumps"
+    try:
+        _DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        _DIR = None
+        return
+
+    _MARKER = _DIR / f"running-{role}.marker"
+    _check_previous_run()
+    _MARKER.write_text(f"pid={os.getpid()} version={version} started="
+                       f"{time.strftime('%Y-%m-%d %H:%M:%S')}", encoding="utf-8")
+    atexit.register(lambda: _MARKER.unlink(missing_ok=True))
+
+    # faulthandler needs its file object to stay open for the process lifetime.
+    try:
+        _FAULT_FH = open(_DIR / "native-faults.log", "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_FAULT_FH, all_threads=True)
+    except Exception:
+        pass
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_hook
+
+
+def previous_report():
+    """Path of the newest report written by an earlier run, or None.
+    The GUI can call this at startup and offer to open the folder."""
+    if _DIR is None:
+        return None
+    try:
+        seen = _DIR / "last-seen.txt"
+        since = seen.stat().st_mtime if seen.exists() else 0.0
+        reports = [p for p in _DIR.glob("*.txt")
+                   if p.name != "last-seen.txt" and p.stat().st_mtime > since]
+        return max(reports, key=lambda p: p.stat().st_mtime) if reports else None
+    except Exception:
+        return None
+
+
+def mark_reports_seen():
+    """Call after the user has been told about the previous report."""
+    if _DIR is None:
+        return
+    try:
+        (_DIR / "last-seen.txt").write_text(time.strftime("%Y-%m-%d %H:%M:%S"),
+                                            encoding="utf-8")
+    except Exception:
+        pass
+
+
+def report_folder():
+    return _DIR
+
+
+def memory_mb():
+    """This process's working set in MB, or None if unavailable.
+    Windows uses GetProcessMemoryInfo; elsewhere /proc/self/status."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t),
+                            ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t),
+                            ("PeakPagefileUsage", ctypes.c_size_t)]
+
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(_PMC)
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ok = ctypes.WinDLL("psapi").GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb)
+            return pmc.WorkingSetSize / 1048576 if ok else None
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        return None
+    return None
+
+
+_MEMLOG_MAX = 512 * 1024   # keep memory.log small; older lines are dropped
+
+
+def log_memory(tag):
+    """Append one line with the app's memory, labelled (e.g. after each
+    finished job). Written to crash-dumps/memory.log, never raises."""
+    mb = memory_mb()
+    value = f"{mb:.1f} MB" if mb is not None else "unavailable"
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} {tag}: {value}\n"
+    crumb("memory", tag=tag, mb=None if mb is None else round(mb, 1))
+    if _DIR is None:
+        return
+    try:
+        p = _DIR / "memory.log"
+        if p.exists() and p.stat().st_size > _MEMLOG_MAX:
+            keep = p.read_text(encoding="utf-8", errors="replace")[-_MEMLOG_MAX // 2:]
+            p.write_text(keep.split("\n", 1)[-1], encoding="utf-8")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 """Download engines (generic HTTP + yt-dlp), ffmpeg helpers, recording watcher."""
 from pathlib import Path
 import glob
@@ -15136,6 +15447,26 @@ def _theme_colors():
     return d
 
 
+# v4.5.2: crash reporter is optional; the toolkit must work without it.
+try:
+    import crash_dump as _crash
+except Exception:
+    _crash = None
+
+
+def _crumb(event, **data):
+    if _crash is not None:
+        try:
+            _crash.crumb(event, **data)
+        except Exception:
+            pass
+
+
+# Probe threads that outlived their dialog. Qt aborts the whole process if a
+# running QThread is destroyed, so these are kept alive here until they finish.
+_ORPHAN_PROBES = []
+
+
 # ------------------------------------------------------------ ffprobe thread
 class _ProbeThread(QThread):
     done = Signal(int, dict)
@@ -15144,6 +15475,18 @@ class _ProbeThread(QThread):
     def __init__(self, token, path, parent=None):
         super().__init__(parent)
         self._token, self._path = token, str(path)
+        self._proc = None
+        self._cancelled = False
+
+    def cancel(self):
+        """Stop ffprobe now so the thread can end. Safe from the GUI thread."""
+        self._cancelled = True
+        p = self._proc
+        if p is not None and p.poll() is None:
+            try:
+                p.kill()
+            except OSError:
+                pass
 
     def run(self):
         try:
@@ -15152,9 +15495,17 @@ class _ProbeThread(QThread):
                    "height,r_frame_rate,avg_frame_rate,duration:stream_disposition=attached_pic",
                    "-of", "json", self._path]
             kw = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                               timeout=45, **kw)
-            data = json.loads(r.stdout or "{}")
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                          text=True, errors="replace", **kw)
+            try:
+                out, _err = self._proc.communicate(timeout=45)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.communicate()
+                raise
+            if self._cancelled:
+                return
+            data = json.loads(out or "{}")
             fmt = data.get("format") or {}
             streams = data.get("streams") or []
             vid = next((s for s in streams if s.get("codec_type") == "video"
@@ -15676,6 +16027,7 @@ class ToolkitDialog(QDialog):
         self._stop_playback()
         self._clear_result()
         self._src, self._info, self._mode = path, {}, "source"
+        _crumb("toolkit_load", file=path.name)
         self._token += 1
         self._set_loaded(False)
         self.src_label.setText(f"Source: {path.name}")
@@ -15726,6 +16078,7 @@ class ToolkitDialog(QDialog):
     def _on_probe_failed(self, token, msg):
         if token != self._token:
             return
+        _crumb("toolkit_probe_failed", msg=str(msg)[:200])
         self.info_label.setText("")
         self.status.setText(f"Couldn't read this file: {msg}")
 
@@ -16210,7 +16563,15 @@ class ToolkitDialog(QDialog):
             self._player.stop()
             self._player.setSource(QUrl())    # release the file handle (Windows)
         for t in list(self._probes):
-            t.wait(2000)
+            t.cancel()                      # kill ffprobe so the thread ends now
+            if not t.wait(3000):
+                # Still running (ffprobe ignored the kill). Detach it from this
+                # dialog and keep a Python reference: destroying a running
+                # QThread aborts the process (the v4.5.2 crash fix).
+                self._probes.remove(t)
+                t.setParent(None)
+                _ORPHAN_PROBES.append(t)
+                t.finished.connect(lambda th=t: _ORPHAN_PROBES.remove(th) if th in _ORPHAN_PROBES else None)
 """Job lifecycle: registry, state, snapshot persistence, new_job."""
 from urllib.parse import urlparse
 import json
@@ -27448,8 +27809,9 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   clearTabVideos(details.tabId);
 });
 
-// TODO(v4.5.1): ACTIVE_TABS is never pruned on tab close; harmless (a window's entry is replaced on activation) but it can name a closed tab id.
 chrome.tabs.onRemoved.addListener((tabId) => {
+  // v4.5.2: drop any window entry that named this tab, so ACTIVE_TABS never holds a closed id.
+  for (const [wid, active] of ACTIVE_TABS) if (active === tabId) ACTIVE_TABS.delete(wid);
   videoMap.delete(tabId);
   clearRecentFor(tabId);
   tabNavIdentity.delete(tabId);
@@ -27477,10 +27839,24 @@ function sameHost(a, b) {
 // Cookies for an item: always the item's own URL first. The page's cookies
 // are only a fallback when the item lives on the page's own host, so session
 // cookies never travel to a third-party CDN.
+// v4.5.4: a file on a sub-domain of the page's site (page pawchive.pw, file
+// n2.pawchive.pw) is the same site, so the page's cookies belong with it. The
+// old exact-hostname test sent no cookies there, and such files returned 403.
+// Only the same host or a parent/child host matches; unrelated sites never do.
+function sameSiteFamily(fileUrl, pageUrl) {
+  try {
+    const f = new URL(fileUrl).hostname.toLowerCase();
+    const p = new URL(pageUrl).hostname.toLowerCase();
+    return f === p || f.endsWith("." + p) || p.endsWith("." + f);
+  } catch (e) {
+    return false;
+  }
+}
+
 async function cookieHeaderForItem(url, pageUrl) {
   const own = await cookieHeaderFor(url).catch(() => "");
   if (own) return own;
-  if (pageUrl && sameHost(url, pageUrl)) {
+  if (pageUrl && sameSiteFamily(url, pageUrl)) {
     return await cookieHeaderFor(pageUrl).catch(() => "");
   }
   return "";
@@ -28092,6 +28468,22 @@ chrome.downloads.onCreated.addListener(async (item) => {
   }
   const browserLag = item.startTime ? t0 - Date.parse(item.startTime) : -1;
 
+  // v4.5.5: Chrome often leaves item.referrer empty for a click on a file link,
+  // and the download event does not say which tab it came from. Fall back to the
+  // active tab's page, but only when that page is on the same site as the file,
+  // so the Referer and cookies never go to a different site.
+  // v4.5.8: send the address Chrome actually downloaded from (finalUrl), not the
+  // first link. A link that redirects can hand the app a URL that needs the
+  // browser's own redirect handling, which is where the 403 came from.
+  const fileUrl = item.finalUrl || item.url;
+  let pageRef = item.referrer || "";
+  if (!pageRef) {
+    try {
+      const [act] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (act && act.url && sameSiteFamily(fileUrl, act.url)) pageRef = act.url;
+    } catch (e) {}
+  }
+
   // Filename lookup and cookie fetch are independent: run them together.
   const [filename, cookie] = await Promise.all([
     (async () => {
@@ -28101,7 +28493,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
       } catch (e) {}
       return null;
     })(),
-    cookieHeaderFor(item.url).catch(() => ""),
+    cookieHeaderForItem(fileUrl, pageRef).catch(() => ""),
   ]);
 
   let handedOff = false;
@@ -28110,9 +28502,9 @@ chrome.downloads.onCreated.addListener(async (item) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        url: item.url,
-        referer: item.referrer || "",
-        page_url: item.referrer || "",
+        url: fileUrl,
+        referer: pageRef,
+        page_url: pageRef,
         cookie: cookie,
         user_agent: navigator.userAgent,
         filename: filename,
@@ -28170,6 +28562,11 @@ function on(type, fn) {
 on("RELAY_DOWNLOAD", (msg, sender, respond) => {
   // From content.js overlay OR popup.js / side panel
   const tabId = sender.tab ? sender.tab.id : msg.tabId;
+  // v4.5.2: the app can't fetch blob:/data: URLs; refuse them instead of queueing a dead job.
+  if (/^(blob|data):/i.test(String(msg.url || ""))) {
+    respond({ ok: false, error: "That video is only in the page (blob:). Pick the stream from the list or use Record.", code: "blob" });
+    return true;
+  }
   // A bookkeeping failure here must never block the download itself.
   try {
     if (!msg.skipList) addItem(tabId, { url: msg.url, source: "overlay", contentType: null });
@@ -28338,7 +28735,15 @@ on("VG_STATE", (msg, sender, respond) => {
   // a cold service-worker wake from reporting false before the read lands.
   (async () => {
     try {
-      const [alive, token] = await Promise.all([checkBackendCached(), getApiToken(), interceptReady]);
+      // v4.5.2: bounded. A stalled chrome.storage read used to leave this reply
+      // unsent until the page's 25 s timeout fired.
+      const deadline = new Promise((r) => setTimeout(() => r(null), 5000));
+      const got = await Promise.race([
+        Promise.all([checkBackendCached(), getApiToken(), interceptReady]),
+        deadline,
+      ]);
+      if (!got) { respond({ alive: false, paired: false, intercept: !!interceptDownloads, timedOut: true }); return; }
+      const [alive, token] = got;
       respond({ alive: !!alive, paired: !!token, intercept: !!interceptDownloads });
     } catch (e) {
       respond({ alive: false, paired: false, intercept: false });
@@ -28519,22 +28924,6 @@ on("VG_DIAG", (msg, sender, respond) => {
 on("VG_DIAG_CLEAR", (msg, sender, respond) => { VGLOG.clear(); respond({ ok: true }); });
 on("VG_PING", (msg, sender, respond) => { respond({ ok: true, t: Date.now() }); });
 
-// ---- Batch 1: side panel (only where the browser has the API) --------------
-async function openSidePanel(sender, msg) {
-  if (!VGCHROME.caps().sidePanel) return { ok: false, error: "This browser has no side panel API. Use the popup." };
-  try {
-    const tabId = (sender && sender.tab && sender.tab.id) || msg.tabId;
-    const winId = msg.windowId;
-    await chrome.sidePanel.open(tabId ? { tabId } : { windowId: winId });
-    return { ok: true };
-  } catch (e) { return { ok: false, error: String(e && e.message ? e.message : e) }; }
-}
-on("VG_OPEN_SIDEPANEL", (msg, sender, respond) => { openSidePanel(sender, msg).then(respond); return true; });
-try {
-  if (VGCHROME.caps().sidePanel) {
-    chrome.sidePanel.setOptions({ path: "sidepanel.html", enabled: true }).catch(() => {});
-  }
-} catch (e) { /* no side panel in this browser */ }
 
 // ---- single guarded listener ------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, rawSendResponse) => {
@@ -29010,8 +29399,7 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
     });
     chrome.notifications.onClicked.addListener((id) => {
       if (!_noteItems.has(id)) return;
-      if (VGCHROME.caps().sidePanel) { const rec = _noteItems.get(id); chrome.sidePanel.open({ tabId: rec.tabId }).catch(() => {}); }
-      else if (chrome.action && chrome.action.openPopup) chrome.action.openPopup().catch(() => {});
+      if (chrome.action && chrome.action.openPopup) chrome.action.openPopup().catch(() => {});
       chrome.notifications.clear(id);
     });
   } catch (e) { /* notifications unavailable */ }
@@ -29071,17 +29459,12 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
   B.on("SEND_ALL_TAB", async (msg, sender) => { const id = msg.tabId != null ? msg.tabId : (sender && sender.tab && sender.tab.id); if (id == null) return { ok: false, error: "No tab." }; const t = await tabInfo(id); return sendAllOnTab({ id, ...t }); });
 
   chrome.commands.onCommand.addListener(async (command, tab) => {
-    if (!/^(send-all-page|open-side-panel|toggle-pill|start-queue)$/.test(command)) return;
+    if (!/^(send-all-page|toggle-pill|start-queue)$/.test(command)) return;
     B.markGesture();
     try {
       const t = tab && tab.id ? tab : (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0];
       if (command === "start-queue") { const r = await B.setQueueRunning(true); return B.commandNotify(r.ok ? "Queue started." : (r.error || "Couldn't start the queue.")); }
       if (!t) return;
-      if (command === "open-side-panel") {
-        if (VGCHROME.caps().sidePanel) { await chrome.sidePanel.open({ tabId: t.id }); return; }
-        if (chrome.action && chrome.action.openPopup) { await chrome.action.openPopup(); return; }
-        return B.commandNotify("Click the toolbar icon to open Video Grabber.");
-      }
       if (command === "toggle-pill") {
         const st = await chrome.storage.local.get(VG_SETTINGS_KEY); const cur = vgNormalize(st[VG_SETTINGS_KEY]);
         const next = { ...cur, pillVisible: !cur.pillVisible };
@@ -29145,7 +29528,13 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
     timer = null;
     const batch = Array.from(pending.values()); pending = new Map();
     if (!batch.length) return;
-    try { await B.store.update(KEY, {}, (lib) => C.libraryMerge(lib, batch, Date.now())); }
+    try {
+      // v4.5.2: bounded, so a stalled storage write can't hang the worker.
+      await Promise.race([
+        B.store.update(KEY, {}, (lib) => C.libraryMerge(lib, batch, Date.now())),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("library write timed out")), 5000)),
+      ]);
+    }
     catch (e) { L.warn("library", "write failed", e); }
   }
   B.flushLibrary = flush;
@@ -30474,8 +30863,15 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
     recorder.onerror = () => stopSafely("recorder error");
     try { video.addEventListener("ended", () => stopSafely("video ended"), { once: true }); } catch (e) {}
     try { stream.getTracks().forEach((t) => t.addEventListener("ended", () => stopSafely("track ended"), { once: true })); } catch (e) {}
-    // TODO(v4.5.1): recorder.start() can throw (InvalidStateError); stream tracks then stay live. Needs a try/catch with the same cleanup as onstop.
-    recorder.start(1000);
+    // v4.5.2: recorder.start() can throw (InvalidStateError). Stop the tracks
+    // so the page's camera/tab capture is released, then report it.
+    try {
+      recorder.start(1000);
+    } catch (e) {
+      try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      recNotify("Video Grabber", "Couldn't start the recording: " + (e && e.message ? e.message : e));
+      return;
+    }
     RECORDERS.set(video, state);
     // M6.2 (v4.5.1): navigating away used to destroy the recorder and lose the take.
     // pagehide always stops it (the page is going away, onstop then saves). A hidden
@@ -30613,6 +31009,23 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
         setLabel(overlay, "Couldn't find tweet link", TH.error);
         return;
       }
+      // E2 (v4.5.2): a blob: currentSrc (X and most MSE players) is not a URL the
+      // app can fetch, and a probed format_id belongs to the page URL, not to
+      // that blob. Resolve the sniffed stream the same way the mode picker does,
+      // or refuse with a clear message. Never send a blob to the app.
+      const curSrc = (!directUrl && video.currentSrc) || "";
+      if (!force_page_url && /^blob:/i.test(curSrc)) {
+        if (format_id) {
+          if (!pu) { setLabel(overlay, "Can't match that quality here. Try One-Click.", TH.error); setTimeout(() => restoreLabel(overlay), 4000); return; }
+          return sendChoice({ format_id, target_format, bypass_dialog, download_playlist, pick_playlist, force_page_url: true });
+        }
+        setLabel(overlay, "Finding the stream…");
+        querySniffedVideos((best) => {
+          if (!best || !best.url) { setLabel(overlay, "No stream found. Try One-Click or Record.", TH.error); setTimeout(() => restoreLabel(overlay), 4000); return; }
+          sendChoice({ target_format, bypass_dialog, download_playlist, pick_playlist, url: best.url });
+        }, null);
+        return;
+      }
       setLabel(overlay, "Sending…");
       let base = tweetNameFor(video);
       // Strip an extension the page title already carries so we never
@@ -30718,12 +31131,6 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
           setLabel(overlay, r && r.ok ? "Sent " + r.sent + " ✓" : String((r && r.error) || e || "Nothing to send").slice(0, 40), r && r.ok ? TH.accent : TH.error);
           setTimeout(() => restoreLabel(overlay), 2500);
         }, 120000);
-      });
-      addMenuItem(menu, "Open Video Grabber panel", {}, () => {
-        closeMenu();
-        vgSend({ type: "VG_OPEN_SIDEPANEL" }, (r) => {
-          if (!r || !r.ok) { setLabel(overlay, "Click the toolbar icon", TH.accent); setTimeout(() => restoreLabel(overlay), 2500); }
-        });
       });
     }
 
@@ -32225,6 +32632,156 @@ async function safeGet(keys) {
     statusEl.className = "ok";
   });
 })();
+// Sweep (v4.5.1): a rejected storage read used to abort this whole async block at
+// the first await, leaving Save and Test dead. Reads now fall back to {} (and
+// blobHookEnabled undefined means ON, matching content.js).
+async function safeGet(keys) {
+  try { return (await chrome.storage.local.get(keys)) || {}; } catch (e) { return {}; }
+}
+(async () => {
+  const tokenInput = document.getElementById("token");
+  const statusEl = document.getElementById("status");
+  const interceptCheckbox = document.getElementById("interceptDownloads");
+  const gestureCheckbox = document.getElementById("interceptNeedsGesture");
+  const ignoreInput = document.getElementById("interceptIgnore");
+
+  // B9 (v4.5.1): the change listener is registered BEFORE the first await so no
+  // change can slip past it. If vgSettings changes while the initial read is
+  // still in flight, that read holds an older snapshot: changedSinceLoad makes
+  // the initial reads below skip their checkbox updates and their migration write.
+  let changedSinceLoad = false;
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes[VG_SETTINGS_KEY]) {
+      changedSinceLoad = true;
+      const nv = vgNormalize(changes[VG_SETTINGS_KEY].newValue);
+      interceptCheckbox.checked = !!nv.interceptDownloads;
+      gestureCheckbox.checked = nv.interceptNeedsGesture;
+      if (document.activeElement !== ignoreInput) ignoreInput.value = nv.interceptIgnore;
+    }
+  });
+
+  const { apiToken } = await safeGet("apiToken");
+  if (apiToken) tokenInput.value = apiToken;
+  // Batch 3: the switch lives in vgSettings (vgsettings.js) — the same value
+  // the popup's Downloads toggle edits, and the one background.js reads.
+  // The old standalone "interceptDownloads" key is only a migration
+  // fallback: if vgSettings has never carried the switch, adopt the legacy
+  // value once (mirrors the migration in background.js).
+  {
+    const stored = await safeGet([VG_SETTINGS_KEY, "interceptDownloads"]);
+    const rawVg = stored[VG_SETTINGS_KEY];
+    if (changedSinceLoad) {
+      // B9: a newer value already reached the checkbox through the listener.
+    } else if (!(rawVg && typeof rawVg.interceptDownloads === "boolean")
+        && typeof stored.interceptDownloads === "boolean") {
+      const adopted = vgNormalize({ ...(rawVg || {}), interceptDownloads: stored.interceptDownloads });
+      try { await chrome.storage.local.set({ [VG_SETTINGS_KEY]: adopted }); } catch (e) {}
+      interceptCheckbox.checked = adopted.interceptDownloads;
+    } else {
+      interceptCheckbox.checked = !!vgNormalize(rawVg).interceptDownloads;
+    }
+  }
+  interceptCheckbox.addEventListener("change", async () => {
+    const cur = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    await chrome.storage.local.set({
+      [VG_SETTINGS_KEY]: { ...cur, interceptDownloads: interceptCheckbox.checked },
+    });
+  });
+  // v4.4: the click-required switch and the ignore list live in vgSettings too.
+  {
+    const cur = vgNormalize((await safeGet(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    if (!changedSinceLoad) {   // B9: never paint a stale snapshot over a newer value
+      gestureCheckbox.checked = cur.interceptNeedsGesture;
+      ignoreInput.value = cur.interceptIgnore;
+    }
+  }
+  async function saveVg(patch) {
+    // Write path: a failed read must throw, not fall back to defaults and overwrite every setting.
+    const cur = vgNormalize((await chrome.storage.local.get(VG_SETTINGS_KEY))[VG_SETTINGS_KEY]);
+    await chrome.storage.local.set({ [VG_SETTINGS_KEY]: vgNormalize({ ...cur, ...patch }) });
+  }
+  gestureCheckbox.addEventListener("change", () => saveVg({ interceptNeedsGesture: gestureCheckbox.checked }));
+  ignoreInput.addEventListener("change", () => saveVg({ interceptIgnore: ignoreInput.value }));
+  // Keeping this page honest when the popup toggle flips a switch meanwhile is
+  // the onChanged listener registered at the top of this file (B9).
+
+  const blobHookCheckbox = document.getElementById("blobHookEnabled");
+  const { blobHookEnabled } = await safeGet("blobHookEnabled");
+  blobHookCheckbox.checked = blobHookEnabled !== false;
+  blobHookCheckbox.addEventListener("change", async () => {
+    await chrome.storage.local.set({ blobHookEnabled: blobHookCheckbox.checked });
+  });
+
+  document.getElementById("test").addEventListener("click", async () => {
+    statusEl.textContent = "Contacting app…";
+    statusEl.className = "";
+    try {
+      const ping = await fetch("http://127.0.0.1:5757/ping");
+      if (ping.status === 404) {
+        statusEl.textContent = "App reachable but outdated — update Video Grabber, then retry.";
+        statusEl.className = "bad";
+        return;
+      }
+      if (!ping.ok) throw new Error("no response");
+      const state = await ping.json().catch(() => ({}));
+      if (state.paired) {
+        if (!tokenInput.value.trim()) {
+          statusEl.textContent = "App is paired, but this extension has no token — copy it from the app's Tools menu.";
+          statusEl.className = "bad";
+          return;
+        }
+        statusEl.textContent = "App reachable ✓ — already paired this session.";
+        statusEl.className = "ok";
+        return;
+      }
+      const res = await fetch("http://127.0.0.1:5757/pair", { method: "POST" });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.token) {
+          await chrome.storage.local.set({ apiToken: data.token });
+          tokenInput.value = data.token;
+          statusEl.textContent = "Paired ✓";
+          statusEl.className = "ok";
+          return;
+        }
+      }
+      statusEl.textContent = "App reachable but pairing refused — restart the app to re-pair.";
+      statusEl.className = "bad";
+    } catch (e) {
+      statusEl.textContent = "App unreachable — is Video Grabber running?";
+      statusEl.className = "bad";
+    }
+  });
+
+  // v5: show the connection state as soon as the page opens (read-only:
+  // /ping never pairs, so this can't use up the once-per-session pairing).
+  try {
+    const ping = await fetch("http://127.0.0.1:5757/ping");
+    if (ping.ok) {
+      const state = await ping.json().catch(() => ({}));
+      const paired = state.paired || !!tokenInput.value.trim();
+      statusEl.textContent = paired
+        ? "App running" + (state.version ? ` (v${state.version})` : "") + (tokenInput.value.trim() ? " ✓" : " but this extension has no token. Press Test connection.")
+        : "App running, not paired yet. Press Test connection.";
+      statusEl.className = paired && tokenInput.value.trim() ? "ok" : "bad";
+    }
+  } catch (e) {
+    statusEl.textContent = "App not running. Launch Video Grabber, then press Test connection.";
+    statusEl.className = "bad";
+  }
+
+  document.getElementById("save").addEventListener("click", async () => {
+    const value = tokenInput.value.trim();
+    if (!value) {
+      statusEl.textContent = "Paste a token first.";
+      statusEl.className = "bad";
+      return;
+    }
+    await chrome.storage.local.set({ apiToken: value });
+    statusEl.textContent = "Saved ✓ — try downloading something.";
+    statusEl.className = "ok";
+  });
+})();
 // panel.js: the views added around the original popup (popup.js stays the
 // "Page" view): Library, Queue, Archive and Tools. Used by popup.html and
 // sidepanel.html. Every value from the page or the app is put in with
@@ -32621,7 +33178,7 @@ async function safeGet(keys) {
       h("div", { class: "pbar" }, h("button", { class: "pbtn", text: "Refresh", onclick: refresh }),
         h("button", { class: "pbtn", text: "Copy report", onclick: () => navigator.clipboard.writeText((sum.textContent || "") + "\n" + out.textContent).then(() => toast("Copied"), () => toast("Copy failed", true)) }),
         h("button", { class: "pbtn", text: "Clear log", onclick: async () => { await send({ type: "VG_DIAG_CLEAR" }); refresh(); } }),
-        !isSide ? h("button", { class: "pbtn", text: "Open side panel", onclick: async () => { const r = await send({ type: "VG_OPEN_SIDEPANEL", tabId: (await X.activeTab() || {}).id }); r.ok ? window.close() : toast(r.error, true); } }) : null), out);
+        null), out);
   }
   loaders.tools = loadTools;
 
@@ -34916,339 +35473,10 @@ function vgNormalize(raw) {
   <script src="panel.js"></script>
 </body>
 </html>
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<style>
-  :root { --bg:#0a0a0f; --panel:#12121a; --elev:#1a1a24; --sel:#173a41; --hover:#1a1a24;
-          --bd:#242430; --bd-hi:#33333f; --tx:#e6e6eb; --tx-soft:#b3b3bd; --mu:#8a8a95; --dim:#5a5a65;
-          --ac:#26c6da; --ac-dim:#1a8a99; --on-ac:#0a0a0f; --ok:#4caf50; --warn:#ffb300; --err:#ef5350;
-          --info:#42a5f5; --r:10px; --font:-apple-system, "Segoe UI", Roboto, sans-serif; color-scheme:dark; }
-  * { box-sizing: border-box; }
-  body { width: 380px; font: 13px/1.4 var(--font); margin: 0; padding: 12px; color: var(--tx); background: var(--bg); }
-  button { font: inherit; color: var(--tx); background: var(--elev); border: 1px solid var(--bd);
-           border-radius: var(--r); cursor: pointer; }
-  button:hover:not(:disabled) { border-color: var(--bd-hi); background: var(--hover); }
-  button:focus-visible, input:focus-visible { outline: 2px solid var(--ac); outline-offset: 2px; }
-  .hdr { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-  .hdr img { width: 32px; height: 32px; border-radius: 8px; }
-  .hdr b { display: block; font-size: 15px; }
-  .hdr small { color: var(--mu); letter-spacing: .06em; font-size: 11px; }
-  .hdr .cog { margin-left: auto; width: 32px; height: 32px; padding: 0; font-size: 17px; line-height: 1; }
-  /* Batch 3: the header button is a sliders icon (inline SVG), distinct from
-     the app's cog; its strokes and knobs use currentColor, so it follows the
-     theme text color like the glyph did. */
-  .hdr .cog svg { display: block; margin: auto; }
-
-  /* v4.3: settings panel (cog). Sections: Pill / Sniffer / Notifications. */
-  #settingsView { display: none; padding-bottom: 8px; }
-  .sethdr { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-  .sethdr b { font-size: 14px; }
-  .sethdr button { padding: 4px 10px; font-size: 12px; }
-  .setsec { border: 1px solid var(--bd); background: var(--panel); border-radius: var(--r);
-            padding: 8px 12px 10px; margin-bottom: 10px; }
-  .setsec h2 { font-size: 11px; font-weight: 600; color: var(--ac); letter-spacing: .08em;
-               text-transform: uppercase; margin: 2px 0 8px; }
-  /* Batch 3: the IMAGE MICRO-PILL section is a collapsible <details>. */
-  details.setsec summary { cursor: pointer; list-style: none; }
-  details.setsec summary::-webkit-details-marker { display: none; }
-  details.setsec summary h2 { display: inline-block; }
-  details.setsec summary::after { content: "\25b8"; float: right; color: var(--mu); font-size: 11px; }
-  details.setsec[open] summary::after { content: "\25be"; }
-  details.setsec:not([open]) { padding-bottom: 2px; }
-  .setrow { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 8px; }
-  .setrow > label { flex: 1; }
-  .setrow.chk { justify-content: flex-start; }
-  .setrow.chk input { accent-color: var(--ac); margin: 0; }
-  .setrow.chk label { flex: 0 1 auto; cursor: pointer; }
-  .setrow select { font: inherit; color: var(--tx); background: var(--bg); border: 1px solid var(--bd);
-                   border-radius: var(--r); padding: 4px 8px; max-width: 170px; }
-  .sethint { font-size: 11px; color: var(--mu); margin: -4px 0 8px; }
-  #setSites .site { display: flex; align-items: center; justify-content: space-between; gap: 8px;
-                    font-size: 12px; padding: 3px 0; }
-  #setSites .site button { padding: 1px 8px; font-size: 12px; }
-  #setSites .none { font-size: 11px; color: var(--dim); }
-  .setbtn { width: 100%; padding: 7px; font-size: 12px; margin-top: 2px; }
-  #status { font-size: 12px; margin-bottom: 10px; padding: 8px 12px; border-radius: var(--r); }
-  .ok { background: color-mix(in srgb, var(--ok) 14%, var(--panel)); color: var(--ok); }
-  .ok:before { content: "\25CF  "; font-size: 10px; }
-  .bad { background: color-mix(in srgb, var(--err) 14%, var(--panel)); color: var(--err); }
-
-  /* 7.1: the active tab is an accent underline with accent text and no fill,
-     so it no longer looks like the filled Download button. */
-  .tabs { display: flex; gap: 3px; margin-bottom: 8px; padding: 0; border-bottom: 1px solid var(--bd); }
-  .tab { flex: 1; padding: 7px; font-size: 12px; border: 0; border-bottom: 2px solid transparent;
-         border-radius: 0; background: transparent; color: var(--mu); }
-  .tab:hover:not(:disabled) { background: transparent; color: var(--tx); }
-  .tab.active { background: transparent; color: var(--ac); border-bottom-color: var(--ac); font-weight: 600; }
-  .tab.active:hover:not(:disabled) { color: var(--ac); }
-
-  #otherTabs { margin-bottom: 6px; }
-  .otab { display: flex; justify-content: space-between; padding: 6px 10px; border: 1px solid var(--bd);
-          border-radius: var(--r); margin-bottom: 4px; cursor: pointer; font-size: 12px; background: var(--panel); }
-  .otab:hover { background: var(--hover); }
-  .otab.sel { border-color: var(--ac); background: var(--sel); }
-
-  .mrow { display: flex; align-items: center; gap: 8px; border: 1px solid var(--bd); background: var(--panel);
-          border-radius: var(--r); padding: 6px 9px; margin-bottom: 5px; min-height: 42px; }
-  .mrow:hover { border-color: var(--bd-hi); }
-  .mrow input[type=checkbox] { flex-shrink: 0; accent-color: var(--ac); }
-  .mrow .mname { font-size: 12px; word-break: break-all; flex: 1; }
-  /* E4: 16x16 favicon; a letter tile stands in until it loads (or if it can't). */
-  .mrow .fav { flex-shrink: 0; width: 16px; height: 16px; border-radius: 4px; background: var(--elev);
-               color: var(--mu); font-size: 10px; font-weight: 600; line-height: 16px; text-align: center; overflow: hidden; }
-  .mrow .fav.has-img { background: none; }
-  .mrow .fav img { display: block; width: 16px; height: 16px; }
-  /* 7.3: buttons at least 24x24, 4px apart, right-aligned behind a divider. */
-  .mrow .macts { flex-shrink: 0; white-space: nowrap; display: flex; gap: 4px; align-items: center;
-                 margin-left: auto; padding-left: 8px; border-left: 1px solid var(--bd); }
-  .mrow .macts button { font-size: 12px; padding: 2px 6px; min-width: 24px; min-height: 24px;
-                        display: inline-flex; align-items: center; justify-content: center; }
-
-  .toolbar { display: flex; flex-wrap: wrap; gap: 5px; margin: 10px 0 4px; }
-  .toolbar button { flex: 1 1 auto; font-size: 11px; padding: 6px 8px; }
-  .toolbar button:disabled { opacity: .4; cursor: default; }
-  #btnDownload { background: var(--ac); color: var(--on-ac); border-color: var(--ac); font-weight: 600; }
-  .toolbar #grabAllBtn { width: auto; padding: 6px 8px; margin: 0; }
-  .toolbar .more { position: relative; flex: 0 0 auto; }
-  #btnMore { font-size: 16px; line-height: 1; padding: 4px 12px; min-width: 40px; }
-  /* Opens upward: the bar sits near the bottom of the popup. */
-  #moreMenu { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 20; min-width: 170px;
-              display: flex; flex-direction: column; gap: 2px; padding: 4px; background: var(--elev);
-              border: 1px solid var(--bd-hi); border-radius: var(--r); box-shadow: 0 6px 18px rgba(0,0,0,.45); }
-  #moreMenu[hidden] { display: none; }
-  #moreMenu button { width: 100%; text-align: left; border: 0; background: transparent; padding: 7px 10px;
-                     font-size: 12px; border-radius: 6px; }
-  #moreMenu button:hover:not(:disabled), #moreMenu button:focus-visible { background: var(--hover); }
-  #moreMenu button:disabled { opacity: .4; cursor: default; }
-  #btnDownload:hover:not(:disabled) { background: var(--ac-dim); border-color: var(--ac-dim); }
-
-  #filterPanel { border: 1px solid var(--bd); background: var(--panel); border-radius: var(--r);
-                 padding: 8px; margin-bottom: 8px; font-size: 12px; display: block; }
-  /* 7.1: chips keep a 2px border so checking one doesn't shift the layout;
-     a checked chip is a 2px accent border with a ~15% accent fill. The
-     "Hide files under 100 KB" row (.tiny) is a plain checkbox row, never a chip. */
-  #filterPanel label { position: relative; display: inline-block; margin: 0 4px 5px 0; padding: 2px 9px;
-                       border: 2px solid var(--bd); border-radius: 999px; color: var(--mu); cursor: pointer; white-space: nowrap; }
-  #filterPanel label input { position: absolute; opacity: 0; width: 0; height: 0; }
-  #filterPanel label:not(.tiny):has(input:checked) { border-color: var(--ac); color: var(--ac);
-                       background: color-mix(in srgb, var(--ac) 15%, transparent); }
-  #filterPanel label:has(input:focus-visible) { outline: 2px solid var(--ac); outline-offset: 2px; }
-  #filterPanel .tiny { display: block; margin: 6px 0 0; padding: 0; border: 0; border-radius: 0; background: none;
-                       color: var(--mu); cursor: pointer; }
-  #filterPanel .tiny input { position: static; opacity: 1; width: auto; height: auto; accent-color: var(--ac); vertical-align: -2px; }
-  #searchInput { width: 100%; padding: 7px 10px; margin-bottom: 8px; border: 1px solid var(--bd);
-                 border-radius: var(--r); font: inherit; display: none; background: var(--bg); color: var(--tx); }
-  #searchInput:focus { border-color: var(--ac); outline: none; }
-
-  .empty { color: var(--dim); font-size: 12px; padding: 14px 0; text-align: center; }
-  .empty .linkbtn { background: none; border: 0; padding: 0; color: var(--ac); text-decoration: underline; cursor: pointer; font: inherit; }
-  #mediaStatus { font-size: 11px; color: var(--mu); min-height: 14px; margin-bottom: 4px; }
-
-  .grab-item { display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--bd); background: var(--panel);
-    border-radius: var(--r); padding: 6px 9px; margin-bottom: 5px; }
-  .grab-item input[type=checkbox] { margin-top: 3px; flex-shrink: 0; accent-color: var(--ac); }
-  .grab-item .name { font-size: 12px; word-break: break-all; }
-  .grab-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-  .grab-toolbar button { font-size: 11px; padding: 4px 9px; }
-  #grabAllBtn, #grabSendBtn { width: 100%; padding: 8px; }
-  #grabSendBtn { margin-top: 6px; background: var(--ac); color: var(--on-ac); border-color: var(--ac); font-weight: 600; }
-  #grabSendBtn:disabled { opacity: .5; cursor: default; }
-  .divider { border-top: 1px solid var(--bd); margin: 12px 0 10px; }
-
-  #recent { margin-bottom: 10px; }
-  #recent h2 { font-size: 11px; font-weight: 600; color: var(--mu); margin: 0 0 5px; letter-spacing: .06em; }
-  .rjob { border: 1px solid var(--bd); background: var(--panel); border-radius: var(--r); padding: 6px 9px; margin-bottom: 4px; font-size: 12px; }
-  .rjob .rname { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rjob .rmeta { display: flex; justify-content: space-between; color: var(--mu); font-size: 11px; }
-  .rjob .rbar { height: 4px; background: var(--elev); border-radius: 4px; margin: 4px 0; overflow: hidden; }
-  .rjob .rbar > i { display: block; height: 100%; background: var(--ac); }
-  .rjob.err .rmeta .rstat { color: var(--err); }
-  #siteRow { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--mu); margin-bottom: 8px; }
-  #siteToggle { font-size: 11px; padding: 3px 10px; }
-
-  /* v4.2: clickable "done" on recent downloads opens the file's folder. */
-  .rjob .rstat.link { cursor: pointer; color: var(--ac); text-decoration: underline; }
-  .rjob .rstat.link:hover { color: var(--ac-dim); }
-  /* v4.2: tag on top-level HLS playlists. */
-  .vtag { font-size: 10px; font-weight: 600; color: var(--ac); border: 1px solid var(--ac-dim);
-          border-radius: 999px; padding: 0 6px; margin-left: 4px; white-space: nowrap; }
-  /* v4.2: "Queue X items?" confirmation for big Grab-all sends. */
-  #grabConfirm { display: none; align-items: center; gap: 8px; margin-top: 6px; padding: 8px 10px;
-                 border: 1px solid var(--warn); border-radius: var(--r); background: var(--panel); }
-  #grabConfirm span { flex: 1; font-size: 12px; }
-  #grabConfirm button { padding: 5px 12px; font-size: 12px; }
-  #grabConfirmYes { background: var(--ac); color: var(--on-ac); border-color: var(--ac); font-weight: 600; }
-  /* v4.2: small toast at the bottom of the popup. */
-  #toast { position: fixed; left: 12px; right: 12px; bottom: 12px; z-index: 10; padding: 8px 12px;
-           border: 1px solid var(--ac); border-radius: var(--r); background: var(--elev); color: var(--tx);
-           font-size: 12px; text-align: center; opacity: 0; pointer-events: none; transition: opacity 150ms ease; }
-  #toast.show { opacity: 1; }
-  #toast.err { border-color: var(--err); color: var(--err); }
-</style>
-<link rel="stylesheet" href="panel.css">
-</head>
-<body>
-  <div class="hdr"><img src="icons/icon48.png" alt=""><div><b>Video Grabber</b><small>BROWSER EXTENSION</small></div><button id="btnCog" class="cog" title="Settings" aria-label="Settings"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><circle cx="9" cy="7" r="2.2" fill="currentColor" stroke="none"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="15" cy="12" r="2.2" fill="currentColor" stroke="none"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="7" cy="17" r="2.2" fill="currentColor" stroke="none"/></svg></button></div>
-  <div id="mainView">
-  <div id="status">Checking desktop app…</div>
-  <div id="recent" style="display:none;"><h2>Recent downloads</h2><div id="recentList"></div></div>
-  <div id="siteRow"><span id="siteName"></span><button id="siteToggle">Hide pill on this site</button></div>
-
-  <div class="tabs" role="tablist" aria-label="Pages">
-    <button id="tabCurrent" class="tab active" role="tab" aria-selected="true">Current Page</button>
-    <button id="tabOther" class="tab" role="tab" aria-selected="false">Other Pages</button>
-  </div>
-  <div id="otherTabs" style="display:none;"></div>
-  <div id="searchInputWrap"><input id="searchInput" type="text" placeholder="Filter by name or URL…"/></div>
-  <div id="filterPanel">
-    <label><input type="checkbox" value="mp4" checked/> mp4</label>
-    <label><input type="checkbox" value="webm" checked/> webm</label>
-    <label><input type="checkbox" value="m3u8" checked/> m3u8</label>
-    <label><input type="checkbox" value="mp3" checked/> mp3</label>
-    <label><input type="checkbox" value="image"/> image</label>
-    <label><input type="checkbox" value="doc"/> doc</label>
-    <label><input type="checkbox" value="archive"/> archive</label>
-    <label><input type="checkbox" value="programs"/> programs</label>
-    <label><input type="checkbox" value="other"/> other</label>
-    <label class="tiny"><input type="checkbox" id="hideTiny" checked/> Hide files under 100 KB</label>
-  </div>
-  <div id="mediaList" role="list" aria-label="Detected media"><div class="empty">Scanning this tab…</div></div>
-  <div id="mediaStatus" aria-live="polite"></div>
-
-  <!-- v4.3: Download and Grab all stay on the bar; the rest live in the overflow menu. -->
-  <div class="toolbar">
-    <button id="btnDownload" title="Download checked items">Download</button>
-    <button id="grabAllBtn" title="Scan this page for every media file and link">🔍 Grab all</button>
-    <div class="more">
-      <button id="btnMore" aria-haspopup="menu" aria-expanded="false" aria-controls="moreMenu" aria-label="More actions" title="More actions">&hellip;</button>
-      <div id="moreMenu" role="menu" hidden>
-        <button id="btnMerge" role="menuitem" disabled title="Download checked items, merging HLS streams">Merge</button>
-        <button id="btnCopy" role="menuitem" title="Copy checked URLs">Copy</button>
-        <button id="btnToggle" role="menuitem" title="Check/uncheck all">Toggle</button>
-        <button id="btnSort" role="menuitem" title="Cycle the sort order: Time, Size, Name">Sort: Time</button>
-        <button id="btnFilter" role="menuitem" title="Filter by type">Filter</button>
-        <button id="btnClear" role="menuitem" title="Clear this tab's detected list">Clear</button>
-        <button id="btnSearch" role="menuitem" title="Search">Search</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="divider"></div>
-  <div id="grabResult" style="font-size:11px;color:#555;margin-bottom:8px;"></div>
-  <div id="grabToolbar" class="grab-toolbar" style="display:none;">
-    <span id="grabCount" style="font-size:11px;color:#555;"></span>
-    <button id="grabCheckAll">Check All</button>
-    <button id="grabUncheckAll">Uncheck All</button>
-  </div>
-  <div id="grabChecklist"></div>
-  <button id="grabSendBtn" style="display:none;">Download Selected</button>
-  <div id="grabConfirm">
-    <span id="grabConfirmText"></span>
-    <button id="grabConfirmYes">Yes</button>
-    <button id="grabConfirmNo">Cancel</button>
-  </div>
-  </div>
-
-  <div id="settingsView">
-    <div class="sethdr"><button id="setBack">&larr; Back</button><b>Settings</b></div>
-
-    <div class="setsec">
-      <h2>Pill</h2>
-      <div class="setrow chk"><input type="checkbox" id="setPillVisible"><label for="setPillVisible">Show the pill on videos</label></div>
-      <div class="setrow chk"><input type="checkbox" id="setOneClick"><label for="setOneClick">One-click download mode (hide the menu arrow)</label></div>
-      <div class="setrow"><label for="setCorner">Default corner</label>
-        <select id="setCorner">
-          <option value="">Free (top-left offset)</option>
-          <option value="tl">Top-Left</option>
-          <option value="tr">Top-Right</option>
-          <option value="bl">Bottom-Left</option>
-          <option value="br">Bottom-Right</option>
-        </select></div>
-      <div class="sethint">Applies to sites where you haven't moved the pill.</div>
-      <div class="setrow"><label for="setQuality">Default format</label>
-        <select id="setQuality">
-          <option value="0">Auto (best)</option>
-          <option value="2160">Up to 2160p</option>
-          <option value="1440">Up to 1440p</option>
-          <option value="1080">Up to 1080p</option>
-          <option value="720">Up to 720p</option>
-          <option value="480">Up to 480p</option>
-        </select></div>
-      <div class="sethint">Starred in the menu when a site has no remembered pick.</div>
-      <div class="setrow"><label for="setMenuH">Max dropdown height</label>
-        <select id="setMenuH">
-          <option value="0">No limit</option>
-          <option value="240">240 px</option>
-          <option value="320">320 px</option>
-          <option value="400">400 px</option>
-          <option value="520">520 px</option>
-        </select></div>
-      <div class="setrow"><label>Hidden on these sites</label></div>
-      <div id="setSites"></div>
-      <button id="setResetPos" class="setbtn">Reset pill positions on all sites</button>
-    </div>
-
-    <details class="setsec" id="microPillSec">
-      <summary><h2>Image Micro-Pill</h2></summary>
-      <div class="setrow chk"><input type="checkbox" id="setMicroPill"><label for="setMicroPill">Show the image micro-pill on hover</label></div>
-      <div class="setrow"><label for="setMicroPos">Micro-pill default position</label>
-        <select id="setMicroPos">
-          <option value="tr">Top-Right</option>
-          <option value="tl">Top-Left</option>
-          <option value="br">Bottom-Right</option>
-          <option value="bl">Bottom-Left</option>
-        </select></div>
-      <div class="setrow chk"><input type="checkbox" id="setMicroSize"><label for="setMicroSize">Show file size in micro-pill menu</label></div>
-      <div class="sethint">The file size is fetched when the menu opens, so it only appears when the site lets the extension read it.</div>
-    </details>
-
-    <div class="setsec">
-      <h2>Sniffer</h2>
-      <div class="setrow"><label for="setSniffer">Detect media in</label>
-        <select id="setSniffer">
-          <option value="all">All tabs</option>
-          <option value="active">Active tab only</option>
-        </select></div>
-      <div class="sethint">Active tab only skips background tabs, so media that loads while a tab is in the background isn't listed.</div>
-    </div>
-
-    <div class="setsec">
-      <h2>Downloads</h2>
-      <div class="setrow chk"><input type="checkbox" id="setIntercept"><label for="setIntercept">Intercept all browser downloads</label></div>
-      <div class="sethint">Cancels the browser's own download and hands the file to Video Grabber instead. The same switch lives under Pairing and advanced options — it is one setting, not two.</div>
-      <div class="setrow chk"><input type="checkbox" id="setNeedsClick"><label for="setNeedsClick">Only after a click or key press</label></div>
-      <div class="sethint">Leaves downloads the browser starts by itself (restored tabs, resumed items, page scripts) alone. Recommended.</div>
-      <div class="setrow"><label for="setIgnore">Never intercept (sites or .types)</label></div>
-      <div class="setrow"><input type="text" id="setIgnore" placeholder="example.com .exe .iso" style="width:100%;box-sizing:border-box;padding:6px 8px;font:inherit;color:inherit;background:var(--bg);border:1px solid var(--bd);border-radius:var(--r);"></div>
-    </div>
-
-    <div class="setsec">
-      <h2>Notifications</h2>
-      <div class="setrow chk"><input type="checkbox" id="setNotifyRec"><label for="setNotifyRec">Recording started / finished</label></div>
-      <div class="setrow chk"><input type="checkbox" id="setNotifyAct"><label for="setNotifyAct">Shortcut and right-click sends</label></div>
-    </div>
-
-    <button id="setOptions" class="setbtn">Pairing and advanced options&hellip;</button>
-  </div>
-
-  <div id="toast" role="status" aria-live="polite"></div>
-
-  <script src="vglog.js"></script>
-  <script src="vgchrome.js"></script>
-  <script src="vgcore.js"></script>
-  <script src="theme.js"></script>
-  <script src="vgsettings.js"></script>
-  <script src="popupshim.js"></script>
-  <script src="popup.js"></script>
-  <script src="panel.js"></script>
-</body>
-</html>
 {
   "manifest_version": 3,
   "name": "Universal Video Grabber",
-  "version": "4.5.1",
+  "version": "4.5.8",
   "minimum_chrome_version": "111",
   "description": "Detects video streams (mp4/HLS/DASH) on any page and sends them to the local Video Grabber app for full-speed download via yt-dlp. Includes a blob/MediaRecorder fallback for in-page-only streams.",
   "permissions": [
@@ -35263,8 +35491,7 @@ function vgNormalize(raw) {
     "notifications",
     "contextMenus",
     "favicon",
-    "alarms",
-    "sidePanel"
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -35303,12 +35530,6 @@ function vgNormalize(raw) {
     },
     "toggle-intercept": {
       "description": "Turn Video Grabber's download interception on or off (no default key, set one in the shortcuts page)"
-    },
-    "open-side-panel": {
-      "suggested_key": {
-        "default": "Alt+Shift+V"
-      },
-      "description": "Open the Video Grabber side panel (or popup where the browser has no side panel)"
     },
     "send-all-page": {
       "description": "Send every media file detected on this page to Video Grabber (no default key)"
@@ -35352,9 +35573,6 @@ function vgNormalize(raw) {
     "32": "icons/icon32.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  },
-  "side_panel": {
-    "default_path": "sidepanel.html"
   }
 }
 /* panel.css: shared by popup.html and sidepanel.html (new views, nav, a11y). */

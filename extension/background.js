@@ -863,18 +863,30 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // over only when ALL of these hold:
 //   - it was created by the browser, not by an extension (no loops with other
 //     download managers, none with our own re-issue);
-//   - it is a fresh in_progress item that started in THIS browser session;
+//   - it started in THIS browser session (any state: a tiny or failed download
+//     can already be complete or interrupted when the event arrives);
 //   - it is not on the user's ignore list (Settings > Downloads);
 //   - a real user action (trusted click, key press, right-click, shortcut or
-//     menu pick) happened in the last 30 s, unless the user turned that
+//     menu pick) happened in the last 60 s, unless the user turned that
 //     requirement off. content.js reports the actions; page scripts can't
 //     fake them (isTrusted);
 //   - it is not a repeat of one handed over in the last 10 s, and the burst
 //     cap (25 per 30 s) hasn't been hit.
-// Everything else is left to the browser, untouched.
+// Everything else is left to the browser, untouched. One exception (v4.5.9):
+// a download that only fails the user-action check is still mirrored to the
+// app (see mirrorSlipThrough), because a slow server can answer after the window.
 const SESSION_START_KEY = "vgSessionStart";
 const GESTURE_KEY = "vgLastGesture";
-const GESTURE_WINDOW_MS = 30000;
+// v4.5.9: 60 s (was 30). Chrome only creates the download item once the server
+// has answered, so a slow server can outlast a short window.
+const GESTURE_WINDOW_MS = 60000;
+// v4.5.9: on a cold service-worker wake the VG_GESTURE message and onCreated can
+// arrive in either order; wait this long for the message before giving up.
+const GESTURE_GRACE_MS = 600;
+// v4.5.9: limits for mirroring downloads that failed the user-action check.
+const MIRROR_MAX = 3;
+const MIRROR_MS = 30000;
+const MIRROR_QUIET_START_MS = 60000;   // browser start-up: restored tabs fire downloads
 const INTERCEPT_DEDUP_MS = 10000;
 const BURST_MAX = 25;
 const BURST_MS = 30000;
@@ -882,6 +894,7 @@ let sessionStartMs = 0;
 let lastGestureAt = 0;
 let _gesturePersistAt = 0;
 let burstTimes = [];
+let mirrorTimes = [];
 const RECENT_INTERCEPT = new Map();   // url -> time it was handed over
 
 // storage.session survives service-worker restarts but not a browser restart,
@@ -923,7 +936,21 @@ async function hasRecentGesture() {
   return Date.now() - lastGestureAt < GESTURE_WINDOW_MS;
 }
 
+async function hasRecentGestureWithGrace() {
+  if (await hasRecentGesture()) return true;
+  const end = Date.now() + GESTURE_GRACE_MS;
+  while (Date.now() < end) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (Date.now() - lastGestureAt < GESTURE_WINDOW_MS) return true;
+  }
+  return false;
+}
+
 let _ignoreSrc = null, _ignoreHosts = [], _ignoreExts = [];
+// v4.5.9: bare words (no dot) that are file extensions, so "exe" or "iso" typed
+// without the dot still works as an extension instead of as a host name.
+const IGNORE_BARE_EXTS = new Set(("zip rar 7z tar gz exe msi iso dmg apk pdf mp4 mkv webm mov avi " +
+  "mp3 flac m4a wav torrent").split(" "));
 function hostOf(u) {
   try { return new URL(u).hostname.toLowerCase(); } catch (e) { return ""; }
 }
@@ -936,6 +963,7 @@ function isIgnoredDownload(item) {
     for (const tok of src.toLowerCase().split(/[\s,;]+/)) {
       if (!tok) continue;
       if (tok[0] === ".") _ignoreExts.push(tok.slice(1));
+      else if (IGNORE_BARE_EXTS.has(tok)) _ignoreExts.push(tok);
       else _ignoreHosts.push(tok.replace(/^https?:\/\//, "").replace(/^\*\./, "").replace(/\/.*$/, ""));
     }
   }
@@ -943,7 +971,10 @@ function isIgnoredDownload(item) {
   const hosts = [hostOf(item.url), hostOf(item.finalUrl || ""), hostOf(item.referrer || "")];
   for (const h of _ignoreHosts) {
     if (!h) continue;
-    for (const x of hosts) if (x && (x === h || x.endsWith("." + h))) return true;
+    // v4.5.9: a one-word entry ("com", "intranet") matches that exact host only,
+    // never as a suffix, so "com" can't swallow every .com site.
+    const dotted = h.indexOf(".") !== -1;
+    for (const x of hosts) if (x && (x === h || (dotted && x.endsWith("." + h)))) return true;
   }
   if (_ignoreExts.length) {
     let path = "";
@@ -975,6 +1006,61 @@ async function toggleIntercept() {
   } catch (e) { /* storage or notifications unavailable: nothing to do */ }
 }
 
+// v4.5.9: fallback for a download that failed the user-action check. The browser
+// keeps its copy (nothing is cancelled or erased), but the URL is still offered
+// to the app so a slow-server or cold-wake miss doesn't leave it only in the
+// browser. Quiet during browser start-up, capped, and deduplicated.
+async function mirrorSlipThrough(item) {
+  try {
+    const now = Date.now();
+    if (now - sessionStartMs < MIRROR_QUIET_START_MS) return;
+    const prevAt = RECENT_INTERCEPT.get(item.url);
+    if (prevAt && now - prevAt < INTERCEPT_DEDUP_MS) return;
+    mirrorTimes = mirrorTimes.filter((t) => now - t < MIRROR_MS);
+    if (mirrorTimes.length >= MIRROR_MAX) return;
+    mirrorTimes.push(now);
+    RECENT_INTERCEPT.set(item.url, now);
+    const fileUrl = item.finalUrl || item.url;
+    let pageRef = item.referrer || "";
+    if (!pageRef) {
+      try {
+        const [act] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (act && act.url && sameSiteFamily(fileUrl, act.url)) pageRef = act.url;
+      } catch (e) {}
+    }
+    const [filename, cookie] = await Promise.all([
+      (async () => {
+        try {
+          const [full] = await chrome.downloads.search({ id: item.id });
+          if (full && full.filename) return full.filename.split(/[\\/]/).pop();
+        } catch (e) {}
+        return null;
+      })(),
+      cookieHeaderForItem(fileUrl, pageRef).catch(() => ""),
+    ]);
+    let ok = false;
+    try {
+      const { res } = await authedFetch("/show-add-dialog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: fileUrl, referer: pageRef, page_url: pageRef, cookie: cookie,
+          user_agent: navigator.userAgent, filename: filename,
+        }),
+      });
+      ok = res.ok;
+    } catch (e) { ok = false; }
+    console.debug("[VG] mirrored a download that had no recent user action, ok=" + ok);
+    if (ok) {
+      VGBG.emit("sent", { items: [{ url: item.url, filename }], pageUrl: item.referrer || "", job_ids: [], viaIntercept: true, mirrored: true });
+    } else {
+      RECENT_INTERCEPT.delete(item.url);
+    }
+  } catch (e) {
+    console.debug("[VG] mirror failed", e);
+  }
+}
+
 chrome.downloads.onCreated.addListener(async (item) => {
   console.debug("[VG] onCreated fired:", (item.url || "").slice(0, 120),
                 "byExtensionId:", item.byExtensionId, "state:", item.state);
@@ -999,7 +1085,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (isLocalhost || isIpAddress) return;
 
   // v4.4 gate (see the block comment above).
-  if (item.state && item.state !== "in_progress") return;
+  // v4.5.9: no item.state check any more. Chrome / Vivaldi can report a fresh
+  // download as interrupted, or already complete when the file is tiny. Old
+  // items are still filtered by the session-start check below. A complete item
+  // can't be cancelled; the handoff below then just mirrors it to the app.
   await Promise.all([sessionReady, vgcfgReady]);
   const started = item.startTime ? Date.parse(item.startTime) : NaN;
   if (Number.isFinite(started) && started < sessionStartMs - 3000) {
@@ -1010,9 +1099,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
     console.debug("[VG] intercept skipped: on the ignore list");
     return;
   }
-  if (VGCFG.interceptNeedsGesture && !(await hasRecentGesture())) {
+  if (VGCFG.interceptNeedsGesture && !(await hasRecentGestureWithGrace())) {
     console.debug("[VG] intercept skipped: no user action in the last",
                   GESTURE_WINDOW_MS / 1000, "s (browser-initiated download)");
+    await mirrorSlipThrough(item);
     return;
   }
   const now = Date.now();
@@ -1055,6 +1145,22 @@ chrome.downloads.onCreated.addListener(async (item) => {
   }
   const browserLag = item.startTime ? t0 - Date.parse(item.startTime) : -1;
 
+  // v4.5.5: Chrome often leaves item.referrer empty for a click on a file link,
+  // and the download event does not say which tab it came from. Fall back to the
+  // active tab's page, but only when that page is on the same site as the file,
+  // so the Referer and cookies never go to a different site.
+  // v4.5.8: send the address Chrome actually downloaded from (finalUrl), not the
+  // first link. A link that redirects can hand the app a URL that needs the
+  // browser's own redirect handling, which is where the 403 came from.
+  const fileUrl = item.finalUrl || item.url;
+  let pageRef = item.referrer || "";
+  if (!pageRef) {
+    try {
+      const [act] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (act && act.url && sameSiteFamily(fileUrl, act.url)) pageRef = act.url;
+    } catch (e) {}
+  }
+
   // Filename lookup and cookie fetch are independent: run them together.
   const [filename, cookie] = await Promise.all([
     (async () => {
@@ -1064,7 +1170,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
       } catch (e) {}
       return null;
     })(),
-    cookieHeaderFor(item.url).catch(() => ""),
+    cookieHeaderForItem(fileUrl, pageRef).catch(() => ""),
   ]);
 
   let handedOff = false;
@@ -1073,9 +1179,9 @@ chrome.downloads.onCreated.addListener(async (item) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        url: item.url,
-        referer: item.referrer || "",
-        page_url: item.referrer || "",
+        url: fileUrl,
+        referer: pageRef,
+        page_url: pageRef,
         cookie: cookie,
         user_agent: navigator.userAgent,
         filename: filename,

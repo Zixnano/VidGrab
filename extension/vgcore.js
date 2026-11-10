@@ -32,6 +32,24 @@
     } catch (e) { return ""; }
   }
 
+  // CDNs often pick the output format with a query value instead of a path
+  // extension: pbs.twimg.com/media/ID?format=gif&name=small, imgix ?fm=gif.
+  // Only a known image/video/audio extension counts, so ?format=json or
+  // ?f=1 never turns into a file extension.
+  const QUERY_EXT_KEYS = ["format", "fm", "f", "ext"];
+  function extFromQuery(url) {
+    try {
+      if (!/^[a-z]+:\/\//i.test(url || "")) return "";
+      const q = new URL(url).searchParams;
+      for (const k of QUERY_EXT_KEYS) {
+        const v = String(q.get(k) || "").trim().toLowerCase().replace(/^\./, "");
+        const kind = EXT_KIND[v];
+        if (v && (kind === "image" || kind === "video" || kind === "audio")) return v;
+      }
+    } catch (e) {}
+    return "";
+  }
+
   // A name that is mostly a random ID (CDN chunk names) says nothing useful.
   function looksRandom(stem) {
     if (!stem) return true;
@@ -60,15 +78,28 @@
   function improveFilename(ctx) {
     ctx = ctx || {};
     const urlExt = extOf(ctx.url || "");
+    const queryExt = extFromQuery(ctx.url || "");
     let name = sanitizeName(ctx.filename || "");
     // A playlist's own extension is never the saved file's extension.
     const nameExt = extOf(name);
     let ext = /^(m3u8|mpd)$/.test(nameExt) ? "" : (nameExt || (/^(m3u8|mpd)$/.test(urlExt) ? "" : urlExt));
+    // ?format=gif: the query says what the bytes are. It fills a missing
+    // extension, and replaces a still-image one (".../ID.jpg?format=gif"), but
+    // only when the name's extension came from the URL itself, so a name the
+    // user typed keeps its extension. Playlists are never touched.
+    if (queryExt && !/^(m3u8|mpd)$/.test(nameExt) && !/^(m3u8|mpd)$/.test(urlExt)
+        && (!nameExt || nameExt === urlExt)
+        && (!ext || (EXT_KIND[ext] === "image" && EXT_KIND[queryExt] === "image"))) {
+      ext = queryExt;
+    }
     if (!ext && ctx.contentType) {
       const ct = String(ctx.contentType).toLowerCase();
       const map = { "video/mp4": "mp4", "video/webm": "webm", "audio/mpeg": "mp3", "audio/mp4": "m4a",
         "audio/aac": "aac", "audio/ogg": "ogg", "image/jpeg": "jpg", "image/png": "png",
-        "image/gif": "gif", "image/webp": "webp", "image/avif": "avif", "application/pdf": "pdf" };
+        "image/gif": "gif", "image/webp": "webp", "image/avif": "avif", "image/apng": "png",
+        "image/bmp": "bmp", "image/svg+xml": "svg", "image/heic": "heic", "image/heif": "heif",
+        "image/tiff": "tif", "image/x-icon": "ico", "image/vnd.microsoft.icon": "ico",
+        "application/pdf": "pdf" };
       for (const k of Object.keys(map)) if (ct.startsWith(k)) { ext = map[k]; break; }
     }
     const stem = name ? name.replace(/\.[a-z0-9]{1,5}$/i, "") : "";
@@ -106,7 +137,7 @@
   const KIND_BY_EXT = {
     video: "mp4 m4v mov webm mkv avi flv wmv mpg mpeg ts m2ts ogv 3gp",
     audio: "mp3 m4a aac wav flac opus ogg wma aiff",
-    image: "jpg jpeg png gif webp avif heic bmp svg ico tif tiff jxl",
+    image: "jpg jpeg png apng gif webp avif heic heif bmp svg ico tif tiff jxl",
     stream: "m3u8 mpd",
     document: "pdf epub doc docx xls xlsx ppt pptx txt csv json xml",
     archive: "zip rar 7z tar gz tgz bz2 xz iso",
@@ -121,7 +152,7 @@
     if (ct.startsWith("video/")) return "video";
     if (ct.startsWith("audio/")) return "audio";
     if (ct.startsWith("image/")) return "image";
-    const e = extOf((item && item.url) || "");
+    const e = extOf((item && item.url) || "") || extFromQuery((item && item.url) || "");
     return EXT_KIND[e] || (ct ? "other" : "unknown");
   }
 
@@ -132,7 +163,7 @@
     let u = null;
     try { u = new URL(url); } catch (e) {}
     const kind = kindOf(item);
-    const ext = extOf(url);
+    const ext = extOf(url) || extFromQuery(url);
     const out = {
       url, kind, ext, host: u ? u.hostname : "", protocol: u ? u.protocol.replace(":", "") : "",
       contentType: item.contentType || "", size: item.size || 0, sizeLabel: sizeLabel(item.size),
@@ -451,7 +482,7 @@
   }
 
   root.VGCORE = {
-    sizeLabel, hostOf, extOf, sanitizeName, looksRandom, improveFilename, expandTemplate,
+    sizeLabel, hostOf, extOf, extFromQuery, sanitizeName, looksRandom, improveFilename, expandTemplate,
     kindOf, inspectItem, analyzeM3U8, searchItems, sortItems, qualityFor, setQuality,
     heightOfFormat, pickFormat, fpsLabel, classifyError, retryDelayMs,
     archiveAdd, archiveHas, archiveSearch, nextRun, isDue, watchMatches, regexLooksUnsafe,

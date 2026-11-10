@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 
 import settings
 from settings import (STATE, load_settings, save_settings, safe_filename, _unique_path,
@@ -785,6 +786,70 @@ def _finalize_single(job_id, job, part, dest):
     maybe_shutdown_if_idle()
 
 
+# Single-stream GET: HTTP 503 is usually a host rate-limiting or warming up
+# (pawchive.pw), so it gets a short fixed retry before the job is failed.
+# (The segmented path has its own backoff in _open_segment.)
+_SINGLE_503_RETRIES = 3     # retries after the first attempt
+_SINGLE_503_WAIT_S = 5      # seconds between attempts
+
+
+def _generic_session(url, headers):
+    """requests.Session carrying the job's Referer / User-Agent / Cookie.
+
+    Headers set on the session are copied onto every redirect hop. A raw
+    Cookie header is the exception: requests drops it on any redirect, so
+    the cookies go into the session's jar instead, scoped to the original
+    host. They still follow same-host redirects (http -> https, /old -> /new)
+    and are never sent to a different host. Range is per request, so it is
+    left out here."""
+    sess = requests.Session()
+    for k, v in headers.items():
+        if k.lower() not in ("cookie", "range"):
+            sess.headers[k] = v
+    cookie = headers.get("Cookie")
+    if cookie:
+        try:
+            host = urlparse(url).hostname or ""
+        except ValueError:
+            host = ""
+        if host:
+            for pair in cookie.split(";"):
+                name, sep, value = pair.strip().partition("=")
+                if sep and name:
+                    sess.cookies.set(name, value, domain=host, path="/")
+    return sess
+
+
+def _open_generic_single(job_id, job, sess, url, range_headers):
+    """GET `url` on `sess`, retrying HTTP 503 up to _SINGLE_503_RETRIES times
+    with _SINGLE_503_WAIT_S seconds between attempts. Returns the open
+    response (the caller closes it); after the last retry that is the 503
+    itself, for the caller to fail the job. Returns None when Stop or Pause
+    arrived during a wait (the job is already transitioned and logged)."""
+    attempt = 0
+    while True:
+        r = sess.get(url, headers=range_headers, stream=True,
+                     timeout=STATE["connection_timeout"],
+                     proxies=settings.proxies_for(url))
+        if r.status_code != 503 or attempt >= _SINGLE_503_RETRIES:
+            return r
+        r.close()
+        attempt += 1
+        log(f"job {job_id}: HTTP 503, retry {attempt}/{_SINGLE_503_RETRIES} "
+            f"in {_SINGLE_503_WAIT_S}s")
+        end_at = time.time() + _SINGLE_503_WAIT_S
+        while time.time() < end_at:
+            if job["stop_evt"].is_set():
+                _try_transition(job, JobEvent.STOP)
+                log(f"job {job_id}: stopped")
+                return None
+            if job["pause_evt"].is_set():
+                _try_transition(job, JobEvent.PAUSE)
+                log(f"job {job_id}: paused")
+                return None
+            time.sleep(0.25)
+
+
 def _run_generic_single(job_id):
     job = JOBS[job_id]
     dest = _job_dest(job)
@@ -795,10 +860,13 @@ def _run_generic_single(job_id):
     if existing:
         headers["Range"] = f"bytes={existing}-"
 
+    sess = _generic_session(job["url"], headers)
+    range_headers = {"Range": headers["Range"]} if "Range" in headers else None
     try:
-        with requests.get(job["url"], headers=headers, stream=True,
-                          timeout=STATE["connection_timeout"],
-                          proxies=settings.proxies_for(job["url"])) as r:
+        r = _open_generic_single(job_id, job, sess, job["url"], range_headers)
+        if r is None:
+            return
+        with r:
             if r.status_code == 416 and existing:
                 # Range not satisfiable. "Content-Range: bytes */N" tells the
                 # real size: when the .part already has N bytes the download
@@ -815,6 +883,9 @@ def _run_generic_single(job_id):
             if r.status_code not in (200, 206):
                 _try_transition(job, JobEvent.FAIL)
                 job["error"] = f"HTTP {r.status_code}"
+                if r.status_code == 503:
+                    job["error"] += (f" (server unavailable, gave up after "
+                                     f"{_SINGLE_503_RETRIES} retries)")
                 log(f"job {job_id}: server returned {r.status_code}")
                 return
             if r.status_code == 200 and existing:
@@ -877,6 +948,7 @@ def _run_generic_single(job_id):
             pass
         log(f"job {job_id}: FAILED — {e}")
     finally:
+        sess.close()
         save_jobs_snapshot()
 
 
