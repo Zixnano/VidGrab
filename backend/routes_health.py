@@ -4,6 +4,7 @@ from flask import Blueprint, jsonify
 
 from settings import APP_VERSION, disk_usage_for, STATE
 import api
+import vg_db
 
 health_bp = Blueprint("routes_health", __name__)
 
@@ -36,4 +37,4 @@ def diskspace():
 
 @health_bp.route("/stats", methods=["GET"])
 def stats():
-    return jsonify({"samples": STATE.get("download_stats", [])[-600:]})
+    return jsonify({"samples": vg_db.recent_stats(600)})

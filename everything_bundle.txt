@@ -2054,6 +2054,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 
 import settings
 from settings import (STATE, load_settings, save_settings, safe_filename, _unique_path,
@@ -2522,14 +2523,163 @@ SEGMENT_COUNT = 8
 _segment_lock = threading.Lock()
 
 
+# --- pawchive.pw 403: headers across redirects (2026-11-10) ---------------
+# Checked against the installed requests (2.31.0) and a local two-host
+# redirect server before writing this. The earlier diagnosis that prompted
+# this fix was wrong in three places, and the fix below corrects those:
+#
+# 1. requests does NOT drop Referer on a cross-host redirect. In
+#    SessionRedirectMixin.resolve_redirects only Cookie is popped (and
+#    Authorization, on a host change). Referer, User-Agent and Accept all
+#    survive. Tested: Referer sent to 127.0.0.1:8765 arrived intact at
+#    localhost:8766 after a 302.
+# 2. The header requests DOES drop is Cookie -- and the proposed fix kept
+#    the old cookie code byte-for-byte, so it could not fix a cookie-loss
+#    403. The session jar only re-sends cookies to the SAME host, so a
+#    redirect pawchive.pw -> n2.pawchive.pw -> a CDN host loses them.
+#    _RedirectSafeSession below re-injects the job Cookie on every hop,
+#    but only to a host in the same site family as the original file host
+#    (same host, or a parent/child subdomain -- the same rule the
+#    extension uses in sameSiteFamily). Cookies are never sent to an
+#    unrelated third-party host.
+# 3. Accept is NOT missing: requests already sends "Accept: */*".
+#    Accept-Language is genuinely absent, and a Chrome-like Accept is
+#    closer to a browser, so those two are added as session defaults.
+#    Deliberately NOT added: Origin (Chrome does not send Origin on a
+#    plain GET navigation/download -- inventing one, let alone falling
+#    back to the target's own origin, is fabricated, not browser-like),
+#    a hardcoded "Sec-Fetch-Site: same-origin" (pawchive.pw page ->
+#    n2.pawchive.pw file is same-SITE but cross-ORIGIN, so that value
+#    would be false -- it is computed from the Referer instead), and an
+#    "Accept-Encoding: gzip, deflate, br" override (requests already
+#    advertises br when brotli is installed, and hardcoding it on a
+#    runtime without brotli would ask for a body it cannot decode).
+# 4. The proposed fix only touched _generic_session, which is only used
+#    by the single-stream path. Files >= 1 MB go through run_generic ->
+#    _probe_ranges (plain requests.head) and run_generic_segmented ->
+#    _open_segment (plain requests.get), neither of which used a session
+#    at all. Both now go through _generic_session too.
+
+
+def _same_site_family(a, b):
+    """Same host, or one is a subdomain of the other (pawchive.pw and
+    n2.pawchive.pw are one family; pawchive.pw and example.com are not).
+    Mirrors the extension's sameSiteFamily()."""
+    a = (a or "").lower()
+    b = (b or "").lower()
+    if not a or not b:
+        return False
+    return a == b or a.endswith("." + b) or b.endswith("." + a)
+
+
+def _origin_tuple(url):
+    """(scheme, host, port) with the scheme default port filled in, so
+    http://host and http://host:80 compare equal."""
+    try:
+        u = urlparse(url or "")
+    except ValueError:
+        return ("", "", None)
+    port = u.port
+    if port is None:
+        port = {"http": 80, "https": 443}.get((u.scheme or "").lower())
+    return ((u.scheme or "").lower(), (u.hostname or "").lower(), port)
+
+
+def _sec_fetch_site(referer, url):
+    """Chrome's Sec-Fetch-Site for a navigation started from `referer` to
+    `url`: same-origin / same-site / cross-site, or "none" with no
+    referer. Computed, never hardcoded."""
+    if not referer:
+        return "none"
+    if _origin_tuple(referer) == _origin_tuple(url):
+        return "same-origin"
+    ru = urlparse(referer)
+    tu = urlparse(url)
+    if _same_site_family(ru.hostname, tu.hostname):
+        return "same-site"
+    return "cross-site"
+
+
+def _merge_cookie_header(existing, stored):
+    """Combine two Cookie headers: pairs already present (e.g. fresh
+    Set-Cookie values from a redirect hop, via the jar) win on a name
+    clash; pairs only in `stored` (the extension's job cookie) fill in."""
+    merged = {}
+    for header in (stored, existing):
+        for pair in (header or "").split(";"):
+            name, sep, value = pair.strip().partition("=")
+            if sep and name and name not in merged:
+                merged[name] = value
+    # `existing` was parsed second, so re-apply it last to win clashes.
+    for pair in (existing or "").split(";"):
+        name, sep, value = pair.strip().partition("=")
+        if sep and name:
+            merged[name] = value
+    return "; ".join(f"{k}={v}" for k, v in merged.items())
+
+
+# Binary extensions whose payload must never be an HTML page. If the
+# server answers one of these with Content-Type: text/html, that is a
+# hotlink / login / error page (some protections return 200 with HTML),
+# not the file -- fail the job instead of saving HTML as a .rar.
+_BINARY_EXTS = {
+    ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".mp4", ".mkv",
+    ".webm", ".mov", ".avi", ".mp3", ".flac", ".ogg", ".png", ".jpg",
+    ".jpeg", ".gif", ".webp", ".pdf", ".exe", ".msi", ".bin", ".dmg",
+    ".iso",
+}
+
+
+def _html_body_for_binary(content_type, suffix):
+    return ("text/html" in (content_type or "").lower()
+            and (suffix or "").lower() in _BINARY_EXTS)
+
+
+class _RedirectSafeSession(requests.Session):
+    """Session that re-applies the job's headers on every redirect hop.
+
+    requests' own redirect handling keeps Referer/User-Agent/Accept but
+    pops Cookie (see resolve_redirects). send() runs for the first
+    request AND for every redirect hop, after that pop, so this is the
+    one place the Cookie can be restored. It is restored only when the
+    hop's host is in the same site family as the original file host.
+    Non-secret headers (Referer, User-Agent, Accept, ...) are re-applied
+    if a hop ever loses one. Range is per-request and is never stored
+    here, so a resume Range is not leaked onto a redirect target."""
+
+    def send(self, request, **kwargs):
+        headers = getattr(self, "_vg_headers", None)
+        if headers:
+            for k, v in headers.items():
+                if k not in request.headers:
+                    request.headers[k] = v
+        cookie = getattr(self, "_vg_cookie", "")
+        origin_host = getattr(self, "_vg_origin_host", "")
+        if cookie and origin_host:
+            try:
+                target_host = urlparse(request.url).hostname or ""
+            except ValueError:
+                target_host = ""
+            if target_host and _same_site_family(target_host, origin_host):
+                merged = _merge_cookie_header(
+                    request.headers.get("Cookie"), cookie)
+                if merged:
+                    request.headers["Cookie"] = merged
+        return super().send(request, **kwargs)
+
+
 def _probe_ranges(url, headers):
     try:
-        h = requests.head(url, headers=headers, allow_redirects=True,
+        sess = _generic_session(url, headers)
+        try:
+            h = sess.head(url, allow_redirects=True,
                           timeout=STATE["connection_timeout"],
                           proxies=settings.proxies_for(url))
-        size = int(h.headers.get("Content-Length", 0))
-        ranges = "bytes" in h.headers.get("Accept-Ranges", "").lower()
-        return size, ranges
+            size = int(h.headers.get("Content-Length", 0))
+            ranges = "bytes" in h.headers.get("Accept-Ranges", "").lower()
+            return size, ranges
+        finally:
+            sess.close()
     except Exception:
         return 0, False
 
@@ -2541,15 +2691,22 @@ class _SegAbort(Exception):
 _SEG_RETRY_BACKOFF = (2, 5, 12)   # seconds before retry 1, 2, 3
 
 
-def _open_segment(job, url, idx, h, cancel):
+def _open_segment(job, url, idx, h, cancel, sess=None):
     """GET one segment, treating HTTP 503 like 429: back off and retry up to
     3 times (honouring Retry-After, capped at 60s). Any other status is
-    returned for the caller to judge."""
+    returned for the caller to judge. `sess` is the caller's
+    _generic_session (so Referer/Cookie survive redirects); without one
+    it falls back to a plain requests.get, as before."""
     attempt = 0
     while True:
-        r = requests.get(url, headers=h, stream=True,
+        if sess is not None:
+            r = sess.get(url, headers=h, stream=True,
                          timeout=STATE["connection_timeout"],
                          proxies=settings.proxies_for(url))
+        else:
+            r = requests.get(url, headers=h, stream=True,
+                             timeout=STATE["connection_timeout"],
+                             proxies=settings.proxies_for(url))
         if r.status_code not in (429, 503):
             return r
         retry_after = r.headers.get("Retry-After", "")
@@ -2575,12 +2732,18 @@ def _open_segment(job, url, idx, h, cancel):
 def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None):
     h = dict(headers)
     h["Range"] = f"bytes={start}-{end}"
+    # One session per segment thread (sessions are not shared across
+    # threads): this is what carries Referer/Cookie across redirects here
+    # -- the old plain requests.get dropped Cookie on every redirect hop.
+    # Range stays per-request, so it is left out of the session headers.
+    sess = _generic_session(
+        url, {k: v for k, v in headers.items() if k.lower() != "range"})
     try:
         # `cancel` is shared by all segments of one job: the first failure
         # sets it so the others stop instead of downloading to the end.
         if cancel is not None and cancel.is_set():
             return
-        with _open_segment(job, url, idx, h, cancel) as r:
+        with _open_segment(job, url, idx, h, cancel, sess) as r:
             if r.status_code == 200:
                 # Server ignored the Range header and returned the whole
                 # file. This happens on CDNs whose edge nodes disagree about
@@ -2593,7 +2756,15 @@ def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None
                     cancel.set()
                 return
             if r.status_code != 206:
+                _log_http_failure(job.get("id"), r, f"segment {idx} GET")
                 raise RuntimeError(f"segment {idx} got HTTP {r.status_code}, expected 206")
+            if _html_body_for_binary(
+                    r.headers.get("Content-Type"),
+                    Path(job.get("filename") or "").suffix):
+                raise RuntimeError(
+                    f"segment {idx} got an HTML page instead of the file "
+                    f"(likely a hotlink / login page, Content-Type: "
+                    f"{r.headers.get('Content-Type')})")
             # Byte counts are folded into job["size_done"] at most every
             # 250 ms per segment (and once more on exit) instead of per
             # 64 KB chunk: the lock and the shared dict were hit thousands of
@@ -2631,6 +2802,8 @@ def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None
         if cancel is not None:
             cancel.set()
         raise
+    finally:
+        sess.close()
 
 
 def _generic_headers(job):
@@ -2819,6 +2992,136 @@ def _finalize_single(job_id, job, part, dest):
     maybe_shutdown_if_idle()
 
 
+# Single-stream GET: HTTP 503 is usually a host rate-limiting or warming up
+# (pawchive.pw), so it gets a short fixed retry before the job is failed.
+# (The segmented path has its own backoff in _open_segment.)
+_SINGLE_503_RETRIES = 3     # retries after the first attempt
+_SINGLE_503_WAIT_S = 5      # seconds between attempts
+
+
+def _generic_session(url, headers):
+    """_RedirectSafeSession carrying the job's Referer / User-Agent / Cookie.
+
+    Browser-like defaults (Accept, Accept-Language, Sec-Fetch-*) are set
+    on the session so they survive every redirect hop; the job's own
+    headers (set below) win over these when both are present. No Origin
+    is sent: Chrome does not send Origin on a plain GET download, and a
+    fallback Origin of the target's own host would be fabricated.
+    Accept-Encoding is left to requests (it already advertises br when
+    brotli is installed).
+
+    A raw Cookie header is the exception to "session headers survive":
+    requests pops Cookie on any redirect, so the cookies go into the
+    session's jar instead, scoped to the original host (same-host
+    redirects keep them that way), AND are re-injected by
+    _RedirectSafeSession.send() on cross-host hops to the same site
+    family (e.g. pawchive.pw -> n2.pawchive.pw). They are never sent to
+    an unrelated host. Range is per request, so it is left out here."""
+    sess = _RedirectSafeSession()
+
+    # Browser-like defaults; the job's own headers (set below) win over
+    # these when both are present.
+    sess.headers.update({
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,image/apng,*/*;q=0.8"),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": _sec_fetch_site(headers.get("Referer", ""), url),
+        "Sec-Fetch-User": "?1",
+    })
+
+    for k, v in headers.items():
+        if k.lower() not in ("cookie", "range"):
+            sess.headers[k] = v
+    # Snapshot for _RedirectSafeSession.send(): re-apply any of these a
+    # redirect hop loses. Cookie is handled separately (see below).
+    sess._vg_headers = {k: v for k, v in sess.headers.items()
+                        if k.lower() != "cookie"}
+
+    cookie = headers.get("Cookie")
+    sess._vg_cookie = cookie or ""
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        host = ""
+    sess._vg_origin_host = host
+    if cookie:
+        if host:
+            for pair in cookie.split(";"):
+                name, sep, value = pair.strip().partition("=")
+                if sep and name:
+                    sess.cookies.set(name, value, domain=host, path="/")
+    return sess
+
+
+def _open_generic_single(job_id, job, sess, url, range_headers):
+    """GET `url` on `sess`, retrying HTTP 503 up to _SINGLE_503_RETRIES times
+    with _SINGLE_503_WAIT_S seconds between attempts. Returns the open
+    response (the caller closes it); after the last retry that is the 503
+    itself, for the caller to fail the job. Returns None when Stop or Pause
+    arrived during a wait (the job is already transitioned and logged)."""
+    attempt = 0
+    while True:
+        r = sess.get(url, headers=range_headers, stream=True,
+                     timeout=STATE["connection_timeout"],
+                     proxies=settings.proxies_for(url))
+        if r.status_code != 503 or attempt >= _SINGLE_503_RETRIES:
+            return r
+        r.close()
+        attempt += 1
+        log(f"job {job_id}: HTTP 503, retry {attempt}/{_SINGLE_503_RETRIES} "
+            f"in {_SINGLE_503_WAIT_S}s")
+        end_at = time.time() + _SINGLE_503_WAIT_S
+        while time.time() < end_at:
+            if job["stop_evt"].is_set():
+                _try_transition(job, JobEvent.STOP)
+                log(f"job {job_id}: stopped")
+                return None
+            if job["pause_evt"].is_set():
+                _try_transition(job, JobEvent.PAUSE)
+                log(f"job {job_id}: paused")
+                return None
+            time.sleep(0.25)
+
+
+def _log_http_failure(job_id, r, what="request"):
+    """Log why a download got a non-success answer (403, 5xx, HTML page, ...):
+    redirect chain, the response headers that identify a CDN / bot wall, the
+    first bytes of the body, and the request headers that were sent. Cookie
+    VALUES are never logged, only their names. Never raises."""
+    try:
+        chain = " -> ".join(f"{h.status_code} {urlparse(h.url).hostname}"
+                            for h in r.history) or "none"
+        sent = r.request.headers
+        cookie_names = sorted({p.split("=")[0].strip()
+                               for p in (sent.get("Cookie") or "").split(";")
+                               if p.strip()})
+        sent_keep = ("Referer", "User-Agent", "Accept", "Accept-Language",
+                     "Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site",
+                     "Sec-Fetch-User", "Range")
+        sent_txt = {k: sent.get(k) for k in sent_keep if sent.get(k)}
+        keep = ("Server", "CF-RAY", "CF-Mitigated", "Content-Type",
+                "Content-Length", "Location", "Retry-After", "WWW-Authenticate",
+                "X-Cache", "Via")
+        got = {k: r.headers.get(k) for k in keep if r.headers.get(k)}
+        raw_headers = getattr(r.raw, "headers", None)
+        set_names = sorted({c.split("=")[0].strip()
+                            for c in (raw_headers.getlist("Set-Cookie")
+                                      if hasattr(raw_headers, "getlist") else [])})
+        try:
+            body = next(r.iter_content(300), b"")
+            body = " ".join(body.decode("utf-8", "replace").split())[:200]
+        except Exception:
+            body = "(unreadable)"
+        log(f"job {job_id}: {what} failed: HTTP {r.status_code} from "
+            f"{urlparse(r.url).hostname} (redirects: {chain})")
+        log(f"job {job_id}: sent {sent_txt} cookies={cookie_names}")
+        log(f"job {job_id}: got {got} set-cookie={set_names} body={body!r}")
+    except Exception as e:
+        log(f"job {job_id}: could not describe the failure ({e})")
+
+
 def _run_generic_single(job_id):
     job = JOBS[job_id]
     dest = _job_dest(job)
@@ -2829,10 +3132,13 @@ def _run_generic_single(job_id):
     if existing:
         headers["Range"] = f"bytes={existing}-"
 
+    sess = _generic_session(job["url"], headers)
+    range_headers = {"Range": headers["Range"]} if "Range" in headers else None
     try:
-        with requests.get(job["url"], headers=headers, stream=True,
-                          timeout=STATE["connection_timeout"],
-                          proxies=settings.proxies_for(job["url"])) as r:
+        r = _open_generic_single(job_id, job, sess, job["url"], range_headers)
+        if r is None:
+            return
+        with r:
             if r.status_code == 416 and existing:
                 # Range not satisfiable. "Content-Range: bytes */N" tells the
                 # real size: when the .part already has N bytes the download
@@ -2849,7 +3155,21 @@ def _run_generic_single(job_id):
             if r.status_code not in (200, 206):
                 _try_transition(job, JobEvent.FAIL)
                 job["error"] = f"HTTP {r.status_code}"
+                if r.status_code == 503:
+                    job["error"] += (f" (server unavailable, gave up after "
+                                     f"{_SINGLE_503_RETRIES} retries)")
                 log(f"job {job_id}: server returned {r.status_code}")
+                _log_http_failure(job_id, r, "single-stream GET")
+                return
+            if _html_body_for_binary(r.headers.get("Content-Type"), dest.suffix):
+                _try_transition(job, JobEvent.FAIL)
+                job["error"] = (
+                    "server returned an HTML page instead of the file "
+                    "(likely a hotlink / login page, Content-Type: "
+                    f"{r.headers.get('Content-Type')})")
+                log(f"job {job_id}: server returned HTML for {dest.name}, "
+                    f"not the file -- failing instead of saving it as "
+                    f"{dest.suffix}")
                 return
             if r.status_code == 200 and existing:
                 log(f"job {job_id}: server ignored Range, restarting from 0")
@@ -2911,6 +3231,7 @@ def _run_generic_single(job_id):
             pass
         log(f"job {job_id}: FAILED — {e}")
     finally:
+        sess.close()
         save_jobs_snapshot()
 
 
@@ -28276,18 +28597,30 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // over only when ALL of these hold:
 //   - it was created by the browser, not by an extension (no loops with other
 //     download managers, none with our own re-issue);
-//   - it is a fresh in_progress item that started in THIS browser session;
+//   - it started in THIS browser session (any state: a tiny or failed download
+//     can already be complete or interrupted when the event arrives);
 //   - it is not on the user's ignore list (Settings > Downloads);
 //   - a real user action (trusted click, key press, right-click, shortcut or
-//     menu pick) happened in the last 30 s, unless the user turned that
+//     menu pick) happened in the last 60 s, unless the user turned that
 //     requirement off. content.js reports the actions; page scripts can't
 //     fake them (isTrusted);
 //   - it is not a repeat of one handed over in the last 10 s, and the burst
 //     cap (25 per 30 s) hasn't been hit.
-// Everything else is left to the browser, untouched.
+// Everything else is left to the browser, untouched. One exception (v4.5.9):
+// a download that only fails the user-action check is still mirrored to the
+// app (see mirrorSlipThrough), because a slow server can answer after the window.
 const SESSION_START_KEY = "vgSessionStart";
 const GESTURE_KEY = "vgLastGesture";
-const GESTURE_WINDOW_MS = 30000;
+// v4.5.9: 60 s (was 30). Chrome only creates the download item once the server
+// has answered, so a slow server can outlast a short window.
+const GESTURE_WINDOW_MS = 60000;
+// v4.5.9: on a cold service-worker wake the VG_GESTURE message and onCreated can
+// arrive in either order; wait this long for the message before giving up.
+const GESTURE_GRACE_MS = 600;
+// v4.5.9: limits for mirroring downloads that failed the user-action check.
+const MIRROR_MAX = 3;
+const MIRROR_MS = 30000;
+const MIRROR_QUIET_START_MS = 60000;   // browser start-up: restored tabs fire downloads
 const INTERCEPT_DEDUP_MS = 10000;
 const BURST_MAX = 25;
 const BURST_MS = 30000;
@@ -28295,6 +28628,7 @@ let sessionStartMs = 0;
 let lastGestureAt = 0;
 let _gesturePersistAt = 0;
 let burstTimes = [];
+let mirrorTimes = [];
 const RECENT_INTERCEPT = new Map();   // url -> time it was handed over
 
 // storage.session survives service-worker restarts but not a browser restart,
@@ -28336,7 +28670,21 @@ async function hasRecentGesture() {
   return Date.now() - lastGestureAt < GESTURE_WINDOW_MS;
 }
 
+async function hasRecentGestureWithGrace() {
+  if (await hasRecentGesture()) return true;
+  const end = Date.now() + GESTURE_GRACE_MS;
+  while (Date.now() < end) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (Date.now() - lastGestureAt < GESTURE_WINDOW_MS) return true;
+  }
+  return false;
+}
+
 let _ignoreSrc = null, _ignoreHosts = [], _ignoreExts = [];
+// v4.5.9: bare words (no dot) that are file extensions, so "exe" or "iso" typed
+// without the dot still works as an extension instead of as a host name.
+const IGNORE_BARE_EXTS = new Set(("zip rar 7z tar gz exe msi iso dmg apk pdf mp4 mkv webm mov avi " +
+  "mp3 flac m4a wav torrent").split(" "));
 function hostOf(u) {
   try { return new URL(u).hostname.toLowerCase(); } catch (e) { return ""; }
 }
@@ -28349,6 +28697,7 @@ function isIgnoredDownload(item) {
     for (const tok of src.toLowerCase().split(/[\s,;]+/)) {
       if (!tok) continue;
       if (tok[0] === ".") _ignoreExts.push(tok.slice(1));
+      else if (IGNORE_BARE_EXTS.has(tok)) _ignoreExts.push(tok);
       else _ignoreHosts.push(tok.replace(/^https?:\/\//, "").replace(/^\*\./, "").replace(/\/.*$/, ""));
     }
   }
@@ -28356,7 +28705,10 @@ function isIgnoredDownload(item) {
   const hosts = [hostOf(item.url), hostOf(item.finalUrl || ""), hostOf(item.referrer || "")];
   for (const h of _ignoreHosts) {
     if (!h) continue;
-    for (const x of hosts) if (x && (x === h || x.endsWith("." + h))) return true;
+    // v4.5.9: a one-word entry ("com", "intranet") matches that exact host only,
+    // never as a suffix, so "com" can't swallow every .com site.
+    const dotted = h.indexOf(".") !== -1;
+    for (const x of hosts) if (x && (x === h || (dotted && x.endsWith("." + h)))) return true;
   }
   if (_ignoreExts.length) {
     let path = "";
@@ -28388,6 +28740,61 @@ async function toggleIntercept() {
   } catch (e) { /* storage or notifications unavailable: nothing to do */ }
 }
 
+// v4.5.9: fallback for a download that failed the user-action check. The browser
+// keeps its copy (nothing is cancelled or erased), but the URL is still offered
+// to the app so a slow-server or cold-wake miss doesn't leave it only in the
+// browser. Quiet during browser start-up, capped, and deduplicated.
+async function mirrorSlipThrough(item) {
+  try {
+    const now = Date.now();
+    if (now - sessionStartMs < MIRROR_QUIET_START_MS) return;
+    const prevAt = RECENT_INTERCEPT.get(item.url);
+    if (prevAt && now - prevAt < INTERCEPT_DEDUP_MS) return;
+    mirrorTimes = mirrorTimes.filter((t) => now - t < MIRROR_MS);
+    if (mirrorTimes.length >= MIRROR_MAX) return;
+    mirrorTimes.push(now);
+    RECENT_INTERCEPT.set(item.url, now);
+    const fileUrl = item.finalUrl || item.url;
+    let pageRef = item.referrer || "";
+    if (!pageRef) {
+      try {
+        const [act] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (act && act.url && sameSiteFamily(fileUrl, act.url)) pageRef = act.url;
+      } catch (e) {}
+    }
+    const [filename, cookie] = await Promise.all([
+      (async () => {
+        try {
+          const [full] = await chrome.downloads.search({ id: item.id });
+          if (full && full.filename) return full.filename.split(/[\\/]/).pop();
+        } catch (e) {}
+        return null;
+      })(),
+      cookieHeaderForItem(fileUrl, pageRef).catch(() => ""),
+    ]);
+    let ok = false;
+    try {
+      const { res } = await authedFetch("/show-add-dialog", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: fileUrl, referer: pageRef, page_url: pageRef, cookie: cookie,
+          user_agent: navigator.userAgent, filename: filename,
+        }),
+      });
+      ok = res.ok;
+    } catch (e) { ok = false; }
+    console.debug("[VG] mirrored a download that had no recent user action, ok=" + ok);
+    if (ok) {
+      VGBG.emit("sent", { items: [{ url: item.url, filename }], pageUrl: item.referrer || "", job_ids: [], viaIntercept: true, mirrored: true });
+    } else {
+      RECENT_INTERCEPT.delete(item.url);
+    }
+  } catch (e) {
+    console.debug("[VG] mirror failed", e);
+  }
+}
+
 chrome.downloads.onCreated.addListener(async (item) => {
   console.debug("[VG] onCreated fired:", (item.url || "").slice(0, 120),
                 "byExtensionId:", item.byExtensionId, "state:", item.state);
@@ -28412,7 +28819,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (isLocalhost || isIpAddress) return;
 
   // v4.4 gate (see the block comment above).
-  if (item.state && item.state !== "in_progress") return;
+  // v4.5.9: no item.state check any more. Chrome / Vivaldi can report a fresh
+  // download as interrupted, or already complete when the file is tiny. Old
+  // items are still filtered by the session-start check below. A complete item
+  // can't be cancelled; the handoff below then just mirrors it to the app.
   await Promise.all([sessionReady, vgcfgReady]);
   const started = item.startTime ? Date.parse(item.startTime) : NaN;
   if (Number.isFinite(started) && started < sessionStartMs - 3000) {
@@ -28423,9 +28833,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
     console.debug("[VG] intercept skipped: on the ignore list");
     return;
   }
-  if (VGCFG.interceptNeedsGesture && !(await hasRecentGesture())) {
+  if (VGCFG.interceptNeedsGesture && !(await hasRecentGestureWithGrace())) {
     console.debug("[VG] intercept skipped: no user action in the last",
                   GESTURE_WINDOW_MS / 1000, "s (browser-initiated download)");
+    await mirrorSlipThrough(item);
     return;
   }
   const now = Date.now();
@@ -31706,8 +32117,58 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
     return m && m[2] ? microAbs(m[2].replace(/\\(["'])/g, "$1"), el.baseURI) : "";
   }
 
+  // The full-size file behind a thumbnail: <a href="full.gif"><img src="thumb.jpg">
+  // </a>. Galleries and archive sites show a static preview in the <img> and link
+  // the real file (the GIF that actually animates) around it. Only a link whose
+  // path ends in an image extension counts; links to a post or page are ignored.
+  function microLinkedImageUrl(img) {
+    try {
+      const a = img.closest && img.closest("a[href]");
+      if (!a) return "";
+      const abs = microAbs(a.getAttribute("href"), a.baseURI || document.baseURI);
+      if (!abs) return "";
+      const last = decodeURIComponent(new URL(abs).pathname.split("/").pop() || "");
+      return MICRO_IMG_EXT_RE.test(last) ? abs : "";
+    } catch (e) { return ""; }
+  }
+
+  // Lazy-load / lightbox attributes that hold the original file when the <img>
+  // itself only shows a resized copy.
+  const MICRO_FULL_ATTRS = ["data-full-src", "data-fullsrc", "data-large-src", "data-large",
+                            "data-hires", "data-zoom-src", "data-original-src", "data-full"];
+  function microFullAttrUrl(img) {
+    for (const a of MICRO_FULL_ATTRS) {
+      const v = img.getAttribute && img.getAttribute(a);
+      const abs = v ? microAbs(v, img.baseURI || document.baseURI) : "";
+      if (abs) return abs;
+    }
+    return "";
+  }
+
+  // The width-described srcset candidates of an <img>, largest first, for the
+  // "Download NNNpx wide" rows.
+  function microSizeChoices(img) {
+    const base = img.baseURI || document.baseURI;
+    const out = [];
+    const seen = new Set();
+    try {
+      const cands = parseSrcset(img.getAttribute("srcset")).concat(parseSrcset(img.getAttribute("data-srcset")));
+      for (const cand of cands) {
+        const abs = microAbs(cand.url, base);
+        const m = /(\d+)w/i.exec(cand.desc || "");
+        if (!abs || !m || seen.has(abs)) continue;
+        seen.add(abs);
+        out.push({ url: abs, w: parseInt(m[1], 10) });
+      }
+    } catch (e) {}
+    out.sort((a, b) => b.w - a.w);
+    return out;
+  }
+
   function microUrlFor(el) {
-    return el.tagName === "IMG" ? microImageUrl(el) : microBgUrl(el);
+    return el.tagName === "IMG"
+      ? (microLinkedImageUrl(el) || microFullAttrUrl(el) || microImageUrl(el))
+      : microBgUrl(el);
   }
 
   function microEligible(el) {
@@ -31883,6 +32344,19 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
     microHideTimer = setTimeout(hideMicro, 150);
   }
 
+  // On a bare image / video tab (the file opened on its own, e.g. "open link in
+  // new tab") location.href IS the file, and no host accepts a file as its own
+  // Referer: hotlink protection answers 403. Use the page the user came from
+  // instead. Images on a normal page keep location.href, as before.
+  function pageRefFor(fileUrl) {
+    try {
+      const bare = /^(image|video|audio)\//i.test(document.contentType || "")
+        || String(fileUrl).split("#")[0] === location.href.split("#")[0];
+      if (bare && document.referrer) return document.referrer;
+    } catch (e) {}
+    return location.href;
+  }
+
   function microFilenameFor(url) {
     try {
       const last = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
@@ -31891,9 +32365,9 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
     return undefined;
   }
 
-  function sendMicro(el) {
+  function sendMicro(el, urlOverride) {
     if (!el) return;
-    const url = microUrlFor(el);   // re-read now: srcset may have changed since hover
+    const url = urlOverride || microUrlFor(el);   // re-read now: srcset may have changed since hover
     if (!url) { microToastShow("No image URL found", true); return; }
     try {
       // Batch 2: image pill goes through the smart path (good file name, archive
@@ -31901,8 +32375,8 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
       // behaviour of never refusing a repeat image.
       const smart = cfg.smartOneClick && /^https?:/i.test(url);
       vgSend(
-        smart ? { type: "SEND_SMART", url, pageUrl: location.href, filename: microFilenameFor(url), title: document.title, force: true }
-              : { type: "RELAY_DOWNLOAD", url, pageUrl: location.href, filename: microFilenameFor(url), skipList: true },
+        smart ? { type: "SEND_SMART", url, pageUrl: pageRefFor(url), filename: microFilenameFor(url), title: document.title, force: true }
+              : { type: "RELAY_DOWNLOAD", url, pageUrl: pageRefFor(url), filename: microFilenameFor(url), skipList: true },
         (resp, vgErr) => {
           const vgLE = (chrome.runtime.lastError && chrome.runtime.lastError.message) || vgErr;
           if (vgLE) {
@@ -31947,19 +32421,48 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
     return (n / (1024 * 1024)).toFixed(2).replace(/\.?0+$/, "") + " MB";
   }
 
+  // The pill's dropdown. Which rows appear depends on the image: a "full-size
+  // file found" header and an "as shown" row when the page displays a preview
+  // of a bigger file, one row per srcset width, a whole-post batch when the
+  // image sits in a container with other images, and "open original" for
+  // sites where only the browser can fetch the file.
+  function microMenuRows(el) {
+    const full = microUrlFor(el);
+    let shown = "";
+    try { shown = el.tagName === "IMG" && (el.currentSrc || el.src) ? microAbs(el.currentSrc || el.src, el.baseURI) : ""; } catch (e) {}
+    const rows = [];
+    let kind = "";
+    try { kind = (/\.([a-z0-9]{2,5})$/i.exec(decodeURIComponent(new URL(full).pathname)) || [])[1] || ""; } catch (e) {}
+    if (full) {
+      const bigger = shown && shown !== full;
+      rows.push({ header: (kind ? kind.toUpperCase() + ": " : "") + (bigger ? "full-size file found" : "as shown on the page") });
+    }
+    rows.push({ label: "Download Image", onClick: () => sendMicro(el) });
+    if (full && shown && shown !== full && /^https?:/i.test(shown)) {
+      rows.push({ label: "Download as shown (preview)", onClick: () => sendMicro(el, shown) });
+    }
+    for (const sz of microSizeChoices(el).filter((x) => x.url !== full && x.url !== shown).slice(0, 3)) {
+      rows.push({ label: "Download " + sz.w + "px wide", onClick: () => sendMicro(el, sz.url) });
+    }
+    rows.push({ label: "Download ALL Images", onClick: () => downloadAllPageImages() });
+    const post = microPostRoot(el);
+    if (post) rows.push({ label: "Download images in this post (" + post.count + ")", onClick: () => downloadAllPageImages(post.root) });
+    rows.push({ sep: true });
+    if (full) {
+      rows.push({ label: "Open original in new tab", onClick: () => { try { window.open(full, "_blank", "noopener"); } catch (e) {} } });
+    }
+    rows.push({ label: "Copy Image URL", onClick: () => {
+        const url = microUrlFor(el);
+        if (!url) { microToastShow("No image URL found", true); return; }
+        copyToClipboard(url).then((ok) =>
+          microToastShow(ok ? "Image URL copied" : "Couldn't copy the URL", !ok));
+      } });
+    return rows;
+  }
+
   function openMicroMenu(x, y, el) {
     if (!el) return;
-    const rows = [
-      { label: "Download Image", onClick: () => sendMicro(el) },
-      { label: "Download ALL Images", onClick: () => downloadAllPageImages() },
-      { sep: true },
-      { label: "Copy Image URL", onClick: () => {
-          const url = microUrlFor(el);
-          if (!url) { microToastShow("No image URL found", true); return; }
-          copyToClipboard(url).then((ok) =>
-            microToastShow(ok ? "Image URL copied" : "Couldn't copy the URL", !ok));
-        } },
-    ];
+    const rows = microMenuRows(el);
     // Batch 3: optional file-size header (microPillSize). The size needs a
     // HEAD request, which many hosts refuse or do not expose to content
     // scripts; when it cannot be read, the menu just opens without the
@@ -31983,52 +32486,85 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
     openPillCtx(x, y, rows);
   }
 
-  // "Download ALL Images": every <img> on the page that is a real picture
-  // (not an icon) with an http(s) URL, de-duplicated. Blob and data URLs are
+  // "Download ALL Images": every <img> under `root` (the page by default) that
+  // is a real picture (not an icon) with an http(s) URL, de-duplicated. The
+  // full-size file is used where the page links one. Blob and data URLs are
   // skipped because the desktop app can't fetch them.
-  function collectPageImageUrls() {
+  function collectImageUrls(root) {
     const seen = new Set();
     const urls = [];
-    for (const img of document.querySelectorAll("img")) {
+    for (const img of (root || document).querySelectorAll("img")) {
       const w = img.naturalWidth || img.width || 0;
       const h = img.naturalHeight || img.height || 0;
       if (Math.max(w, h) < 100) continue;
-      const url = microImageUrl(img);
+      const url = microUrlFor(img);
       if (!url || !/^https?:/i.test(url) || seen.has(url)) continue;
       seen.add(url);
       urls.push(url);
     }
     return urls;
   }
+  function collectPageImageUrls() { return collectImageUrls(document); }
 
-  function downloadAllPageImages() {
-    const urls = collectPageImageUrls().slice(0, 200);
+  // The nearest post / gallery / article container around `el` that holds at
+  // least two images but fewer than the whole page.
+  function microPostRoot(el) {
+    const sel = "article, [role='article'], [class*='post'], [class*='gallery'], [class*='files'], section, main";
+    let total = -1;
+    for (let n = el.parentElement; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      if (!(n.matches && n.matches(sel))) continue;
+      const count = collectImageUrls(n).length;
+      if (count < 2) continue;
+      if (total < 0) total = collectImageUrls(document).length;
+      if (count >= total) return null;
+      return { root: n, count };
+    }
+    return null;
+  }
+
+  function downloadAllPageImages(root) {
+    const urls = collectImageUrls(root || document).slice(0, 200);
     if (!urls.length) { microToastShow("No images found on this page", true); return; }
-    let sent = 0, dupes = 0, failed = 0, pending = urls.length;
-    const finish = () => {
-      if (--pending > 0) return;
-      const parts = [`Queued ${sent} image(s)`];
-      if (dupes) parts.push(`${dupes} already listed`);
-      if (failed) parts.push(`${failed} failed`);
+    let sent = 0, dupes = 0, failed = 0;
+    const summary = () => {
+      const parts = ["Queued " + sent + " image(s)"];
+      if (dupes) parts.push(dupes + " already listed");
+      if (failed) parts.push(failed + " failed");
       microToastShow(parts.join(", "), failed > 0 && sent === 0);
     };
-    microToastShow(`Sending ${urls.length} image(s)\u2026`);
-    for (const url of urls) {
-      try {
-        vgSend(
-          { type: "RELAY_DOWNLOAD", url, pageUrl: location.href,
-            filename: microFilenameFor(url), skipList: true },
-          (resp) => {
-            if (chrome.runtime.lastError || !(resp && resp.ok)) failed++;
-            else if (resp.duplicate_of) dupes++;
-            else sent++;
-            finish();
-          });
-      } catch (e) {
-        failed++;
-        finish();
+    microToastShow("Sending " + urls.length + " image(s)\u2026");
+    if (!cfg.smartOneClick) {
+      // Smart path off: the original one-message-per-image relay.
+      let pending = urls.length;
+      for (const url of urls) {
+        const done = (ok, dupe) => { if (!ok) failed++; else if (dupe) dupes++; else sent++; if (--pending === 0) summary(); };
+        try {
+          vgSend({ type: "RELAY_DOWNLOAD", url, pageUrl: pageRefFor(url), filename: microFilenameFor(url), skipList: true },
+            (resp) => done(!chrome.runtime.lastError && !!(resp && resp.ok), !!(resp && resp.duplicate_of)));
+        } catch (e) { done(false, false); }
       }
+      return;
     }
+    // Smart path: SEND_MANY in chunks, so file names are tidied like a single
+    // send and one slow message can't time out a long list.
+    const CHUNK = 15;
+    let idx = 0;
+    const next = () => {
+      if (idx >= urls.length) { summary(); return; }
+      const slice = urls.slice(idx, idx + CHUNK);
+      idx += CHUNK;
+      vgSend({ type: "SEND_MANY", force: true, pageUrl: pageRefFor(""),
+               items: slice.map((u) => ({ url: u, filename: microFilenameFor(u), title: document.title, pageUrl: pageRefFor(u) })) },
+        (resp, vgErr) => {
+          const results = (!vgErr && resp && Array.isArray(resp.results)) ? resp.results : [];
+          for (const r of results) { if (!r.ok) failed++; else if (r.duplicate_of) dupes++; else sent++; }
+          failed += slice.length - results.length;
+          if (results.some((r) => r.code === "app_offline")) idx = urls.length;   // don't hammer a dead app
+          else microToastShow("Sending " + Math.min(idx, urls.length) + "/" + urls.length + "\u2026");
+          next();
+        }, 120000);
+    };
+    next();
   }
 
   // mouseenter does not bubble but does pass through the capture phase, so one
@@ -34481,6 +35017,24 @@ async function setupSettings() {
     } catch (e) { return ""; }
   }
 
+  // CDNs often pick the output format with a query value instead of a path
+  // extension: pbs.twimg.com/media/ID?format=gif&name=small, imgix ?fm=gif.
+  // Only a known image/video/audio extension counts, so ?format=json or
+  // ?f=1 never turns into a file extension.
+  const QUERY_EXT_KEYS = ["format", "fm", "f", "ext"];
+  function extFromQuery(url) {
+    try {
+      if (!/^[a-z]+:\/\//i.test(url || "")) return "";
+      const q = new URL(url).searchParams;
+      for (const k of QUERY_EXT_KEYS) {
+        const v = String(q.get(k) || "").trim().toLowerCase().replace(/^\./, "");
+        const kind = EXT_KIND[v];
+        if (v && (kind === "image" || kind === "video" || kind === "audio")) return v;
+      }
+    } catch (e) {}
+    return "";
+  }
+
   // A name that is mostly a random ID (CDN chunk names) says nothing useful.
   function looksRandom(stem) {
     if (!stem) return true;
@@ -34509,15 +35063,28 @@ async function setupSettings() {
   function improveFilename(ctx) {
     ctx = ctx || {};
     const urlExt = extOf(ctx.url || "");
+    const queryExt = extFromQuery(ctx.url || "");
     let name = sanitizeName(ctx.filename || "");
     // A playlist's own extension is never the saved file's extension.
     const nameExt = extOf(name);
     let ext = /^(m3u8|mpd)$/.test(nameExt) ? "" : (nameExt || (/^(m3u8|mpd)$/.test(urlExt) ? "" : urlExt));
+    // ?format=gif: the query says what the bytes are. It fills a missing
+    // extension, and replaces a still-image one (".../ID.jpg?format=gif"), but
+    // only when the name's extension came from the URL itself, so a name the
+    // user typed keeps its extension. Playlists are never touched.
+    if (queryExt && !/^(m3u8|mpd)$/.test(nameExt) && !/^(m3u8|mpd)$/.test(urlExt)
+        && (!nameExt || nameExt === urlExt)
+        && (!ext || (EXT_KIND[ext] === "image" && EXT_KIND[queryExt] === "image"))) {
+      ext = queryExt;
+    }
     if (!ext && ctx.contentType) {
       const ct = String(ctx.contentType).toLowerCase();
       const map = { "video/mp4": "mp4", "video/webm": "webm", "audio/mpeg": "mp3", "audio/mp4": "m4a",
         "audio/aac": "aac", "audio/ogg": "ogg", "image/jpeg": "jpg", "image/png": "png",
-        "image/gif": "gif", "image/webp": "webp", "image/avif": "avif", "application/pdf": "pdf" };
+        "image/gif": "gif", "image/webp": "webp", "image/avif": "avif", "image/apng": "png",
+        "image/bmp": "bmp", "image/svg+xml": "svg", "image/heic": "heic", "image/heif": "heif",
+        "image/tiff": "tif", "image/x-icon": "ico", "image/vnd.microsoft.icon": "ico",
+        "application/pdf": "pdf" };
       for (const k of Object.keys(map)) if (ct.startsWith(k)) { ext = map[k]; break; }
     }
     const stem = name ? name.replace(/\.[a-z0-9]{1,5}$/i, "") : "";
@@ -34555,7 +35122,7 @@ async function setupSettings() {
   const KIND_BY_EXT = {
     video: "mp4 m4v mov webm mkv avi flv wmv mpg mpeg ts m2ts ogv 3gp",
     audio: "mp3 m4a aac wav flac opus ogg wma aiff",
-    image: "jpg jpeg png gif webp avif heic bmp svg ico tif tiff jxl",
+    image: "jpg jpeg png apng gif webp avif heic heif bmp svg ico tif tiff jxl",
     stream: "m3u8 mpd",
     document: "pdf epub doc docx xls xlsx ppt pptx txt csv json xml",
     archive: "zip rar 7z tar gz tgz bz2 xz iso",
@@ -34570,7 +35137,7 @@ async function setupSettings() {
     if (ct.startsWith("video/")) return "video";
     if (ct.startsWith("audio/")) return "audio";
     if (ct.startsWith("image/")) return "image";
-    const e = extOf((item && item.url) || "");
+    const e = extOf((item && item.url) || "") || extFromQuery((item && item.url) || "");
     return EXT_KIND[e] || (ct ? "other" : "unknown");
   }
 
@@ -34581,7 +35148,7 @@ async function setupSettings() {
     let u = null;
     try { u = new URL(url); } catch (e) {}
     const kind = kindOf(item);
-    const ext = extOf(url);
+    const ext = extOf(url) || extFromQuery(url);
     const out = {
       url, kind, ext, host: u ? u.hostname : "", protocol: u ? u.protocol.replace(":", "") : "",
       contentType: item.contentType || "", size: item.size || 0, sizeLabel: sizeLabel(item.size),
@@ -34900,7 +35467,7 @@ async function setupSettings() {
   }
 
   root.VGCORE = {
-    sizeLabel, hostOf, extOf, sanitizeName, looksRandom, improveFilename, expandTemplate,
+    sizeLabel, hostOf, extOf, extFromQuery, sanitizeName, looksRandom, improveFilename, expandTemplate,
     kindOf, inspectItem, analyzeM3U8, searchItems, sortItems, qualityFor, setQuality,
     heightOfFormat, pickFormat, fpsLabel, classifyError, retryDelayMs,
     archiveAdd, archiveHas, archiveSearch, nextRun, isDue, watchMatches, regexLooksUnsafe,

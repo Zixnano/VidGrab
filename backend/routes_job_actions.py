@@ -11,7 +11,7 @@ from flask import Blueprint, jsonify, request
 
 from downloader import _CREATE_NO_WINDOW, _WORKERS
 from engines import clear_youtube_cooldown, find_ffmpeg_dir
-from jobs import JobEvent, JobPhase, JOBS, reorder_job, repair_status, save_jobs_snapshot, set_phase, transition
+from jobs import JobEvent, JobPhase, JOBS, reorder_job, repair_status, save_jobs_snapshot, set_phase, transition, set_archived
 from logging_setup import log
 from settings import _dest_for, _unique_path, stat_for
 from api import _safe_in_roots, cleanup_partial_files
@@ -89,6 +89,31 @@ def stop(job_id):
 @job_actions_bp.route("/delete/<job_id>", methods=["POST"])
 def delete(job_id):
     return _job_action(job_id, "delete")
+
+
+@job_actions_bp.route("/archive/<job_id>", methods=["POST"])
+def archive_job(job_id):
+    """Hide a finished, failed, stopped or skipped row from the default job
+    list. The row stays in the database and in search results."""
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job.get("status") not in ("done", "error", "stopped", "skipped"):
+        return jsonify({"error": "only finished, failed, stopped or skipped "
+                                 "downloads can be archived"}), 409
+    set_archived(job, True)
+    save_jobs_snapshot()
+    return jsonify({"ok": True})
+
+
+@job_actions_bp.route("/unarchive/<job_id>", methods=["POST"])
+def unarchive_job(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    set_archived(job, False, manual=True)
+    save_jobs_snapshot()
+    return jsonify({"ok": True})
 
 
 @job_actions_bp.route("/delete-file/<job_id>", methods=["POST"])

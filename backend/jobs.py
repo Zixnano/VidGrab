@@ -1,5 +1,6 @@
-"""Job lifecycle: registry, state, snapshot persistence, new_job."""
+"""Job lifecycle: registry, state, SQLite persistence, new_job."""
 from urllib.parse import urlparse
+import atexit
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from settings import (STATE, category_for, safe_filename, guess_filename, detect
                       guess_ext_from_head, stat_for, is_junk_stem, clean_title,
                       generated_name, source_site_for)
 from logging_setup import log
+import vg_db
 
 
 _ON_NEW_JOB_HOOKS = []
@@ -61,30 +63,196 @@ _LAST_HOOK_TS = 0.0
 
 _SNAPSHOT_LOCK = threading.Lock()
 
+# v13: jobs are stored in SQLite (vg_db) instead of one jobs.json that was
+# rewritten in full on every change. JOBS stays the in-memory source of truth
+# for every job, so all of the code that reads or mutates it is unchanged;
+# this section only decides what has to be written to the database.
+#
+# save_jobs_snapshot() keeps its name and its no-argument call shape. A call
+# no longer rewrites anything by itself: it wakes ONE writer thread, which
+# waits a moment so a burst of saves collapses into a single pass, then
+# writes only the rows that changed since the last pass (and deletes rows
+# whose job left JOBS). One thread plus vg_db's write lock means two saves
+# can never race each other.
 
-def save_jobs_snapshot():
-    """Persist a plain (non-Event) view of jobs so history survives restarts."""
+# Keys that never reach the database. referer and user_agent ARE persisted so
+# a queued/downloading job that reloads as "stopped" can still be resumed
+# against hosts that check them. The cookie stays out on purpose: session
+# cookies on disk are a privacy tradeoff not taken.
+_NOT_PERSISTED = ("pause_evt", "stop_evt", "cookie", "error")
+
+# jid -> hash of the row text last written to, or loaded from, the database.
+# Only ids this process has written or loaded are ever deleted from the
+# database, so a save that runs before the history is loaded cannot erase it.
+_PERSISTED = {}
+_PERSISTED_PATH = None        # which database file _PERSISTED describes
+_LOADING = False              # load_jobs_snapshot() is filling JOBS: don't flush yet
+
+_FLUSH_EVENT = threading.Event()
+_WRITER_LOCK = threading.Lock()
+_WRITER = None
+_WRITER_STOP = False
+_FLUSH_DEBOUNCE = 0.15        # seconds a burst of saves is allowed to collapse for
+_ARCHIVE_SWEEP_SECS = 600     # how often old failures are archived while running
+
+
+def _persistable(j):
+    """Plain (non-Event) view of a job: what is written to the database."""
+    return {k: v for k, v in list(j.items()) if k not in _NOT_PERSISTED}
+
+
+def _flush_now():
+    """Write the difference between JOBS and the database, in one transaction."""
+    global _PERSISTED_PATH
     # Serialized: /convert's progress thread and a finishing download can
-    # otherwise clobber each other's .tmp file.
+    # otherwise write the same rows at once.
     with _SNAPSHOT_LOCK:
+        if _LOADING:
+            return
         try:
-            snap = {}
+            path = str(vg_db.db_path())
+            if _PERSISTED_PATH != path:
+                _PERSISTED.clear()
+                _PERSISTED_PATH = path
+            upserts, fps = [], {}
             for jid, j in list(JOBS.items()):
-                # referer and user_agent are persisted so a queued/downloading
-                # job that reloads as "stopped" can still be resumed against
-                # hosts that check them. The cookie stays out on purpose:
-                # session cookies on disk are a privacy tradeoff not taken.
-                snap[jid] = {k: v for k, v in list(j.items())
-                             if k not in ("pause_evt", "stop_evt", "cookie", "error")}
-            # Permanent history: no cap on the snapshot, and no pruning of
-            # JOBS either (pruning memory would drop those rows from the
-            # next snapshot too).
-            tmp = settings.JOBS_PATH.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(snap, indent=2))
-            os.replace(tmp, settings.JOBS_PATH)
+                try:
+                    snap = _persistable(j)
+                    blob = vg_db.dumps_job(snap)
+                except Exception as e:
+                    # One job that can't be serialized (or changed under us
+                    # mid-dump) must not stop the others from being saved.
+                    log(f"couldn't serialize job {jid} for history: {e}")
+                    continue
+                fp = hash(blob)
+                if _PERSISTED.get(jid) != fp:
+                    upserts.append((jid, snap, blob))
+                    fps[jid] = fp
+            gone = [jid for jid in list(_PERSISTED) if jid not in JOBS]
+            # Permanent history: no cap, and no pruning of JOBS either
+            # (pruning memory would delete those rows from the database too).
+            vg_db.apply_changes(upserts, gone)
+            # Rows SQLite refused were logged by vg_db; they are remembered
+            # like any other so every later save doesn't log them again. They
+            # are tried again as soon as the job changes.
+            _PERSISTED.update(fps)
+            for jid in gone:
+                _PERSISTED.pop(jid, None)
         except Exception as e:
             log(f"couldn't save job history: {e}")
 
+
+def _writer_loop():
+    last_sweep = time.time()
+    while not _WRITER_STOP:
+        # The timeout is the heartbeat for the periodic archive sweep below.
+        if _FLUSH_EVENT.wait(timeout=30):
+            time.sleep(_FLUSH_DEBOUNCE)
+            _FLUSH_EVENT.clear()
+            _flush_now()
+        if time.time() - last_sweep >= _ARCHIVE_SWEEP_SECS:
+            last_sweep = time.time()
+            try:
+                archive_stale_errors()
+            except Exception as e:
+                log(f"archive sweep failed: {e}")
+
+
+def _request_flush():
+    global _WRITER
+    with _WRITER_LOCK:
+        if _WRITER is None or not _WRITER.is_alive():
+            _WRITER = threading.Thread(target=_writer_loop, name="vg-db-writer", daemon=True)
+            _WRITER.start()
+    _FLUSH_EVENT.set()
+
+
+def save_jobs_snapshot(wait=False):
+    """Persist job history so it survives restarts. Returns at once; the
+    writer thread saves within a fraction of a second. wait=True writes
+    before returning (shutdown, tests)."""
+    if wait:
+        _flush_now()
+    else:
+        _request_flush()
+
+
+def flush_jobs():
+    """Write everything pending right now, on the calling thread."""
+    _flush_now()
+
+
+def shutdown_persistence():
+    """Flush what is still pending and close the database. Registered with
+    atexit, so every normal exit path ends with a complete save."""
+    global _WRITER_STOP
+    _WRITER_STOP = True
+    _FLUSH_EVENT.set()
+    _flush_now()
+    vg_db.close_all()
+
+
+def reset_persistence():
+    """Forget what is known to be in the database and release the
+    connections. For tests that point the app at a fresh data folder."""
+    global _PERSISTED_PATH
+    with _SNAPSHOT_LOCK:
+        _PERSISTED.clear()
+        _PERSISTED_PATH = None
+    vg_db.close_all(checkpoint=False)
+
+
+atexit.register(shutdown_persistence)
+
+def _ts(v):
+    """A timestamp field as a float; anything unusable (a damaged row) is 0."""
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def set_archived(j, archived, manual=False):
+    """Set or clear a job's archived flag. Archived rows stay in the database
+    (full history, searchable) but are left out of the default job list.
+    A manual unarchive pins the row ("keep_visible") so the periodic sweep in
+    archive_stale_errors() doesn't hide it again a few minutes later."""
+    j["archived"] = bool(archived)
+    if archived:
+        j["archived_ts"] = time.time()
+        j.pop("keep_visible", None)
+    else:
+        j["archived_ts"] = None
+        if manual:
+            j["keep_visible"] = True
+
+
+def archive_stale_errors(hours=None):
+    """Archive failed rows older than `hours` (default: the
+    hide_old_errors_hours setting, 0 = never). This is the old GUI time filter
+    stored as a flag: same age rule (failed_ts, else created_ts), but the
+    decision is made once and kept instead of being re-computed on every
+    paint. Returns how many rows were archived."""
+    if hours is None:
+        hours = STATE.get("hide_old_errors_hours", 24)
+    try:
+        hrs = float(hours or 0)
+    except (TypeError, ValueError):
+        hrs = 0
+    if hrs <= 0:
+        return 0
+    cutoff = time.time() - hrs * 3600
+    n = 0
+    for j in list(JOBS.values()):
+        if (j.get("status") == "error" and not j.get("archived")
+                and not j.get("keep_visible")
+                and _ts(j.get("failed_ts") or j.get("created_ts")) < cutoff):
+            set_archived(j, True)
+            n += 1
+    if n:
+        log(f"archived {n} old failed download(s)")
+        save_jobs_snapshot()
+    return n
 
 
 def _migrate_extensionless(job):
@@ -197,6 +365,8 @@ def _migrate_job(j):
         # v5
         "auto_name": False, "retry_count": 0, "retry_after": 0,
         "failed_ts": None,
+        # v13
+        "archived": False,
     }
     for k, v in defaults.items():
         j.setdefault(k, v)
@@ -275,32 +445,60 @@ def _migrate_playlist_dir(job):
 
 
 def load_jobs_snapshot():
-    if settings.JOBS_PATH.exists():
-        try:
-            snap = json.loads(settings.JOBS_PATH.read_text())
-            migrated = False
-            for jid, j in snap.items():
-                j["pause_evt"] = threading.Event()
-                j["stop_evt"] = threading.Event()
-                _migrate_job(j)
-                if j.get("status") in ("downloading", "queued", "held"):
-                    repair_status(j, "stopped")
-                JOBS[jid] = j
-                _migrate_extensionless(j)
-                if _repair_zero_size(j):
-                    migrated = True
-                if _migrate_playlist_dir(j):
-                    migrated = True
-            if migrated:
-                save_jobs_snapshot()
-            global JOB_COUNTER
-            # Ignore non-numeric keys: int() on one used to raise, leave the
-            # counter at 0, and let the next job reuse "1" and overwrite it.
-            JOB_COUNTER = max([int(k) for k in JOBS.keys()
-                               if str(k).isascii() and str(k).isdigit()] + [0])
-        except Exception as e:
-            log(f"couldn't load job history: {e}")
-
+    global _LOADING, _PERSISTED_PATH
+    _LOADING = True
+    try:
+        # v13: jobs live in SQLite. The first launch after the upgrade
+        # imports jobs.json (renamed to jobs.json.migrated afterwards) and
+        # moves the download_stats list out of settings.json, once.
+        vg_db.migrate_jobs_json(settings.JOBS_PATH)
+        if vg_db.migrate_stats_from_settings(STATE):
+            settings.save_settings()
+        snap, seeded = {}, {}
+        for jid, text in vg_db.load_jobs():
+            try:
+                row = json.loads(text)
+            except ValueError as e:
+                log(f"couldn't read stored job {jid}: {e}")
+                continue
+            if isinstance(row, dict):
+                snap[jid] = row
+                seeded[jid] = hash(text)
+        migrated = False
+        for jid, j in snap.items():
+            j["pause_evt"] = threading.Event()
+            j["stop_evt"] = threading.Event()
+            _migrate_job(j)
+            if j.get("status") in ("downloading", "queued", "held"):
+                repair_status(j, "stopped")
+            JOBS[jid] = j
+            _migrate_extensionless(j)
+            if _repair_zero_size(j):
+                migrated = True
+            if _migrate_playlist_dir(j):
+                migrated = True
+        if migrated:
+            save_jobs_snapshot()
+        global JOB_COUNTER
+        # Ignore non-numeric keys: int() on one used to raise, leave the
+        # counter at 0, and let the next job reuse "1" and overwrite it.
+        JOB_COUNTER = max([int(k) for k in JOBS.keys()
+                           if str(k).isascii() and str(k).isdigit()] + [0])
+        # What the database holds right now. Anything the migrations above
+        # changed in memory differs from it, so the first flush rewrites it.
+        with _SNAPSHOT_LOCK:
+            _PERSISTED.clear()
+            _PERSISTED.update(seeded)
+            _PERSISTED_PATH = str(vg_db.db_path())
+    except Exception as e:
+        log(f"couldn't load job history: {e}")
+    finally:
+        _LOADING = False
+    try:
+        archive_stale_errors()
+    except Exception as e:
+        log(f"couldn't archive old failures: {e}")
+    save_jobs_snapshot()
 
 
 def next_job_id():
@@ -421,6 +619,7 @@ def new_job(url, filename=None, category=None, referer=None, cookie=None,
         "source_site": source_site_for(page_url, referer, url),
         "retry_count": 0, "retry_after": 0,
         "priority": _next_priority(), "failed_ts": None,
+        "archived": False,
         "size_total": 0, "size_done": 0, "speed": "", "error": None,
         "referer": referer, "cookie": cookie, "user_agent": user_agent,
         "created_ts": created_ts if created_ts is not None else time.time(),
@@ -533,6 +732,10 @@ def transition(j, event):
         j["failed_ts"] = time.time()   # lets the GUI hide old failures
     elif ev is JobEvent.RESUME:
         j["failed_ts"] = None
+        # v13: a failed row that is retried leaves the archive.
+        j["archived"] = False
+        j["archived_ts"] = None
+        j.pop("keep_visible", None)
     if ev is JobEvent.PAUSE and j.get("pause_evt") is not None:
         j["pause_evt"].set()
     elif ev is JobEvent.RESUME:

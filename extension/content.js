@@ -2143,8 +2143,58 @@
     return m && m[2] ? microAbs(m[2].replace(/\\(["'])/g, "$1"), el.baseURI) : "";
   }
 
+  // The full-size file behind a thumbnail: <a href="full.gif"><img src="thumb.jpg">
+  // </a>. Galleries and archive sites show a static preview in the <img> and link
+  // the real file (the GIF that actually animates) around it. Only a link whose
+  // path ends in an image extension counts; links to a post or page are ignored.
+  function microLinkedImageUrl(img) {
+    try {
+      const a = img.closest && img.closest("a[href]");
+      if (!a) return "";
+      const abs = microAbs(a.getAttribute("href"), a.baseURI || document.baseURI);
+      if (!abs) return "";
+      const last = decodeURIComponent(new URL(abs).pathname.split("/").pop() || "");
+      return MICRO_IMG_EXT_RE.test(last) ? abs : "";
+    } catch (e) { return ""; }
+  }
+
+  // Lazy-load / lightbox attributes that hold the original file when the <img>
+  // itself only shows a resized copy.
+  const MICRO_FULL_ATTRS = ["data-full-src", "data-fullsrc", "data-large-src", "data-large",
+                            "data-hires", "data-zoom-src", "data-original-src", "data-full"];
+  function microFullAttrUrl(img) {
+    for (const a of MICRO_FULL_ATTRS) {
+      const v = img.getAttribute && img.getAttribute(a);
+      const abs = v ? microAbs(v, img.baseURI || document.baseURI) : "";
+      if (abs) return abs;
+    }
+    return "";
+  }
+
+  // The width-described srcset candidates of an <img>, largest first, for the
+  // "Download NNNpx wide" rows.
+  function microSizeChoices(img) {
+    const base = img.baseURI || document.baseURI;
+    const out = [];
+    const seen = new Set();
+    try {
+      const cands = parseSrcset(img.getAttribute("srcset")).concat(parseSrcset(img.getAttribute("data-srcset")));
+      for (const cand of cands) {
+        const abs = microAbs(cand.url, base);
+        const m = /(\d+)w/i.exec(cand.desc || "");
+        if (!abs || !m || seen.has(abs)) continue;
+        seen.add(abs);
+        out.push({ url: abs, w: parseInt(m[1], 10) });
+      }
+    } catch (e) {}
+    out.sort((a, b) => b.w - a.w);
+    return out;
+  }
+
   function microUrlFor(el) {
-    return el.tagName === "IMG" ? microImageUrl(el) : microBgUrl(el);
+    return el.tagName === "IMG"
+      ? (microLinkedImageUrl(el) || microFullAttrUrl(el) || microImageUrl(el))
+      : microBgUrl(el);
   }
 
   function microEligible(el) {
@@ -2320,6 +2370,19 @@
     microHideTimer = setTimeout(hideMicro, 150);
   }
 
+  // On a bare image / video tab (the file opened on its own, e.g. "open link in
+  // new tab") location.href IS the file, and no host accepts a file as its own
+  // Referer: hotlink protection answers 403. Use the page the user came from
+  // instead. Images on a normal page keep location.href, as before.
+  function pageRefFor(fileUrl) {
+    try {
+      const bare = /^(image|video|audio)\//i.test(document.contentType || "")
+        || String(fileUrl).split("#")[0] === location.href.split("#")[0];
+      if (bare && document.referrer) return document.referrer;
+    } catch (e) {}
+    return location.href;
+  }
+
   function microFilenameFor(url) {
     try {
       const last = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
@@ -2328,9 +2391,9 @@
     return undefined;
   }
 
-  function sendMicro(el) {
+  function sendMicro(el, urlOverride) {
     if (!el) return;
-    const url = microUrlFor(el);   // re-read now: srcset may have changed since hover
+    const url = urlOverride || microUrlFor(el);   // re-read now: srcset may have changed since hover
     if (!url) { microToastShow("No image URL found", true); return; }
     try {
       // Batch 2: image pill goes through the smart path (good file name, archive
@@ -2338,8 +2401,8 @@
       // behaviour of never refusing a repeat image.
       const smart = cfg.smartOneClick && /^https?:/i.test(url);
       vgSend(
-        smart ? { type: "SEND_SMART", url, pageUrl: location.href, filename: microFilenameFor(url), title: document.title, force: true }
-              : { type: "RELAY_DOWNLOAD", url, pageUrl: location.href, filename: microFilenameFor(url), skipList: true },
+        smart ? { type: "SEND_SMART", url, pageUrl: pageRefFor(url), filename: microFilenameFor(url), title: document.title, force: true }
+              : { type: "RELAY_DOWNLOAD", url, pageUrl: pageRefFor(url), filename: microFilenameFor(url), skipList: true },
         (resp, vgErr) => {
           const vgLE = (chrome.runtime.lastError && chrome.runtime.lastError.message) || vgErr;
           if (vgLE) {
@@ -2384,19 +2447,48 @@
     return (n / (1024 * 1024)).toFixed(2).replace(/\.?0+$/, "") + " MB";
   }
 
+  // The pill's dropdown. Which rows appear depends on the image: a "full-size
+  // file found" header and an "as shown" row when the page displays a preview
+  // of a bigger file, one row per srcset width, a whole-post batch when the
+  // image sits in a container with other images, and "open original" for
+  // sites where only the browser can fetch the file.
+  function microMenuRows(el) {
+    const full = microUrlFor(el);
+    let shown = "";
+    try { shown = el.tagName === "IMG" && (el.currentSrc || el.src) ? microAbs(el.currentSrc || el.src, el.baseURI) : ""; } catch (e) {}
+    const rows = [];
+    let kind = "";
+    try { kind = (/\.([a-z0-9]{2,5})$/i.exec(decodeURIComponent(new URL(full).pathname)) || [])[1] || ""; } catch (e) {}
+    if (full) {
+      const bigger = shown && shown !== full;
+      rows.push({ header: (kind ? kind.toUpperCase() + ": " : "") + (bigger ? "full-size file found" : "as shown on the page") });
+    }
+    rows.push({ label: "Download Image", onClick: () => sendMicro(el) });
+    if (full && shown && shown !== full && /^https?:/i.test(shown)) {
+      rows.push({ label: "Download as shown (preview)", onClick: () => sendMicro(el, shown) });
+    }
+    for (const sz of microSizeChoices(el).filter((x) => x.url !== full && x.url !== shown).slice(0, 3)) {
+      rows.push({ label: "Download " + sz.w + "px wide", onClick: () => sendMicro(el, sz.url) });
+    }
+    rows.push({ label: "Download ALL Images", onClick: () => downloadAllPageImages() });
+    const post = microPostRoot(el);
+    if (post) rows.push({ label: "Download images in this post (" + post.count + ")", onClick: () => downloadAllPageImages(post.root) });
+    rows.push({ sep: true });
+    if (full) {
+      rows.push({ label: "Open original in new tab", onClick: () => { try { window.open(full, "_blank", "noopener"); } catch (e) {} } });
+    }
+    rows.push({ label: "Copy Image URL", onClick: () => {
+        const url = microUrlFor(el);
+        if (!url) { microToastShow("No image URL found", true); return; }
+        copyToClipboard(url).then((ok) =>
+          microToastShow(ok ? "Image URL copied" : "Couldn't copy the URL", !ok));
+      } });
+    return rows;
+  }
+
   function openMicroMenu(x, y, el) {
     if (!el) return;
-    const rows = [
-      { label: "Download Image", onClick: () => sendMicro(el) },
-      { label: "Download ALL Images", onClick: () => downloadAllPageImages() },
-      { sep: true },
-      { label: "Copy Image URL", onClick: () => {
-          const url = microUrlFor(el);
-          if (!url) { microToastShow("No image URL found", true); return; }
-          copyToClipboard(url).then((ok) =>
-            microToastShow(ok ? "Image URL copied" : "Couldn't copy the URL", !ok));
-        } },
-    ];
+    const rows = microMenuRows(el);
     // Batch 3: optional file-size header (microPillSize). The size needs a
     // HEAD request, which many hosts refuse or do not expose to content
     // scripts; when it cannot be read, the menu just opens without the
@@ -2420,52 +2512,85 @@
     openPillCtx(x, y, rows);
   }
 
-  // "Download ALL Images": every <img> on the page that is a real picture
-  // (not an icon) with an http(s) URL, de-duplicated. Blob and data URLs are
+  // "Download ALL Images": every <img> under `root` (the page by default) that
+  // is a real picture (not an icon) with an http(s) URL, de-duplicated. The
+  // full-size file is used where the page links one. Blob and data URLs are
   // skipped because the desktop app can't fetch them.
-  function collectPageImageUrls() {
+  function collectImageUrls(root) {
     const seen = new Set();
     const urls = [];
-    for (const img of document.querySelectorAll("img")) {
+    for (const img of (root || document).querySelectorAll("img")) {
       const w = img.naturalWidth || img.width || 0;
       const h = img.naturalHeight || img.height || 0;
       if (Math.max(w, h) < 100) continue;
-      const url = microImageUrl(img);
+      const url = microUrlFor(img);
       if (!url || !/^https?:/i.test(url) || seen.has(url)) continue;
       seen.add(url);
       urls.push(url);
     }
     return urls;
   }
+  function collectPageImageUrls() { return collectImageUrls(document); }
 
-  function downloadAllPageImages() {
-    const urls = collectPageImageUrls().slice(0, 200);
+  // The nearest post / gallery / article container around `el` that holds at
+  // least two images but fewer than the whole page.
+  function microPostRoot(el) {
+    const sel = "article, [role='article'], [class*='post'], [class*='gallery'], [class*='files'], section, main";
+    let total = -1;
+    for (let n = el.parentElement; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      if (!(n.matches && n.matches(sel))) continue;
+      const count = collectImageUrls(n).length;
+      if (count < 2) continue;
+      if (total < 0) total = collectImageUrls(document).length;
+      if (count >= total) return null;
+      return { root: n, count };
+    }
+    return null;
+  }
+
+  function downloadAllPageImages(root) {
+    const urls = collectImageUrls(root || document).slice(0, 200);
     if (!urls.length) { microToastShow("No images found on this page", true); return; }
-    let sent = 0, dupes = 0, failed = 0, pending = urls.length;
-    const finish = () => {
-      if (--pending > 0) return;
-      const parts = [`Queued ${sent} image(s)`];
-      if (dupes) parts.push(`${dupes} already listed`);
-      if (failed) parts.push(`${failed} failed`);
+    let sent = 0, dupes = 0, failed = 0;
+    const summary = () => {
+      const parts = ["Queued " + sent + " image(s)"];
+      if (dupes) parts.push(dupes + " already listed");
+      if (failed) parts.push(failed + " failed");
       microToastShow(parts.join(", "), failed > 0 && sent === 0);
     };
-    microToastShow(`Sending ${urls.length} image(s)\u2026`);
-    for (const url of urls) {
-      try {
-        vgSend(
-          { type: "RELAY_DOWNLOAD", url, pageUrl: location.href,
-            filename: microFilenameFor(url), skipList: true },
-          (resp) => {
-            if (chrome.runtime.lastError || !(resp && resp.ok)) failed++;
-            else if (resp.duplicate_of) dupes++;
-            else sent++;
-            finish();
-          });
-      } catch (e) {
-        failed++;
-        finish();
+    microToastShow("Sending " + urls.length + " image(s)\u2026");
+    if (!cfg.smartOneClick) {
+      // Smart path off: the original one-message-per-image relay.
+      let pending = urls.length;
+      for (const url of urls) {
+        const done = (ok, dupe) => { if (!ok) failed++; else if (dupe) dupes++; else sent++; if (--pending === 0) summary(); };
+        try {
+          vgSend({ type: "RELAY_DOWNLOAD", url, pageUrl: pageRefFor(url), filename: microFilenameFor(url), skipList: true },
+            (resp) => done(!chrome.runtime.lastError && !!(resp && resp.ok), !!(resp && resp.duplicate_of)));
+        } catch (e) { done(false, false); }
       }
+      return;
     }
+    // Smart path: SEND_MANY in chunks, so file names are tidied like a single
+    // send and one slow message can't time out a long list.
+    const CHUNK = 15;
+    let idx = 0;
+    const next = () => {
+      if (idx >= urls.length) { summary(); return; }
+      const slice = urls.slice(idx, idx + CHUNK);
+      idx += CHUNK;
+      vgSend({ type: "SEND_MANY", force: true, pageUrl: pageRefFor(""),
+               items: slice.map((u) => ({ url: u, filename: microFilenameFor(u), title: document.title, pageUrl: pageRefFor(u) })) },
+        (resp, vgErr) => {
+          const results = (!vgErr && resp && Array.isArray(resp.results)) ? resp.results : [];
+          for (const r of results) { if (!r.ok) failed++; else if (r.duplicate_of) dupes++; else sent++; }
+          failed += slice.length - results.length;
+          if (results.some((r) => r.code === "app_offline")) idx = urls.length;   // don't hammer a dead app
+          else microToastShow("Sending " + Math.min(idx, urls.length) + "/" + urls.length + "\u2026");
+          next();
+        }, 120000);
+    };
+    next();
   }
 
   // mouseenter does not bubble but does pass through the capture phase, so one

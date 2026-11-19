@@ -45,7 +45,10 @@ if not re.fullmatch(r"[a-p]{32}", EXTENSION_ID):
 CORS(app, resources={
     r"/*": {"origins": [_EXT_ORIGIN]},
     r"/upload": {"origins": r".*"},
-}, supports_credentials=False)
+}, supports_credentials=False,
+   # /jobs reports its paging in these headers; without this the extension
+   # (cross-origin fetch) cannot read them.
+   expose_headers=["X-Total-Count", "X-Offset", "X-Limit", "X-Has-More"])
 
 TOKEN_PROTECTED_PATHS = {
     "/download", "/batch", "/pause", "/resume", "/stop", "/delete",
@@ -56,6 +59,7 @@ TOKEN_PROTECTED_PATHS = {
     "/update-status", "/update-skip", "/ytdlp-update", "/ytdlp-rollback",
     "/reorder", "/theme", "/queue-running", "/delete-file", "/toolkit",
     "/open-folder", "/diskspace",
+    "/archive", "/unarchive", "/archive-failed",
 }
 
 # Routes that may be driven with a /remote login cookie.
@@ -403,8 +407,8 @@ _CHANGELOG_TTL = 600
 # re-exported so `from api import <route or helper>` keeps working.
 from routes_health import health_bp, health, ping, version, diskspace, stats
 from routes_pair import pair_bp, pair, upload_token, favicon_store, favicon_get
-from routes_jobs import jobs_bp, jobs, download, batch, show_add_dialog, queue_status_route, set_queue_running, dup_check, clear_failed
-from routes_job_actions import job_actions_bp, _job_action, pause, resume, stop, delete, delete_job_and_file, redownload, reorder, set_category, open_folder, convert
+from routes_jobs import jobs_bp, jobs, download, batch, show_add_dialog, queue_status_route, set_queue_running, dup_check, clear_failed, archive_failed
+from routes_job_actions import job_actions_bp, _job_action, pause, resume, stop, delete, delete_job_and_file, archive_job, unarchive_job, redownload, reorder, set_category, open_folder, convert
 from routes_files import files_bp, upload, toolkit_compress, toolkit_trim, toolkit_gif
 from routes_probe import probe_bp, probe, probe_formats, probe_head
 from routes_settings import settings_bp, update_settings, theme, logs_endpoint

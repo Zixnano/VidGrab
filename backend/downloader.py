@@ -31,6 +31,7 @@ from jobs import (start_order_key, JOBS, new_job, save_jobs_snapshot, _fire_new_
                   transition, JobEvent, JobPhase, set_phase, resolve_playlist_dir,
                   repair_status)
 from logging_setup import log, LOG_QUEUE
+import vg_db
 
 
 # Keep ffmpeg / Defender from flashing console windows when frozen on Windows.
@@ -156,10 +157,13 @@ def maybe_play_sound():
 
 
 def record_stat(nbytes):
-    stats = STATE.setdefault("download_stats", [])
-    stats.append({"ts": time.time(), "bytes": nbytes})
-    if len(stats) > 3600:
-        del stats[: len(stats) - 3600]
+    # v13: a row in the download_stats table (newest 3600 kept, same bound as
+    # the old settings.json list) instead of a growing list inside STATE that
+    # every save_settings() rewrote.
+    try:
+        vg_db.record_stat(time.time(), nbytes)
+    except Exception as e:
+        log(f"couldn't record download stat: {e}")
 
 
 AUDIO_ONLY_TARGETS = {"mp3", "flac", "opus", "m4a"}
@@ -489,14 +493,163 @@ SEGMENT_COUNT = 8
 _segment_lock = threading.Lock()
 
 
+# --- pawchive.pw 403: headers across redirects (2026-11-10) ---------------
+# Checked against the installed requests (2.31.0) and a local two-host
+# redirect server before writing this. The earlier diagnosis that prompted
+# this fix was wrong in three places, and the fix below corrects those:
+#
+# 1. requests does NOT drop Referer on a cross-host redirect. In
+#    SessionRedirectMixin.resolve_redirects only Cookie is popped (and
+#    Authorization, on a host change). Referer, User-Agent and Accept all
+#    survive. Tested: Referer sent to 127.0.0.1:8765 arrived intact at
+#    localhost:8766 after a 302.
+# 2. The header requests DOES drop is Cookie -- and the proposed fix kept
+#    the old cookie code byte-for-byte, so it could not fix a cookie-loss
+#    403. The session jar only re-sends cookies to the SAME host, so a
+#    redirect pawchive.pw -> n2.pawchive.pw -> a CDN host loses them.
+#    _RedirectSafeSession below re-injects the job Cookie on every hop,
+#    but only to a host in the same site family as the original file host
+#    (same host, or a parent/child subdomain -- the same rule the
+#    extension uses in sameSiteFamily). Cookies are never sent to an
+#    unrelated third-party host.
+# 3. Accept is NOT missing: requests already sends "Accept: */*".
+#    Accept-Language is genuinely absent, and a Chrome-like Accept is
+#    closer to a browser, so those two are added as session defaults.
+#    Deliberately NOT added: Origin (Chrome does not send Origin on a
+#    plain GET navigation/download -- inventing one, let alone falling
+#    back to the target's own origin, is fabricated, not browser-like),
+#    a hardcoded "Sec-Fetch-Site: same-origin" (pawchive.pw page ->
+#    n2.pawchive.pw file is same-SITE but cross-ORIGIN, so that value
+#    would be false -- it is computed from the Referer instead), and an
+#    "Accept-Encoding: gzip, deflate, br" override (requests already
+#    advertises br when brotli is installed, and hardcoding it on a
+#    runtime without brotli would ask for a body it cannot decode).
+# 4. The proposed fix only touched _generic_session, which is only used
+#    by the single-stream path. Files >= 1 MB go through run_generic ->
+#    _probe_ranges (plain requests.head) and run_generic_segmented ->
+#    _open_segment (plain requests.get), neither of which used a session
+#    at all. Both now go through _generic_session too.
+
+
+def _same_site_family(a, b):
+    """Same host, or one is a subdomain of the other (pawchive.pw and
+    n2.pawchive.pw are one family; pawchive.pw and example.com are not).
+    Mirrors the extension's sameSiteFamily()."""
+    a = (a or "").lower()
+    b = (b or "").lower()
+    if not a or not b:
+        return False
+    return a == b or a.endswith("." + b) or b.endswith("." + a)
+
+
+def _origin_tuple(url):
+    """(scheme, host, port) with the scheme default port filled in, so
+    http://host and http://host:80 compare equal."""
+    try:
+        u = urlparse(url or "")
+    except ValueError:
+        return ("", "", None)
+    port = u.port
+    if port is None:
+        port = {"http": 80, "https": 443}.get((u.scheme or "").lower())
+    return ((u.scheme or "").lower(), (u.hostname or "").lower(), port)
+
+
+def _sec_fetch_site(referer, url):
+    """Chrome's Sec-Fetch-Site for a navigation started from `referer` to
+    `url`: same-origin / same-site / cross-site, or "none" with no
+    referer. Computed, never hardcoded."""
+    if not referer:
+        return "none"
+    if _origin_tuple(referer) == _origin_tuple(url):
+        return "same-origin"
+    ru = urlparse(referer)
+    tu = urlparse(url)
+    if _same_site_family(ru.hostname, tu.hostname):
+        return "same-site"
+    return "cross-site"
+
+
+def _merge_cookie_header(existing, stored):
+    """Combine two Cookie headers: pairs already present (e.g. fresh
+    Set-Cookie values from a redirect hop, via the jar) win on a name
+    clash; pairs only in `stored` (the extension's job cookie) fill in."""
+    merged = {}
+    for header in (stored, existing):
+        for pair in (header or "").split(";"):
+            name, sep, value = pair.strip().partition("=")
+            if sep and name and name not in merged:
+                merged[name] = value
+    # `existing` was parsed second, so re-apply it last to win clashes.
+    for pair in (existing or "").split(";"):
+        name, sep, value = pair.strip().partition("=")
+        if sep and name:
+            merged[name] = value
+    return "; ".join(f"{k}={v}" for k, v in merged.items())
+
+
+# Binary extensions whose payload must never be an HTML page. If the
+# server answers one of these with Content-Type: text/html, that is a
+# hotlink / login / error page (some protections return 200 with HTML),
+# not the file -- fail the job instead of saving HTML as a .rar.
+_BINARY_EXTS = {
+    ".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".mp4", ".mkv",
+    ".webm", ".mov", ".avi", ".mp3", ".flac", ".ogg", ".png", ".jpg",
+    ".jpeg", ".gif", ".webp", ".pdf", ".exe", ".msi", ".bin", ".dmg",
+    ".iso",
+}
+
+
+def _html_body_for_binary(content_type, suffix):
+    return ("text/html" in (content_type or "").lower()
+            and (suffix or "").lower() in _BINARY_EXTS)
+
+
+class _RedirectSafeSession(requests.Session):
+    """Session that re-applies the job's headers on every redirect hop.
+
+    requests' own redirect handling keeps Referer/User-Agent/Accept but
+    pops Cookie (see resolve_redirects). send() runs for the first
+    request AND for every redirect hop, after that pop, so this is the
+    one place the Cookie can be restored. It is restored only when the
+    hop's host is in the same site family as the original file host.
+    Non-secret headers (Referer, User-Agent, Accept, ...) are re-applied
+    if a hop ever loses one. Range is per-request and is never stored
+    here, so a resume Range is not leaked onto a redirect target."""
+
+    def send(self, request, **kwargs):
+        headers = getattr(self, "_vg_headers", None)
+        if headers:
+            for k, v in headers.items():
+                if k not in request.headers:
+                    request.headers[k] = v
+        cookie = getattr(self, "_vg_cookie", "")
+        origin_host = getattr(self, "_vg_origin_host", "")
+        if cookie and origin_host:
+            try:
+                target_host = urlparse(request.url).hostname or ""
+            except ValueError:
+                target_host = ""
+            if target_host and _same_site_family(target_host, origin_host):
+                merged = _merge_cookie_header(
+                    request.headers.get("Cookie"), cookie)
+                if merged:
+                    request.headers["Cookie"] = merged
+        return super().send(request, **kwargs)
+
+
 def _probe_ranges(url, headers):
     try:
-        h = requests.head(url, headers=headers, allow_redirects=True,
+        sess = _generic_session(url, headers)
+        try:
+            h = sess.head(url, allow_redirects=True,
                           timeout=STATE["connection_timeout"],
                           proxies=settings.proxies_for(url))
-        size = int(h.headers.get("Content-Length", 0))
-        ranges = "bytes" in h.headers.get("Accept-Ranges", "").lower()
-        return size, ranges
+            size = int(h.headers.get("Content-Length", 0))
+            ranges = "bytes" in h.headers.get("Accept-Ranges", "").lower()
+            return size, ranges
+        finally:
+            sess.close()
     except Exception:
         return 0, False
 
@@ -508,15 +661,22 @@ class _SegAbort(Exception):
 _SEG_RETRY_BACKOFF = (2, 5, 12)   # seconds before retry 1, 2, 3
 
 
-def _open_segment(job, url, idx, h, cancel):
+def _open_segment(job, url, idx, h, cancel, sess=None):
     """GET one segment, treating HTTP 503 like 429: back off and retry up to
     3 times (honouring Retry-After, capped at 60s). Any other status is
-    returned for the caller to judge."""
+    returned for the caller to judge. `sess` is the caller's
+    _generic_session (so Referer/Cookie survive redirects); without one
+    it falls back to a plain requests.get, as before."""
     attempt = 0
     while True:
-        r = requests.get(url, headers=h, stream=True,
+        if sess is not None:
+            r = sess.get(url, headers=h, stream=True,
                          timeout=STATE["connection_timeout"],
                          proxies=settings.proxies_for(url))
+        else:
+            r = requests.get(url, headers=h, stream=True,
+                             timeout=STATE["connection_timeout"],
+                             proxies=settings.proxies_for(url))
         if r.status_code not in (429, 503):
             return r
         retry_after = r.headers.get("Retry-After", "")
@@ -542,12 +702,18 @@ def _open_segment(job, url, idx, h, cancel):
 def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None):
     h = dict(headers)
     h["Range"] = f"bytes={start}-{end}"
+    # One session per segment thread (sessions are not shared across
+    # threads): this is what carries Referer/Cookie across redirects here
+    # -- the old plain requests.get dropped Cookie on every redirect hop.
+    # Range stays per-request, so it is left out of the session headers.
+    sess = _generic_session(
+        url, {k: v for k, v in headers.items() if k.lower() != "range"})
     try:
         # `cancel` is shared by all segments of one job: the first failure
         # sets it so the others stop instead of downloading to the end.
         if cancel is not None and cancel.is_set():
             return
-        with _open_segment(job, url, idx, h, cancel) as r:
+        with _open_segment(job, url, idx, h, cancel, sess) as r:
             if r.status_code == 200:
                 # Server ignored the Range header and returned the whole
                 # file. This happens on CDNs whose edge nodes disagree about
@@ -560,7 +726,15 @@ def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None
                     cancel.set()
                 return
             if r.status_code != 206:
+                _log_http_failure(job.get("id"), r, f"segment {idx} GET")
                 raise RuntimeError(f"segment {idx} got HTTP {r.status_code}, expected 206")
+            if _html_body_for_binary(
+                    r.headers.get("Content-Type"),
+                    Path(job.get("filename") or "").suffix):
+                raise RuntimeError(
+                    f"segment {idx} got an HTML page instead of the file "
+                    f"(likely a hotlink / login page, Content-Type: "
+                    f"{r.headers.get('Content-Type')})")
             # Byte counts are folded into job["size_done"] at most every
             # 250 ms per segment (and once more on exit) instead of per
             # 64 KB chunk: the lock and the shared dict were hit thousands of
@@ -598,6 +772,8 @@ def _download_segment(job, url, idx, start, end, headers, part_path, cancel=None
         if cancel is not None:
             cancel.set()
         raise
+    finally:
+        sess.close()
 
 
 def _generic_headers(job):
@@ -794,24 +970,53 @@ _SINGLE_503_WAIT_S = 5      # seconds between attempts
 
 
 def _generic_session(url, headers):
-    """requests.Session carrying the job's Referer / User-Agent / Cookie.
+    """_RedirectSafeSession carrying the job's Referer / User-Agent / Cookie.
 
-    Headers set on the session are copied onto every redirect hop. A raw
-    Cookie header is the exception: requests drops it on any redirect, so
-    the cookies go into the session's jar instead, scoped to the original
-    host. They still follow same-host redirects (http -> https, /old -> /new)
-    and are never sent to a different host. Range is per request, so it is
-    left out here."""
-    sess = requests.Session()
+    Browser-like defaults (Accept, Accept-Language, Sec-Fetch-*) are set
+    on the session so they survive every redirect hop; the job's own
+    headers (set below) win over these when both are present. No Origin
+    is sent: Chrome does not send Origin on a plain GET download, and a
+    fallback Origin of the target's own host would be fabricated.
+    Accept-Encoding is left to requests (it already advertises br when
+    brotli is installed).
+
+    A raw Cookie header is the exception to "session headers survive":
+    requests pops Cookie on any redirect, so the cookies go into the
+    session's jar instead, scoped to the original host (same-host
+    redirects keep them that way), AND are re-injected by
+    _RedirectSafeSession.send() on cross-host hops to the same site
+    family (e.g. pawchive.pw -> n2.pawchive.pw). They are never sent to
+    an unrelated host. Range is per request, so it is left out here."""
+    sess = _RedirectSafeSession()
+
+    # Browser-like defaults; the job's own headers (set below) win over
+    # these when both are present.
+    sess.headers.update({
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,image/apng,*/*;q=0.8"),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": _sec_fetch_site(headers.get("Referer", ""), url),
+        "Sec-Fetch-User": "?1",
+    })
+
     for k, v in headers.items():
         if k.lower() not in ("cookie", "range"):
             sess.headers[k] = v
+    # Snapshot for _RedirectSafeSession.send(): re-apply any of these a
+    # redirect hop loses. Cookie is handled separately (see below).
+    sess._vg_headers = {k: v for k, v in sess.headers.items()
+                        if k.lower() != "cookie"}
+
     cookie = headers.get("Cookie")
+    sess._vg_cookie = cookie or ""
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        host = ""
+    sess._vg_origin_host = host
     if cookie:
-        try:
-            host = urlparse(url).hostname or ""
-        except ValueError:
-            host = ""
         if host:
             for pair in cookie.split(";"):
                 name, sep, value = pair.strip().partition("=")
@@ -848,6 +1053,43 @@ def _open_generic_single(job_id, job, sess, url, range_headers):
                 log(f"job {job_id}: paused")
                 return None
             time.sleep(0.25)
+
+
+def _log_http_failure(job_id, r, what="request"):
+    """Log why a download got a non-success answer (403, 5xx, HTML page, ...):
+    redirect chain, the response headers that identify a CDN / bot wall, the
+    first bytes of the body, and the request headers that were sent. Cookie
+    VALUES are never logged, only their names. Never raises."""
+    try:
+        chain = " -> ".join(f"{h.status_code} {urlparse(h.url).hostname}"
+                            for h in r.history) or "none"
+        sent = r.request.headers
+        cookie_names = sorted({p.split("=")[0].strip()
+                               for p in (sent.get("Cookie") or "").split(";")
+                               if p.strip()})
+        sent_keep = ("Referer", "User-Agent", "Accept", "Accept-Language",
+                     "Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site",
+                     "Sec-Fetch-User", "Range")
+        sent_txt = {k: sent.get(k) for k in sent_keep if sent.get(k)}
+        keep = ("Server", "CF-RAY", "CF-Mitigated", "Content-Type",
+                "Content-Length", "Location", "Retry-After", "WWW-Authenticate",
+                "X-Cache", "Via")
+        got = {k: r.headers.get(k) for k in keep if r.headers.get(k)}
+        raw_headers = getattr(r.raw, "headers", None)
+        set_names = sorted({c.split("=")[0].strip()
+                            for c in (raw_headers.getlist("Set-Cookie")
+                                      if hasattr(raw_headers, "getlist") else [])})
+        try:
+            body = next(r.iter_content(300), b"")
+            body = " ".join(body.decode("utf-8", "replace").split())[:200]
+        except Exception:
+            body = "(unreadable)"
+        log(f"job {job_id}: {what} failed: HTTP {r.status_code} from "
+            f"{urlparse(r.url).hostname} (redirects: {chain})")
+        log(f"job {job_id}: sent {sent_txt} cookies={cookie_names}")
+        log(f"job {job_id}: got {got} set-cookie={set_names} body={body!r}")
+    except Exception as e:
+        log(f"job {job_id}: could not describe the failure ({e})")
 
 
 def _run_generic_single(job_id):
@@ -887,6 +1129,17 @@ def _run_generic_single(job_id):
                     job["error"] += (f" (server unavailable, gave up after "
                                      f"{_SINGLE_503_RETRIES} retries)")
                 log(f"job {job_id}: server returned {r.status_code}")
+                _log_http_failure(job_id, r, "single-stream GET")
+                return
+            if _html_body_for_binary(r.headers.get("Content-Type"), dest.suffix):
+                _try_transition(job, JobEvent.FAIL)
+                job["error"] = (
+                    "server returned an HTML page instead of the file "
+                    "(likely a hotlink / login page, Content-Type: "
+                    f"{r.headers.get('Content-Type')})")
+                log(f"job {job_id}: server returned HTML for {dest.name}, "
+                    f"not the file -- failing instead of saving it as "
+                    f"{dest.suffix}")
                 return
             if r.status_code == 200 and existing:
                 log(f"job {job_id}: server ignored Range, restarting from 0")

@@ -59,6 +59,9 @@ MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 HOME = Path.home() / "Downloads" / "VideoGrabber"
 CONFIG_PATH = HOME / "settings.json"
 JOBS_PATH = HOME / "jobs.json"
+# v13: jobs and download stats live in SQLite. JOBS_PATH is only read once,
+# to migrate a pre-v13 jobs.json (see vg_db.migrate_jobs_json).
+DB_PATH = HOME / "videograbber.db"
 
 # Canonical category list (single source of truth — gui_qt.py used to keep
 # its own duplicate copy of this; category_for() below always falls back
@@ -132,7 +135,6 @@ STATE = {
     "per_category_dirs": {},
     "file_types_overrides": {},
     "rules": [],
-    "download_stats": [],
     "portable": False,
     "double_click": "open",
     "force_on_top": True,
@@ -268,10 +270,11 @@ def set_shutdown_pending(v):
 
 def set_paths(h):
     """main() calls this after resolving the portable home directory."""
-    global HOME, CONFIG_PATH, JOBS_PATH
+    global HOME, CONFIG_PATH, JOBS_PATH, DB_PATH
     HOME = h
     CONFIG_PATH = HOME / "settings.json"
     JOBS_PATH = HOME / "jobs.json"
+    DB_PATH = HOME / "videograbber.db"
 
 
 def portable_home():

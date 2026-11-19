@@ -1,5 +1,9 @@
 """Read-only: list jobs whose GUI path changes now that gui_qt._path_for
-calls settings._dest_for. Usage: python check_path_drift.py [jobs.json] [settings.json]"""
+calls settings._dest_for. Usage: python check_path_drift.py [jobs.json] [settings.json]
+
+v13: job history is in videograbber.db. With no jobs.json argument this reads
+the database (read-only); pass a jobs.json or jobs.json.migrated to check an
+old export instead."""
 import json
 import sys
 from pathlib import Path
@@ -42,11 +46,18 @@ def new_path_for(job):
     return settings._dest_for(job)
 
 
-jobs_file = Path(sys.argv[1]) if len(sys.argv) > 1 else settings.JOBS_PATH
+jobs_file = Path(sys.argv[1]) if len(sys.argv) > 1 else None
 cfg_file = Path(sys.argv[2]) if len(sys.argv) > 2 else settings.CONFIG_PATH
 if cfg_file.exists():
     settings.STATE.update(settings._read_settings_json(cfg_file))
-jobs = json.loads(jobs_file.read_text(encoding="utf-8"))
+if jobs_file is not None:
+    jobs = json.loads(jobs_file.read_text(encoding="utf-8"))
+else:
+    import sqlite3
+    # mode=ro: this script must never create or change the database.
+    _db = sqlite3.connect(f"file:{settings.DB_PATH.as_posix()}?mode=ro", uri=True)
+    jobs = {jid: json.loads(data) for jid, data in _db.execute("SELECT id, data FROM jobs")}
+    _db.close()
 changed = 0
 for jid, j in jobs.items():
     try:

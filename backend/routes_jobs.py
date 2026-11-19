@@ -1,11 +1,15 @@
 """Job listing, creation and queue routes."""
 
+import heapq
+import json
 import time
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 from downloader import queue_status
-from jobs import _fire_show_dialog_hooks, JOBS, new_job, save_jobs_snapshot
+from jobs import (_fire_show_dialog_hooks, JOBS, new_job, save_jobs_snapshot,
+                  flush_jobs, set_archived, _ts)
+import vg_db
 from logging_setup import log
 from settings import save_settings, STATE
 from api import _find_duplicate, cleanup_partial_files
@@ -13,13 +17,98 @@ from api import _find_duplicate, cleanup_partial_files
 jobs_bp = Blueprint("routes_jobs", __name__)
 
 
+JOBS_DEFAULT_LIMIT = 100
+
+# Rows with one of these statuses are running or waiting to run. They lead the
+# list so a page-1 poll always carries every live progress update.
+_LIVE_STATUSES = ("queued", "downloading", "paused", "held")
+
+
+def _jobs_order(item):
+    """Sort key for a (job_id, job) pair: active rows first, then newest
+    first. The id breaks ties (a playlist batch shares one created_ts), so the
+    order is total and paging is stable."""
+    jid, j = item
+    jid = str(jid)
+    return (0 if j.get("status") in _LIVE_STATUSES else 1,
+            -_ts(j.get("created_ts")),
+            -(int(jid) if jid.isascii() and jid.isdigit() else -1))
+
+
+def _int_arg(name, default):
+    raw = request.args.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a whole number")
+    if v < 0:
+        raise ValueError(f"{name} must not be negative")
+    return v
+
+
 @jobs_bp.route("/jobs", methods=["GET"])
 def jobs():
+    """Job list, paged. The body is still {job_id: job}; the paging facts
+    travel in headers (X-Total-Count, X-Offset, X-Limit, X-Has-More).
+
+    Query parameters
+      limit     rows to return (default 100; 0 = every row)
+      offset    rows to skip (default 0)
+      q         full-text search over filename, url and metadata (FTS5)
+      archived  0 = leave archived rows out (default), 1 = only archived, all
+      status    comma-separated statuses to keep, e.g. status=error,stopped
+
+    Order: queued/downloading/paused/held rows first, then newest first.
+    limit=0&archived=all returns exactly what this route used to."""
+    try:
+        limit = _int_arg("limit", JOBS_DEFAULT_LIMIT)
+        offset = _int_arg("offset", 0)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    arch = (request.args.get("archived") or "0").strip().lower()
+    if arch in ("0", "false", "no"):
+        arch = "0"
+    elif arch in ("1", "true", "yes"):
+        arch = "1"
+    elif arch != "all":
+        return jsonify({"error": "archived must be 0, 1 or all"}), 400
+    statuses = {s.strip().lower() for s in (request.args.get("status") or "").split(",") if s.strip()}
+    q = (request.args.get("q") or "").strip()
+
+    if q:
+        # The index is written by the background writer a moment after a
+        # change; catch it up so a search never misses a job added just now.
+        flush_jobs()
+        pool = [(i, j) for i, j in ((i, JOBS.get(i)) for i in vg_db.search_job_ids(q))
+                if j is not None]
+    else:
+        pool = list(JOBS.items())
+    if arch == "0":
+        pool = [(i, j) for i, j in pool if not j.get("archived")]
+    elif arch == "1":
+        pool = [(i, j) for i, j in pool if j.get("archived")]
+    if statuses:
+        pool = [(i, j) for i, j in pool if j.get("status") in statuses]
+    total = len(pool)
+    if limit:
+        # nsmallest: only the rows of this page are ever fully ordered.
+        page = heapq.nsmallest(offset + limit, pool, key=_jobs_order)[offset:]
+    else:
+        page = sorted(pool, key=_jobs_order)[offset:]
     # cookie is dropped: the GUI never reads it, and shipping every job's
     # cookie string on each 1 Hz poll bloats the payload and leaks it.
-    return jsonify({jid: {k: v for k, v in j.items()
-                          if k not in ("pause_evt", "stop_evt", "cookie")}
-                     for jid, j in list(JOBS.items())})
+    body = {jid: {k: v for k, v in list(j.items())
+                  if k not in ("pause_evt", "stop_evt", "cookie")}
+            for jid, j in page}
+    # json.dumps, not jsonify: jsonify sorts the keys, and the page order matters.
+    resp = current_app.response_class(json.dumps(body, default=str), mimetype="application/json")
+    resp.headers["X-Total-Count"] = str(total)
+    resp.headers["X-Offset"] = str(offset)
+    resp.headers["X-Limit"] = str(limit)
+    resp.headers["X-Has-More"] = "1" if limit and offset + limit < total else "0"
+    return resp
 
 @jobs_bp.route("/download", methods=["POST"])
 def download():
@@ -192,3 +281,27 @@ def clear_failed():
     if removed:
         save_jobs_snapshot()
     return jsonify({"removed": removed})
+
+
+@jobs_bp.route("/archive-failed", methods=["POST"])
+def archive_failed():
+    """Archive error rows instead of deleting them. Optional JSON body:
+    {"older_than_hours": N} limits it to failures at least that old (the same
+    age rule the old "hide failed downloads older than" setting used)."""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        hours = float(data.get("older_than_hours") or 0)
+    except (TypeError, ValueError):
+        hours = 0
+    cutoff = time.time() - hours * 3600
+    archived = 0
+    for j in list(JOBS.values()):
+        if j.get("status") != "error" or j.get("archived"):
+            continue
+        if hours and _ts(j.get("failed_ts") or j.get("created_ts")) > cutoff:
+            continue
+        set_archived(j, True)
+        archived += 1
+    if archived:
+        save_jobs_snapshot()
+    return jsonify({"archived": archived})
