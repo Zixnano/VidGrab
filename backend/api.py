@@ -60,6 +60,7 @@ TOKEN_PROTECTED_PATHS = {
     "/reorder", "/theme", "/queue-running", "/delete-file", "/toolkit",
     "/open-folder", "/diskspace",
     "/archive", "/unarchive", "/archive-failed",
+    "/companion",
 }
 
 # Routes that may be driven with a /remote login cookie.
@@ -415,6 +416,12 @@ from routes_settings import settings_bp, update_settings, theme, logs_endpoint
 from routes_updates import updates_bp, update_status, update_skip, ytdlp_update_now, ytdlp_rollback, changelog_route
 from routes_remote import remote_bp, _REMOTE_COOKIE, _REMOTE_SESSION_TTL, _REMOTE_SESSIONS, _REMOTE_SESSION_LOCK, _new_remote_session, _valid_remote_session, _REMOTE_CSS, _remote_page, _remote_login_page, remote_login, _remote_action_form, remote_ui
 
+try:
+    from companion.api_routes import companion_bp
+except Exception as _companion_exc:   # optional feature: never block the server
+    companion_bp = None
+    log(f"companion routes not loaded: {_companion_exc}")
+
 app.register_blueprint(health_bp)
 app.register_blueprint(pair_bp)
 app.register_blueprint(jobs_bp)
@@ -424,8 +431,11 @@ app.register_blueprint(probe_bp)
 app.register_blueprint(settings_bp)
 app.register_blueprint(updates_bp)
 app.register_blueprint(remote_bp)
+if companion_bp is not None:
+    app.register_blueprint(companion_bp)
 
 
 def run_server():
     host = "0.0.0.0" if STATE.get("lan_access") else "127.0.0.1"
     app.run(host=host, port=APP_PORT, debug=False, use_reloader=False)
+# app_host.py: entry point frozen into VideoGrabberApp.exe (thin app host).

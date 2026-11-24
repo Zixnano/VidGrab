@@ -1,0 +1,86 @@
+{
+  "version": 3,
+  "frame_size": 64,
+  "animation": {
+    "fps": {"idle": 4, "content": 4, "happy": 4, "curious": 3, "sleeping": 2, "sad": 2, "excited": 6, "celebrating": 6, "wobble": 5, "cracked": 4},
+    "bob": {
+      "idle": [900, 1], "content": [900, 1], "happy": [500, 1], "curious": [700, 1],
+      "sleeping": [1600, 1], "sad": [0, 0], "excited": [350, 2], "celebrating": [300, 3],
+      "wobble": [0, 0], "cracked": [500, 1]
+    },
+    "blink_period_ms": 4700,
+    "blink_hold_ms": 150
+  },
+  "egg": {
+    "sheet": "egg.png",
+    "columns": 4,
+    "rows": 1,
+    "frames": {
+      "idle": [0], "content": [0], "happy": [1, 2], "curious": [1], "sleeping": [0],
+      "sad": [0], "excited": [1, 2], "celebrating": [1, 2], "wobble": [1, 0, 2, 0], "cracked": [3, 0, 3, 3]
+    },
+    "blink": null
+  },
+  "species": [
+    {
+      "id": "puppy",
+      "name": "Mochi",
+      "display_name": "Lavender Puppy",
+      "sheet": "puppy.png",
+      "columns": 4,
+      "rows": 2,
+      "unlocked_by_default": true,
+      "unlock": null,
+      "blink": null,
+      "frames": {
+        "idle": [0], "content": [6], "happy": [1, 7], "curious": [3, 6], "sleeping": [2],
+        "sad": [4], "excited": [5], "celebrating": [5, 7]
+      }
+    },
+    {
+      "id": "cat",
+      "name": "Miso",
+      "display_name": "Moonlight Cat",
+      "sheet": "cat.png",
+      "columns": 8,
+      "rows": 1,
+      "unlocked_by_default": false,
+      "unlock": {"achievement": "download_10"},
+      "blink": 1,
+      "frames": {
+        "idle": [0], "content": [0], "happy": [2], "curious": [3], "sleeping": [4],
+        "sad": [5], "excited": [6], "celebrating": [6, 7]
+      }
+    },
+    {
+      "id": "frog",
+      "name": "Pip",
+      "display_name": "Clover Frog",
+      "sheet": "frog.png",
+      "columns": 8,
+      "rows": 1,
+      "unlocked_by_default": false,
+      "unlock": {"achievement": "streak_3"},
+      "blink": 1,
+      "frames": {
+        "idle": [0], "content": [0], "happy": [2], "curious": [3], "sleeping": [4],
+        "sad": [5], "excited": [6], "celebrating": [6, 7]
+      }
+    },
+    {
+      "id": "axolotl",
+      "name": "Bubbles",
+      "display_name": "Starry Axolotl",
+      "sheet": "axolotl.png",
+      "columns": 8,
+      "rows": 1,
+      "unlocked_by_default": false,
+      "unlock": {"achievement": "level_10"},
+      "blink": 1,
+      "frames": {
+        "idle": [0], "content": [0], "happy": [2], "curious": [3], "sleeping": [4],
+        "sad": [5], "excited": [6], "celebrating": [6, 7]
+      }
+    }
+  ]
+}

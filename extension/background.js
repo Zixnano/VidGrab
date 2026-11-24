@@ -1657,4 +1657,5 @@ const VGBG = {
 self.VGBG = VGBG;
 try { importScripts("bg-features.js"); } catch (e) { VGLOG.error("boot", "bg-features.js failed to load", e); }
 try { importScripts("bg-library.js"); } catch (e) { VGLOG.error("boot", "bg-library.js failed to load", e); }
+try { importScripts("bg-companion.js"); } catch (e) { VGLOG.error("boot", "bg-companion.js failed to load", e); }
 VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().version);

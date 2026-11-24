@@ -1875,6 +1875,9 @@ class MainWindow(QMainWindow):
         self._apply_toolbar_text()
 
     def _shell_dpad(self, d):
+        hook = getattr(self, "_vg_pad_hook", None)
+        if hook is not None and hook("dpad", d):
+            return
         if d in ("up", "down"):
             n = self.model.rowCount()
             if not n:
@@ -1887,6 +1890,9 @@ class MainWindow(QMainWindow):
             self.select_category(names[(i + (-1 if d == "left" else 1)) % len(names)])
 
     def _shell_button(self, name):
+        hook = getattr(self, "_vg_pad_hook", None)
+        if hook is not None and hook("button", name):
+            return
         if name == "start":
             self.toggle_queue()
         elif name == "select":
@@ -2500,6 +2506,12 @@ def launch_gui(new_job_hook=None, home_dir=None, show_dialog_hook=None):
     _window = MainWindow()
     _apply_app_icon(_app, _window)
     _window.show()
+    # Companion (optional, local-only). A failure here must never stop the app starting.
+    try:
+        from companion.integration import install as _install_companion
+        _install_companion(_window)
+    except Exception as exc:
+        log(f"companion: not installed ({exc})")
     if new_job_hook is not None:
         new_job_hook(_window.new_job_hook())
     if show_dialog_hook is not None:

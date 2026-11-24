@@ -718,6 +718,20 @@ def _coerce_status(v):
     return v if isinstance(v, JobStatus) else JobStatus(v)
 
 
+def _companion_notify(status, j):
+    """Tell the optional companion about a real status change. Cheap and failure-proof."""
+    name = {JobStatus.DONE: "job_finished", JobStatus.ERROR: "job_failed",
+            JobStatus.DOWNLOADING: "queue_active"}.get(status)
+    if name is None:
+        return
+    try:
+        from companion.events import publish
+        publish(name, {"job": {"id": j.get("id"), "url": j.get("url"), "status": j.get("status"),
+                               "size_total": j.get("size_total"), "size_done": j.get("size_done")}})
+    except Exception:
+        pass
+
+
 def transition(j, event):
     """Validate and apply a lifecycle event. Raises ValueError on illegal
     transitions — this is the single place allowed to mutate j["status"]
@@ -745,6 +759,8 @@ def transition(j, event):
             j["stop_evt"].clear()
     elif ev is JobEvent.STOP and j.get("stop_evt") is not None:
         j["stop_evt"].set()
+    if cur is not nxt:
+        _companion_notify(nxt, j)
     return nxt
 
 
