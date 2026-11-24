@@ -15,6 +15,20 @@ echo   Video Grabber - push to GitHub
 echo ==========================================
 echo.
 
+rem --- Keep Python cache files out of git ---------------------------------
+findstr /x /c:"__pycache__/" .gitignore >nul 2>&1
+if errorlevel 1 (
+    echo.>>.gitignore
+    echo __pycache__/>>.gitignore
+)
+findstr /x /c:"*.pyc" .gitignore >nul 2>&1
+if errorlevel 1 (
+    echo *.pyc>>.gitignore
+)
+for /f "delims=" %%f in ('git ls-files "*.pyc"') do (
+    git rm --cached -q -- "%%f"
+)
+
 git add -A
 
 git diff --cached --quiet
@@ -24,8 +38,9 @@ if not errorlevel 1 (
     git status --short
     set "msg=%~1"
     if not defined msg set /p "msg=Commit message: "
+    if defined msg set "msg=!msg:"=!"
     if not defined msg (
-        for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd HH:mm"') do set "msg=Update %%i"
+        for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HH:mm"') do set "msg=Update %%i"
     )
     git commit -m "!msg!"
     if errorlevel 1 (
