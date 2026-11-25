@@ -64,6 +64,7 @@ TOKEN_PROTECTED_PATHS = {
     "/reorder", "/theme", "/queue-running", "/delete-file", "/toolkit",
     "/open-folder", "/diskspace",
     "/archive", "/unarchive", "/archive-failed",
+    "/companion",
 }
 
 # Routes that may be driven with a /remote login cookie.
@@ -419,6 +420,12 @@ from routes_settings import settings_bp, update_settings, theme, logs_endpoint
 from routes_updates import updates_bp, update_status, update_skip, ytdlp_update_now, ytdlp_rollback, changelog_route
 from routes_remote import remote_bp, _REMOTE_COOKIE, _REMOTE_SESSION_TTL, _REMOTE_SESSIONS, _REMOTE_SESSION_LOCK, _new_remote_session, _valid_remote_session, _REMOTE_CSS, _remote_page, _remote_login_page, remote_login, _remote_action_form, remote_ui
 
+try:
+    from companion.api_routes import companion_bp
+except Exception as _companion_exc:   # optional feature: never block the server
+    companion_bp = None
+    log(f"companion routes not loaded: {_companion_exc}")
+
 app.register_blueprint(health_bp)
 app.register_blueprint(pair_bp)
 app.register_blueprint(jobs_bp)
@@ -428,11 +435,14 @@ app.register_blueprint(probe_bp)
 app.register_blueprint(settings_bp)
 app.register_blueprint(updates_bp)
 app.register_blueprint(remote_bp)
+if companion_bp is not None:
+    app.register_blueprint(companion_bp)
 
 
 def run_server():
     host = "0.0.0.0" if STATE.get("lan_access") else "127.0.0.1"
     app.run(host=host, port=APP_PORT, debug=False, use_reloader=False)
+# app_host.py: entry point frozen into VideoGrabberApp.exe (thin app host).
 # app_host.py: entry point frozen into VideoGrabberApp.exe (thin app host).
 # This is the former launcher.py, unchanged in its defences; under the
 # Supervisor Architecture it is spawned BY the supervisor (launcher.py,
@@ -8759,6 +8769,9 @@ class MainWindow(QMainWindow):
         self._apply_toolbar_text()
 
     def _shell_dpad(self, d):
+        hook = getattr(self, "_vg_pad_hook", None)
+        if hook is not None and hook("dpad", d):
+            return
         if d in ("up", "down"):
             n = self.model.rowCount()
             if not n:
@@ -8771,6 +8784,9 @@ class MainWindow(QMainWindow):
             self.select_category(names[(i + (-1 if d == "left" else 1)) % len(names)])
 
     def _shell_button(self, name):
+        hook = getattr(self, "_vg_pad_hook", None)
+        if hook is not None and hook("button", name):
+            return
         if name == "start":
             self.toggle_queue()
         elif name == "select":
@@ -9384,6 +9400,12 @@ def launch_gui(new_job_hook=None, home_dir=None, show_dialog_hook=None):
     _window = MainWindow()
     _apply_app_icon(_app, _window)
     _window.show()
+    # Companion (optional, local-only). A failure here must never stop the app starting.
+    try:
+        from companion.integration import install as _install_companion
+        _install_companion(_window)
+    except Exception as exc:
+        log(f"companion: not installed ({exc})")
     if new_job_hook is not None:
         new_job_hook(_window.new_job_hook())
     if show_dialog_hook is not None:
@@ -17632,6 +17654,20 @@ def _coerce_status(v):
     return v if isinstance(v, JobStatus) else JobStatus(v)
 
 
+def _companion_notify(status, j):
+    """Tell the optional companion about a real status change. Cheap and failure-proof."""
+    name = {JobStatus.DONE: "job_finished", JobStatus.ERROR: "job_failed",
+            JobStatus.DOWNLOADING: "queue_active"}.get(status)
+    if name is None:
+        return
+    try:
+        from companion.events import publish
+        publish(name, {"job": {"id": j.get("id"), "url": j.get("url"), "status": j.get("status"),
+                               "size_total": j.get("size_total"), "size_done": j.get("size_done")}})
+    except Exception:
+        pass
+
+
 def transition(j, event):
     """Validate and apply a lifecycle event. Raises ValueError on illegal
     transitions — this is the single place allowed to mutate j["status"]
@@ -17659,6 +17695,8 @@ def transition(j, event):
             j["stop_evt"].clear()
     elif ev is JobEvent.STOP and j.get("stop_evt") is not None:
         j["stop_evt"].set()
+    if cur is not nxt:
+        _companion_notify(nxt, j)
     return nxt
 
 
@@ -29214,6 +29252,9 @@ jobs:
           Get-ChildItem -Filter *.py | Where-Object {
             $_.Name -notin 'launcher.py','app_host.py','recovery_ui.py'
           } | Copy-Item -Destination "$root/app/"
+          # Companion package (a subfolder, so the *.py filter above does not catch it)
+          if (-not (Test-Path companion/integration.py)) { throw "companion folder missing from backend/" }
+          Copy-Item -Path companion -Destination "$root/app/" -Recurse
           if (-not (Test-Path "$root/app/vg_state.py")) { throw "app/vg_state.py missing" }
           # App icon: the Qt window loads app/icon.ico at runtime (the .spec files
           # use the same file for the exe). Looks where the specs look.
@@ -31103,7 +31144,79 @@ const VGBG = {
 self.VGBG = VGBG;
 try { importScripts("bg-features.js"); } catch (e) { VGLOG.error("boot", "bg-features.js failed to load", e); }
 try { importScripts("bg-library.js"); } catch (e) { VGLOG.error("boot", "bg-library.js failed to load", e); }
+try { importScripts("bg-companion.js"); } catch (e) { VGLOG.error("boot", "bg-companion.js failed to load", e); }
 VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().version);
+// bg-companion.js: companion pet messages for the panel. Loaded by background.js after bg-library.js:
+//   try { importScripts("bg-companion.js"); } catch (e) { VGLOG.error("boot", "bg-companion.js failed to load", e); }
+// The token never leaves the background worker. The panel only sends the four message types below.
+(function () {
+  "use strict";
+  const B = self.VGBG, C = self.VGCORE, L = self.VGLOG;
+  if (!B || !C || !L) {
+    try { console.warn("bg-companion.js: VGBG/VGCORE/VGLOG are not ready, companion messages are disabled. It must load after bg-library.js."); } catch (e) { /* ignore */ }
+    return;
+  }
+
+  const ACTIONS = new Set(["pet", "feed", "play", "nap", "enable", "disable"]);
+  const SPRITE_NAME = /^[a-z0-9_-]+\.png$/i;
+  const spriteCache = new Map();          // sheet name -> data URL (sheets are small and never change)
+  let manifest = null, manifestAt = 0;
+
+  async function app(path, opts) {
+    opts = opts || {};
+    if (!(await B.checkBackend())) return { ok: false, offline: true, error: "Video Grabber app isn't running." };
+    try {
+      const { res, unpaired } = await B.authedFetch(path, {
+        method: opts.method || "GET",
+        headers: opts.body ? { "Content-Type": "application/json" } : {},
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+      });
+      if (unpaired) return { ok: false, error: "Not paired yet.", code: "not_paired" };
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return { ok: false, status: res.status, data, error: (data && data.error) || ("HTTP " + res.status) };
+      return { ok: true, status: res.status, data };
+    } catch (e) {
+      const c = C.classifyError(e);
+      return { ok: false, error: c.message, code: c.code };
+    }
+  }
+
+  B.on("COMPANION_STATE", async () => app("/companion"));
+
+  B.on("COMPANION_MANIFEST", async () => {
+    if (manifest && Date.now() - manifestAt < 300000) return { ok: true, data: manifest };
+    const r = await app("/companion/manifest");
+    if (r.ok) { manifest = r.data; manifestAt = Date.now(); }
+    return r;
+  });
+
+  B.on("COMPANION_ACTION", async (msg) => {
+    const action = String((msg && msg.action) || "");
+    if (!ACTIONS.has(action)) return { ok: false, error: "Unknown action." };
+    return app("/companion/action", { method: "POST", body: { action } });
+  });
+
+  B.on("COMPANION_SPRITE", async (msg) => {
+    const name = String((msg && msg.name) || "");
+    if (!SPRITE_NAME.test(name)) return { ok: false, error: "Bad sprite name." };
+    if (spriteCache.has(name)) return { ok: true, data: { dataUrl: spriteCache.get(name) } };
+    if (!(await B.checkBackend())) return { ok: false, offline: true, error: "Video Grabber app isn't running." };
+    try {
+      const { res, unpaired } = await B.authedFetch("/companion/sprite/" + encodeURIComponent(name));
+      if (unpaired) return { ok: false, error: "Not paired yet.", code: "not_paired" };
+      if (!res.ok) return { ok: false, error: "HTTP " + res.status };
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      const dataUrl = "data:image/png;base64," + btoa(bin);
+      spriteCache.set(name, dataUrl);
+      return { ok: true, data: { dataUrl } };
+    } catch (e) {
+      const c = C.classifyError(e);
+      return { ok: false, error: c.message, code: c.code };
+    }
+  });
+})();
 // bg-features.js: Batch 2 features that live in the service worker. Loaded by
 // background.js through importScripts() once the core (sniffer, app client,
 // dispatcher) is ready, and talks to it only through the VGBG object, so the
@@ -31683,6 +31796,241 @@ VGLOG.info("boot", "service worker ready v" + chrome.runtime.getManifest().versi
     return { ok: true, removed };
   });
   L.info("library", "bg-library ready");
+})();
+// companion-anim.js: the same frame sequencing the desktop app uses (backend/companion/animation.py).
+// Timing comes from the manifest ("animation"), so both sides stay in step. Pure, no DOM.
+(function (root) {
+  "use strict";
+  const DEFAULTS = {
+    fps: { idle: 4, content: 4, happy: 4, curious: 3, sleeping: 2, sad: 2, excited: 6, celebrating: 6, wobble: 5, cracked: 4 },
+    bob: { idle: [900, 1], content: [900, 1], happy: [500, 1], curious: [700, 1], sleeping: [1600, 1], sad: [0, 0],
+           excited: [350, 2], celebrating: [300, 3], wobble: [0, 0], cracked: [500, 1] },
+    blink_period_ms: 4700,
+    blink_hold_ms: 150,
+  };
+
+  function mergeCfg(animation) {
+    const out = { fps: { ...DEFAULTS.fps }, bob: { ...DEFAULTS.bob },
+                  blink_period_ms: DEFAULTS.blink_period_ms, blink_hold_ms: DEFAULTS.blink_hold_ms };
+    if (animation) {
+      if (animation.fps) Object.assign(out.fps, animation.fps);
+      if (animation.bob) Object.assign(out.bob, animation.bob);
+      if (animation.blink_period_ms) out.blink_period_ms = animation.blink_period_ms;
+      if (animation.blink_hold_ms) out.blink_hold_ms = animation.blink_hold_ms;
+    }
+    return out;
+  }
+
+  function Animator(entry, animation) {
+    this.entry = entry || {};
+    this.cfg = mergeCfg(animation);
+  }
+  Animator.prototype.framesFor = function (pose) {
+    const frames = this.entry.frames || {};
+    const seq = frames[pose] || frames.idle || [0];
+    return seq.map((n) => Number(n) | 0);
+  };
+  Animator.prototype.blinkActive = function (t) {
+    const period = Math.max(1000, Number(this.cfg.blink_period_ms) | 0);
+    const hold = Math.max(50, Number(this.cfg.blink_hold_ms) | 0);
+    return ((t * 1000) % period) >= period - hold;
+  };
+  // returns { index, dy }: frame number in the sheet and the vertical bob in sprite pixels
+  Animator.prototype.frame = function (pose, t) {
+    const seq = this.framesFor(pose);
+    const fps = Number(this.cfg.fps[pose]) || 4;
+    let index = seq[Math.floor(t * fps) % seq.length];
+    const blink = this.entry.blink;
+    if (blink !== null && blink !== undefined && (pose === "idle" || pose === "content") && this.blinkActive(t)) index = Number(blink) | 0;
+    const bob = this.cfg.bob[pose] || [0, 0];
+    let dy = 0;
+    if (bob[0] && bob[1]) dy = Math.floor((t * 1000) / bob[0]) % 2 ? (bob[1] | 0) : 0;
+    return { index, dy };
+  };
+  function sheetCell(index, columns, size) {
+    const cols = Math.max(1, columns | 0), s = size || 64;
+    return { x: (index % cols) * s, y: Math.floor(index / cols) * s };
+  }
+
+  const api = { Animator, sheetCell };
+  if (typeof module !== "undefined" && module.exports) module.exports = api; else root.VGCAnim = api;
+})(typeof self !== "undefined" ? self : this);
+// companion-panel.js: adds a "Pal" tab to the popup and side panel. Load it after panel.js and
+// companion-anim.js. It does not edit panel.js: it adds its own nav button and pane to the same
+// containers and hides itself when any other tab is chosen. Every value from the app goes in with
+// textContent, never innerHTML. All data comes from the background worker (COMPANION_* messages);
+// when the app is off or unreachable the tab says so and never invents progress.
+(function () {
+  "use strict";
+  const C = window.VGCORE, X = window.VGCHROME, A = window.VGCAnim;
+  if (!C || !X || !A) return;
+  const $ = (id) => document.getElementById(id);
+  const nav = $("vgnav"), mount = $("vgviews");
+  if (!nav || !mount) return;                              // panel.js has not built the shell
+
+  function h(tag, attrs, ...kids) {
+    const el = document.createElement(tag);
+    for (const k of Object.keys(attrs || {})) {
+      const v = attrs[k];
+      if (v == null || v === false) continue;
+      if (k === "class") el.className = v;
+      else if (k === "text") el.textContent = v;
+      else if (k.startsWith("on") && typeof v === "function") el.addEventListener(k.slice(2), v);
+      else if (v === true) el.setAttribute(k, "");
+      else el.setAttribute(k, String(v));
+    }
+    for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+    return el;
+  }
+  const send = (msg) => X.send(msg);
+
+  // ----------------------------------------------------------------- styles --
+  const style = document.createElement("style");
+  style.textContent = [
+    ".vgc-stage{display:flex;flex-direction:column;align-items:center;padding:10px 6px 4px;border:1px solid var(--bd);background:var(--panel);border-radius:var(--r);margin-bottom:8px}",
+    ".vgc-sprite{width:128px;height:134px;position:relative;overflow:hidden}",
+    ".vgc-sprite i{position:absolute;left:0;top:3px;width:128px;height:128px;background-repeat:no-repeat;image-rendering:pixelated}",
+    ".vgc-name{font-size:14px;font-weight:700;margin:2px 0 0}",
+    ".vgc-sub{font-size:11px;color:var(--mu);margin:2px 0 6px;text-align:center}",
+    ".vgc-say{font-size:12px;padding:6px 10px;border:1px solid var(--bd-hi,var(--bd));border-radius:12px;background:var(--elev);margin:4px 0 2px;max-width:100%;text-align:center}",
+    ".vgc-need{display:grid;grid-template-columns:70px 1fr 28px;gap:6px;align-items:center;font-size:11px;color:var(--mu);margin:3px 0}",
+    ".vgc-need b{font-weight:400;text-align:right}",
+    ".vgc-acts{display:flex;gap:5px;margin:8px 0}",
+    ".vgc-acts button{flex:1}",
+    ".vgc-note{font-size:11px;color:var(--mu);margin-top:6px}",
+  ].join("\n");
+  document.head.append(style);
+
+  // ------------------------------------------------------------- nav + pane --
+  const btn = h("button", { id: "nav-pal", role: "tab", "aria-selected": "false", "aria-controls": "pane-pal", tabindex: "0", text: "Pal", onclick: open });
+  nav.append(btn);
+  const pane = h("section", { id: "pane-pal", class: "pview", role: "tabpanel", "aria-labelledby": "nav-pal" });
+  mount.append(pane);
+
+  let animTimer = null, pollTimer = null, t0 = performance.now();
+  let manifest = null, snap = null, sprite = { name: "", url: "", entry: null }, animator = null, animKey = "";
+  let spriteEl = null, toastText = "", lastSig = null;
+
+  function open() {
+    for (const b of nav.querySelectorAll("button")) { const on = b === btn; b.setAttribute("aria-selected", on ? "true" : "false"); b.tabIndex = on ? 0 : -1; }
+    if ($("mainView")) $("mainView").style.display = "none";
+    if ($("settingsView")) $("settingsView").style.display = "none";
+    for (const p of mount.querySelectorAll(".pview")) p.classList.toggle("on", p === pane);
+    start();
+  }
+  function stop() {
+    clearInterval(animTimer); clearInterval(pollTimer); animTimer = pollTimer = null;
+    pane.classList.remove("on");
+    btn.setAttribute("aria-selected", "false");
+  }
+  // Another tab (or the settings cog) was chosen: panel.js shows its own pane, we step aside.
+  nav.addEventListener("click", (e) => { const b = e.target.closest("button"); if (b && b !== btn) stop(); }, true);
+  nav.addEventListener("keydown", (e) => { if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && pane.classList.contains("on")) stop(); }, true);
+  const cog = $("btnCog");
+  if (cog) cog.addEventListener("click", stop);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { clearInterval(animTimer); clearInterval(pollTimer); animTimer = pollTimer = null; }
+    else if (pane.classList.contains("on")) start();
+  });
+
+  function start() {
+    t0 = performance.now();
+    refresh(true);
+    clearInterval(pollTimer);
+    pollTimer = setInterval(() => refresh(false), 5000);
+  }
+  function startAnim() {
+    clearInterval(animTimer);
+    if (snap && snap.enabled && snap.animations !== false) animTimer = setInterval(paint, 100);
+  }
+
+  // ---------------------------------------------------------------- loading --
+  async function refresh(force) {
+    const [s, m] = await Promise.all([send({ type: "COMPANION_STATE" }), manifest ? Promise.resolve({ ok: true, data: manifest }) : send({ type: "COMPANION_MANIFEST" })]);
+    if (!s || !s.ok) { lastSig = null; render({ error: (s && s.error) || "Could not reach the app.", offline: !!(s && s.offline) }); return; }
+    if (m && m.ok) manifest = m.data;
+    snap = s.data;
+    const sig = JSON.stringify(snap) + "|" + (manifest ? 1 : 0) + "|" + (sprite.url ? 1 : 0);
+    if (!force && !toastText && sig === lastSig) return;     // nothing changed: do not rebuild the pane
+    lastSig = sig;
+    if (snap.enabled && manifest) await ensureSprite();
+    render();
+  }
+
+  async function ensureSprite() {
+    const stage = snap.stage;
+    const entry = stage === "egg" ? manifest.egg : (manifest.species || []).find((x) => x.id === snap.species) || (manifest.species || [])[0];
+    if (!entry) return;
+    if (sprite.name !== entry.sheet || !sprite.url) {
+      const r = await send({ type: "COMPANION_SPRITE", name: entry.sheet });
+      if (r && r.ok) sprite = { name: entry.sheet, url: r.data.dataUrl, entry };
+    }
+    sprite.entry = entry;
+    const key = snap.species + "|" + stage;
+    if (key !== animKey) { animator = new A.Animator(entry, manifest.animation); animKey = key; }
+  }
+
+  // --------------------------------------------------------------- rendering --
+  function need(label, value) {
+    return h("div", { class: "vgc-need" }, h("span", { text: label }), h("div", { class: "bar" }, h("i", { style: "width:" + Math.max(0, Math.min(100, value)) + "%" })), h("b", { text: String(value) }));
+  }
+
+  function render(problem) {
+    pane.textContent = "";
+    spriteEl = null;
+    clearInterval(animTimer); animTimer = null;
+    if (problem) {
+      toastText = "";
+      pane.append(h("div", { class: "pmsg warn", text: problem.offline ? "The Video Grabber app is not running, so your pal is asleep." : problem.error }));
+      return;
+    }
+    if (!snap.enabled) {
+      pane.append(h("div", { class: "vgc-stage" },
+        h("div", { class: "vgc-name", text: "Your companion is off" }),
+        h("div", { class: "vgc-sub", text: "Turn it on to hatch an egg, earn XP from downloads, and play mini-games on the handheld." }),
+        h("button", { class: "pbtn pri", text: "Turn on companion", onclick: () => act("enable") })));
+      return;
+    }
+    spriteEl = h("i", {});
+    const nxt = snap.next_stage;
+    pane.append(
+      h("div", { class: "vgc-stage" },
+        h("div", { class: "vgc-sprite" }, spriteEl),
+        h("div", { class: "vgc-name", text: snap.name + " the " + snap.stage[0].toUpperCase() + snap.stage.slice(1) }),
+        h("div", { class: "vgc-sub", text: "Level " + snap.level + "  \u2022  " + snap.coins + " treats  \u2022  " + snap.streak + "-day streak" + (nxt ? "  \u2022  " + (snap.stage === "egg" ? "hatches" : "grows up") + " at level " + nxt.level : "") }),
+        (toastText || snap.bubbles) ? h("div", { class: "vgc-say", text: toastText || snap.speech }) : null,
+        h("div", { class: "bar", style: "width:90%" }, h("i", { style: "width:" + Math.round(100 * snap.xp / Math.max(1, snap.xp_needed)) + "%" })),
+        h("div", { class: "vgc-sub", text: snap.xp + " / " + snap.xp_needed + " XP" })),
+      need("Hunger", snap.hunger), need("Energy", snap.energy), need("Affection", snap.affection),
+      h("div", { class: "vgc-acts" },
+        h("button", { class: "pbtn", text: "Feed", onclick: () => act("feed") }),
+        h("button", { class: "pbtn", text: "Play", onclick: () => act("play") }),
+        h("button", { class: "pbtn", text: "Pet", onclick: () => act("pet") }),
+        h("button", { class: "pbtn", text: "Nap", onclick: () => act("nap") })),
+      h("div", { class: "vgc-note", text: "Finish downloads in the app to earn XP. Play mini-games from the Companion menu: they use the handheld's D-pad." }));
+    if (!manifest || !sprite.url) pane.append(h("div", { class: "pmsg warn", text: "Artwork is not available right now. Your pal's stats still update." }));
+    toastText = "";
+    paint();
+    startAnim();
+  }
+
+  function paint() {
+    if (!spriteEl || !snap || !animator || !sprite.url || !manifest) return;
+    const fs = manifest.frame_size || 64, sc = 2, entry = sprite.entry;
+    const animate = snap.animations !== false;
+    const f = animator.frame(snap.pose, animate ? (performance.now() - t0) / 1000 : 0);
+    const cell = A.sheetCell(f.index, entry.columns, fs);
+    spriteEl.style.backgroundImage = "url(" + sprite.url + ")";
+    spriteEl.style.backgroundSize = (entry.columns * fs * sc) + "px " + (entry.rows * fs * sc) + "px";
+    spriteEl.style.backgroundPosition = (-cell.x * sc) + "px " + (-cell.y * sc) + "px";
+    spriteEl.style.transform = "translateY(" + (animate ? -f.dy * sc : 0) + "px)";
+  }
+
+  async function act(action) {
+    const r = await send({ type: "COMPANION_ACTION", action });
+    if (!r || !r.ok) toastText = (r && (r.error || (r.data && r.data.error))) || "Not now.";
+    await refresh();
+  }
 })();
 // content.js — Universal Video Grabber
 // Watches every <video> element on the page (this frame; manifest sets
@@ -37750,6 +38098,8 @@ function vgNormalize(raw) {
   <script src="popupshim.js"></script>
   <script src="popup.js"></script>
   <script src="panel.js"></script>
+  <script src="companion-anim.js"></script>
+  <script src="companion-panel.js"></script>
 </body>
 </html>
 {

@@ -166,6 +166,210 @@ def record_stat(nbytes):
         log(f"couldn't record download stat: {e}")
 
 
+# --- unknown-extension repair (2026-11-25) --------------------------------
+# yt-dlp's generic extractor names a file it cannot classify "<id>.UNKNOWN_VIDEO"
+# (seen on Dropbox links whose URL path carries no file extension), and some
+# hosts hand out extensionless names. Windows then shows "UNKNOWN_VIDEO File"
+# and nothing opens it. The bytes are normally a perfectly good video, so the
+# fix is to look at the CONTENT, name the file correctly, and only then let the
+# auto-MP4 step run. It runs for every engine, before any conversion, and never
+# touches a file whose extension already looks real. (Confirmed cause of the
+# 2026-11-25 898 MB case: a Dropbox /zip_download_get/ folder link, i.e. a ZIP.)
+_BAD_EXTS = {"", ".unknown_video", ".unknown", ".unknown_audio", ".unknown_file",
+             ".bin", ".tmp", ".temp", ".download", ".crdownload", ".dat"}
+
+_FFPROBE_EXT_MAP = {
+    "mov": ".mp4", "matroska": ".mkv", "webm": ".webm", "avi": ".avi",
+    "mpegts": ".ts", "flv": ".flv", "asf": ".wmv", "mpeg": ".mpg",
+    "ogg": ".ogg", "mp3": ".mp3", "wav": ".wav", "flac": ".flac", "aac": ".aac",
+}
+
+
+def _ext_is_suspect(path):
+    """True when the name has no believable extension (empty, a known
+    placeholder like .UNKNOWN_VIDEO, or a 'suffix' that is really part of a
+    title such as 'Show v1.2 final')."""
+    suf = Path(path).suffix.lower()
+    if suf in _BAD_EXTS:
+        return True
+    return re.fullmatch(r"\.[a-z0-9]{1,5}", suf) is None
+
+
+def _sniff_ext(path):
+    """Extension from the file's magic bytes, or '' when not a known media
+    container. Reads only the first 64 KB."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(65536)
+    except OSError:
+        return ""
+    if len(head) < 12:
+        return ""
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand == b"qt  ":
+            return ".mov"
+        if brand in (b"M4A ", b"M4B "):
+            return ".m4a"
+        if brand[:2] == b"3g":
+            return ".3gp"
+        if brand in (b"heic", b"heix", b"hevc", b"mif1", b"msf1"):
+            return ".heic"   # stills share the MP4 box layout: never ".mp4"
+        if brand in (b"avif", b"avis"):
+            return ".avif"
+        return ".mp4"
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return ".webm" if b"webm" in head[:200] else ".mkv"
+    if head[:4] == b"RIFF":
+        if head[8:12] == b"AVI ":
+            return ".avi"
+        if head[8:12] == b"WAVE":
+            return ".wav"
+        if head[8:12] == b"WEBP":
+            return ".webp"
+        return ""
+    if head[:3] == b"FLV":
+        return ".flv"
+    if head[:4] == b"OggS":
+        return ".ogg"
+    if head[:8] == b"\x30\x26\xb2\x75\x8e\x66\xcf\x11":
+        return ".wmv"
+    if head[:4] == b"\x00\x00\x01\xba":
+        return ".mpg"
+    if len(head) > 376 and head[0] == 0x47 and head[188] == 0x47 and head[376] == 0x47:
+        return ".ts"
+    if head[:4] == b"fLaC":
+        return ".flac"
+    # Non-media files that land here the same way. Dropbox "download folder"
+    # links (/zip_download_get/) are zip archives, not videos.
+    if head[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
+        if head[30:38] == b"mimetype" and b"application/epub+zip" in head[:120]:
+            return ".epub"
+        return ".zip"
+    if head[:6] == b"7z\xbc\xaf\x27\x1c":
+        return ".7z"
+    if head[:6] == b"Rar!\x1a\x07":
+        return ".rar"
+    if head[:2] == b"\x1f\x8b":
+        return ".gz"
+    if head[:3] == b"BZh":
+        return ".bz2"
+    if head[:6] == b"\xfd7zXZ\x00":
+        return ".xz"
+    if head[:4] == b"\x28\xb5\x2f\xfd":
+        return ".zst"
+    if head[257:262] == b"ustar":
+        return ".tar"
+    if head[32769:32774] == b"CD001":
+        return ".iso"
+    if head[:5] == b"%PDF-":
+        return ".pdf"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if head[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return ".tif"
+    if head[:4] == b"wOFF":
+        return ".woff"
+    if head[:4] == b"wOF2":
+        return ".woff2"
+    if head[:4] == b"OTTO":
+        return ".otf"
+    if head[:4] == b"\x00\x01\x00\x00":
+        return ".ttf"
+    if head[:2] == b"MZ" and b"This program" in head[:256]:
+        return ".exe"
+    if head[:16] == b"SQLite format 3\x00":
+        return ".sqlite"
+    if head[:3] == b"ID3" or (head[0] == 0xFF and (head[1] & 0xE0) == 0xE0
+                              and (head[1] & 0x06) != 0):
+        return ".mp3"
+    return ""
+
+
+def _sniff_text_ext(path):
+    """For files with no binary signature: html / json / xml / txt when the
+    first 8 KB is plain text (an HTML error page saved as a video is common)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+    except OSError:
+        return ""
+    if not head or b"\x00" in head:
+        return ""
+    try:
+        txt = head.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            txt = head[:-3].decode("utf-8")      # cut mid-character at 8 KB
+        except UnicodeDecodeError:
+            return ""
+    low = txt.lstrip("\ufeff \t\r\n").lower()
+    if low.startswith(("<!doctype html", "<html", "<head", "<body")) or "<html" in low[:500]:
+        return ".html"
+    if low.startswith("<?xml"):
+        return ".xml"
+    if low[:1] in ("{", "["):
+        return ".json"
+    return ".txt"
+
+
+def _ffprobe_ext_guess(path):
+    """Fallback when the magic bytes are not recognised: ask ffprobe."""
+    _ffdir = find_ffmpeg_dir()
+    ffprobe = str(Path(_ffdir) / "ffprobe.exe") if _ffdir else "ffprobe"
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=format_name",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, timeout=30, text=True, errors="replace",
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        first = (r.stdout or "").strip().lower().split(",")[0].strip()
+        return _FFPROBE_EXT_MAP.get(first, "")
+    except Exception as e:
+        log(f"fix-ext: ffprobe guess failed on {Path(path).name}: {e}")
+        return ""
+
+
+def fix_unknown_extension(job, dest):
+    """Rename a finished download whose extension is missing or a placeholder
+    (.UNKNOWN_VIDEO etc.) to the extension its content really has. Returns the
+    (possibly new) path and keeps job['filename'] / job['dest'] in sync.
+    Never raises, never deletes, and leaves the file alone if the content is
+    not recognised."""
+    try:
+        dest = Path(dest)
+        if not dest.is_file() or dest.stat().st_size == 0:
+            return dest
+        if not _ext_is_suspect(dest):
+            return dest
+        ext = _sniff_ext(dest) or _ffprobe_ext_guess(dest) or _sniff_text_ext(dest)
+        if not ext and dest.suffix.lower().startswith(".unknown"):
+            # Nothing recognised, but ".unknown_video" is a lie either way:
+            # ".bin" is honest and never looks like a broken video.
+            ext = ".bin"
+        if not ext:
+            log(f"fix-ext: {dest.name} has an unusual extension and the content "
+                f"is not recognised, leaving as-is")
+            return dest
+        base = dest.stem if dest.suffix.lower() in _BAD_EXTS else dest.name
+        target = dest.with_name(base + ext)
+        if target.exists():
+            target = _unique_path(target)
+        dest.rename(target)
+        log(f"fix-ext: {dest.name} -> {target.name} (detected {ext} from content)")
+        job["filename"] = target.name
+        job["dest"] = str(target)
+        return target
+    except Exception as e:
+        log(f"fix-ext: could not repair extension for {dest}: {e}")
+        return Path(dest)
+
+
 AUDIO_ONLY_TARGETS = {"mp3", "flac", "opus", "m4a"}
 
 
@@ -947,6 +1151,7 @@ def _finalize_single(job_id, job, part, dest):
         log(f"job {job_id}: WARNING — size mismatch (got {actual}, "
             f"expected {job['size_total']})")
         job["error"] = f"size mismatch: {actual}/{job['size_total']}"
+    dest = fix_unknown_extension(job, dest)
     dest = maybe_convert_target(job, dest)
     if not _try_transition(job, JobEvent.COMPLETE):
         # Paused/stopped while converting: not done, so no completion side effects.
@@ -1318,6 +1523,9 @@ def run_ytdlp(job_id):
         # registry filename.
         job["dest"] = str(real)
         job["filename"] = real.name
+        # yt-dlp names unclassifiable files "<id>.UNKNOWN_VIDEO": give the file
+        # its real extension (from its content) BEFORE any conversion.
+        real = fix_unknown_extension(job, real)
         # maybe_convert_target falls back to auto-mp4 when the job has no
         # explicit target, and honors target_format even when auto_mp4 is off.
         real = maybe_convert_target(job, real)

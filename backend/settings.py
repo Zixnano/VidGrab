@@ -1,4 +1,3 @@
-"""Application settings, paths, filename helpers, bandwidth profiles."""
 from pathlib import Path
 from urllib.parse import unquote
 import copy
@@ -673,6 +672,21 @@ _FILENAME_QUERY_KEYS = ("fn", "filename", "file", "name", "file_name")
 def detect_type(url):
     if ".m3u8" in url.lower() or ".mpd" in url.lower():
         return "ytdlp"
+    # Dropbox direct-content links (dl.dropboxusercontent.com, and the
+    # /zip_download_get/ "download folder" links) carry no file extension, so
+    # they used to fall through to yt-dlp, which saved them as
+    # "<id>.UNKNOWN_VIDEO". They are plain file downloads: the generic engine
+    # takes the real name from Content-Disposition and supports resume.
+    try:
+        _du = urlparse(url)
+        _dh = (_du.hostname or "").lower()
+        _dp = (_du.path or "").lower()
+        if _dh.endswith("dropboxusercontent.com") or "/zip_download_get" in _dp:
+            return "generic"
+        if _dh.endswith("dropbox.com") and "dl=1" in (_du.query or "").lower():
+            return "generic"
+    except ValueError:
+        pass
     # Path only: an extension-looking string in a query value or host must
     # not route a page URL to the generic downloader (the query-value check
     # below handles fn=/filename=/format= on its own terms).

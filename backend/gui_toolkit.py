@@ -24,8 +24,8 @@ from PySide6.QtCore import QPointF, QProcess, QRectF, Qt, QThread, QTimer, QUrl,
 from PySide6.QtGui import QColor, QMovie, QPainter, QPen, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-    QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar,
-    QPushButton, QRadioButton, QSizePolicy, QSlider, QStackedWidget, QTabWidget,
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar,
+    QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSlider, QStackedWidget, QTabWidget,
     QVBoxLayout, QWidget,
 )
 
@@ -374,7 +374,11 @@ class ToolkitDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Media Toolkit")
         self.setAcceptDrops(True)
-        install_fit(self, 940, 800, 600, 440)
+        # Smaller default and a small minimum: the editing area scrolls and the
+        # progress bar + buttons stay pinned, so the window can be any size.
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        self.setSizeGripEnabled(True)
+        install_fit(self, 900, 680, 520, 340)
 
         self._src = None
         self._info = {}
@@ -404,7 +408,26 @@ class ToolkitDialog(QDialog):
 
     # ---------------------------------------------------------------- UI
     def _build_ui(self):
-        root = QVBoxLayout(self)
+        # Layout: [scrolling editing area] + [pinned footer: progress, status,
+        # buttons]. The scroll area is what lets the window shrink below the
+        # content's natural height instead of running off the screen.
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.viewport().setAutoFillBackground(False)
+        body = QWidget()
+        body.setObjectName("ToolkitBody")
+        body.setStyleSheet("#ToolkitBody { background: transparent; }")
+        body.setAutoFillBackground(False)
+        root = QVBoxLayout(body)
+        root.setContentsMargins(0, 0, 6, 0)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        self._vg_scroll = scroll        # tells gui_fit not to wrap it again
+        foot = QVBoxLayout()
+        outer.addLayout(foot)
 
         top = QHBoxLayout()
         self.src_label = QLabel("Drop a video here or click Open file\u2026")
@@ -416,7 +439,7 @@ class ToolkitDialog(QDialog):
         root.addLayout(top)
 
         self.stack = QStackedWidget()
-        self.stack.setMinimumHeight(250)
+        self.stack.setMinimumHeight(140)
         self.placeholder = QLabel("No video loaded")
         self.placeholder.setAlignment(Qt.AlignCenter)
         self.placeholder.setObjectName("EmptyState")
@@ -504,10 +527,10 @@ class ToolkitDialog(QDialog):
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
         self.bar.setTextVisible(True)
-        root.addWidget(self.bar)
+        foot.addWidget(self.bar)
         self.status = QLabel("")
         self.status.setWordWrap(True)
-        root.addWidget(self.status)
+        foot.addWidget(self.status)
 
         bt = QHBoxLayout()
         self.view_orig = QPushButton("Original")
@@ -541,7 +564,7 @@ class ToolkitDialog(QDialog):
         bt.addStretch(1)
         for w in (self.b_cancel, self.b_export, b_close):
             bt.addWidget(w)
-        root.addLayout(bt)
+        foot.addLayout(bt)
 
     def _build_compress(self):
         w = QWidget()
